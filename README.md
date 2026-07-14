@@ -63,6 +63,19 @@ jet --help
 ## Usage
 After installation, you can use the `jet` command in your terminal. Here are some basic commands:
 
+### Falcon
+
+This fork ships an opinionated, cluster-aware workflow as the native `falcon` command. `falcon-next` remains as a temporary compatibility entry point.
+
+```bash
+command falcon setup --force  # migrate an older wrapper/preview config
+falcon h100 -- python train.py
+falcon 2080tix3 -m 50Gi:50Gi -- python train.py
+falcon dashboard
+```
+
+Setup installs the native command wrapper and dynamic completion for the active zsh/bash shell. See [Native Falcon](docs/falcon.md) for resource planning, overrides, job controls, and dashboard behavior.
+
 Please refer to the following sections for detailed user guides.
 
 - [Submitting Jobs](https://github.com/manideep2510/jet-k8s/blob/main/docs/submitting-jobs.md)

@@ -726,9 +726,15 @@ class ProcessArguments:
         return job_config
 
     def _get_user_groups(self, username=None):
-        username = username or os.getlogin()
-        pw = pwd.getpwnam(username)
-        return os.getgrouplist(username, pw.pw_gid)
+        # Reading the current process groups works without a controlling TTY or
+        # an NSS/passwd entry (both are commonly absent in cluster login pods).
+        if username:
+            try:
+                pw = pwd.getpwnam(username)
+                return os.getgrouplist(username, pw.pw_gid)
+            except KeyError:
+                pass
+        return os.getgroups()
 
     def _parse_shm_size_arg(self, shm_size):
         volume_name = 'shm-volume'
