@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from . import __version__
 from .commands import attach, clean, delete, logs, remember_job, top
 from .completion import candidates, shell_script
-from .config import config_path, detect_shell, load_config, run_setup
+from .config import DEFAULT_CONFIG, config_path, detect_shell, load_config, run_setup
 from .dashboard import run_dashboard
 from .launcher import build_jet_command, job_name, launch
 from .resources import canonical_gpu, fetch_nodes, plan_resources
@@ -41,7 +41,6 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Request 95%% of proportional node capacity instead of currently free CPU/RAM",
     )
     parser.add_argument("-a", "--async", dest="async_mode", action="store_true", help="Submit without following or cleanup")
-    parser.add_argument("--namespace", help="Override the LOGNAME-derived namespace")
     placement = parser.add_mutually_exclusive_group()
     placement.add_argument("--pin-node", action="store_true", help="Pin placement to Falcon's sizing node")
     placement.add_argument("--no-pin", dest="pin_node", action="store_false", help=argparse.SUPPRESS)
@@ -88,8 +87,6 @@ def _print_plan(plan: Any, shm_size: str, pin_node: bool = False) -> None:
 
 
 def _launch_request(preset_name: str, count: int, args: argparse.Namespace, config: Dict[str, Any]) -> int:
-    if args.namespace:
-        config["cluster"]["namespace"] = args.namespace
     preset = config["presets"][preset_name]
     try:
         nodes = fetch_nodes(config["cluster"]["kube_state_metrics_url"])
@@ -172,10 +169,6 @@ def _looks_like_legacy_submission(argv: Sequence[str]) -> bool:
     return first in flags or any(first.startswith(flag + "=") for flag in flags if flag.startswith("--"))
 
 
-def _namespace_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--namespace", help="Override the LOGNAME-derived namespace")
-
-
 def _main_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
     preset_help = ", ".join(f"{name}[xN]" for name in config["presets"])
     parser = argparse.ArgumentParser(
@@ -191,7 +184,6 @@ def _main_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-shell", action="store_true", help="Do not update the active shell rc file")
     dashboard = sub.add_parser("dashboard", aliases=["dash"], help="Open the nvitop-style dashboard")
-    _namespace_argument(dashboard)
     dashboard.add_argument("--once", action="store_true", help="Print one compact snapshot and exit")
     dashboard.add_argument("--json", action="store_true", help="Print one machine-readable JSON snapshot")
     dashboard.add_argument("--job", help="Show metrics only for this job")
@@ -202,12 +194,9 @@ def _main_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
     ):
         command = sub.add_parser(name, help=help_text)
         command.add_argument("job", nargs="?", help="Job name (defaults to last Falcon job)")
-        _namespace_argument(command)
     remove = sub.add_parser("delete", aliases=["kill"], help="Delete one or more jobs")
     remove.add_argument("jobs", nargs="*", help="Job names (defaults to last Falcon job)")
-    _namespace_argument(remove)
     cleaner = sub.add_parser("clean", help="Delete completed and failed jobs")
-    _namespace_argument(cleaner)
     init = sub.add_parser("shell-init", help="Print native wrapper and completion")
     init.add_argument("shell", nargs="?", choices=["zsh", "bash"])
     completion = sub.add_parser("completion", help="Print completion for a shell")
@@ -224,7 +213,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif argv and argv[0].startswith("--config="):
         config_arg, argv = argv[0].split("=", 1)[1], argv[1:]
     try:
-        config = load_config(config_arg)
+        bootstrap_command = argv[0] if argv else ""
+        try:
+            config = load_config(config_arg)
+        except ValueError:
+            # Setup must be able to replace an obsolete config, and shell init
+            # must remain available while that repair is pending.
+            if bootstrap_command not in {"setup", "shell-init", "completion", "config"}:
+                raise
+            config = DEFAULT_CONFIG
         if _looks_like_legacy_submission(argv):
             return run_legacy(argv, config)
         if argv and resolve_preset(argv[0], config):
@@ -239,7 +236,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser = _main_parser(config)
         args = parser.parse_args((["--config", config_arg] if config_arg else []) + argv)
         active_path = args.config or config_arg
-        namespace = getattr(args, "namespace", None) or config["cluster"]["namespace"]
+        namespace = config["cluster"]["namespace"]
         if args.command == "setup":
             target, rc_path = run_setup(
                 active_path, force=args.force, non_interactive=args.non_interactive, install_shell=not args.no_shell

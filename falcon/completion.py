@@ -45,9 +45,9 @@ def candidates(kind: str, config: Dict[str, Any], command: str = "") -> List[str
         return job_names(config["cluster"]["namespace"])
     if kind == "options":
         if command in {"dashboard", "dash"}:
-            return ["--namespace", "--once", "--json", "--job", "--samples", "--interval"]
+            return ["--once", "--json", "--job", "--samples", "--interval"]
         if command in JOB_COMMANDS or command == "clean":
-            return ["--namespace"]
+            return []
         if command == "setup":
             return ["--force", "--non-interactive", "--no-shell"]
         if command in {"completion", "shell-init"}:
@@ -61,7 +61,7 @@ def candidates(kind: str, config: Dict[str, Any], command: str = "") -> List[str
         if is_preset:
             return [
                 "--cpu", "--memory", "--shm-size", "--shm-percent", "--job", "--async",
-                "--max", "--namespace", "--pin-node", "--dry-run", "--explain", "--jet-arg", "--",
+                "--max", "--pin-node", "--dry-run", "--explain", "--jet-arg", "--",
             ]
     return []
 

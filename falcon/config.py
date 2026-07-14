@@ -19,7 +19,7 @@ LEGACY_DASHBOARD_EMA_ALPHAS = {0.02, 0.08, 0.25}
 
 
 # These describe this Falcon deployment and intentionally stay out of setup and
-# ~/.falconrc. Users configure workflow policy, not cluster plumbing.
+# ~/.falconrc. Identity and mount settings are added separately during setup.
 INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
     "cluster": {
         "kube_state_metrics_url": "http://localhost:30080/metrics",
@@ -33,7 +33,6 @@ INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
         "scheduler": "kai-scheduler",
         "mount_home": True,
         "environment": {
-            "IN_JET_POD": "1",
             "USER": "${USER}",
             "CONDA_AUTO_ACTIVATE_BASE": "false",
         },
@@ -75,6 +74,7 @@ def namespace_from_logname(value: Optional[str] = None) -> str:
 
 
 def effective_defaults() -> Dict[str, Any]:
+    """Build the initial setup config from the current login identity."""
     config = _merge(INFRASTRUCTURE_DEFAULTS, USER_DEFAULTS)
     identity = logname()
     config["cluster"]["namespace"] = namespace_from_logname(identity)
@@ -85,8 +85,8 @@ def effective_defaults() -> Dict[str, Any]:
     return config
 
 
-# Kept as a public value for callers/tests; load_config recomputes identity so
-# LOGNAME changes are always respected.
+# Kept as a public value for callers/tests and initial CLI parsing. Runtime
+# configuration loaded from an existing .falconrc does not use this identity.
 DEFAULT_CONFIG: Dict[str, Any] = effective_defaults()
 
 
@@ -104,9 +104,9 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
             raise ValueError(f"Falcon config must be a YAML mapping: {target}")
     elif require_exists:
         raise FileNotFoundError(f"Falcon config not found: {target}. Run 'falcon setup'.")
-    # Infrastructure keys from older preview configs are deliberately ignored;
-    # they are no longer user configuration. Also discard retired aliases and
-    # fixed shm_size fields while retaining custom preset definitions.
+    # Only namespace and volumes are user-configurable from the cluster/runtime
+    # sections. Container and scheduler plumbing remains internal. Also discard
+    # retired aliases and fixed shm_size fields while retaining custom presets.
     user_raw: Dict[str, Any] = {}
     for key in ("version", "resources"):
         if key in raw:
@@ -133,7 +133,21 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
             for name, preset in raw["presets"].items()
             if isinstance(preset, dict)
         }
-    config = _merge(effective_defaults(), user_raw)
+    if isinstance(raw.get("cluster"), dict) and "namespace" in raw["cluster"]:
+        user_raw["cluster"] = {"namespace": raw["cluster"]["namespace"]}
+    if isinstance(raw.get("runtime"), dict):
+        user_raw["runtime"] = {
+            key: raw["runtime"][key]
+            for key in ("volumes", "environment")
+            if key in raw["runtime"]
+        }
+
+    # LOGNAME is only consulted when no config exists, to provide initial CLI
+    # defaults before setup. Once .falconrc exists, its persisted identity and
+    # mounts are authoritative and a missing field is reported rather than
+    # silently regenerated from the current environment.
+    defaults = effective_defaults() if not target.exists() else _merge(INFRASTRUCTURE_DEFAULTS, USER_DEFAULTS)
+    config = _merge(defaults, user_raw)
     validate_config(config)
     return config
 
@@ -146,6 +160,17 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("resources.shared_memory_percent must be between 0 and 100")
     if not config.get("presets"):
         raise ValueError("At least one GPU preset is required")
+    if not config.get("cluster", {}).get("namespace"):
+        raise ValueError("cluster.namespace is required; run 'falcon setup --force' to update .falconrc")
+    volumes = config.get("runtime", {}).get("volumes")
+    if not isinstance(volumes, list) or not volumes or not all(isinstance(value, str) and value for value in volumes):
+        raise ValueError("runtime.volumes must be a non-empty list; run 'falcon setup --force' to update .falconrc")
+    environment = config.get("runtime", {}).get("environment", {})
+    if not isinstance(environment, dict) or not all(
+        isinstance(key, str) and key and not isinstance(value, (dict, list))
+        for key, value in environment.items()
+    ):
+        raise ValueError("runtime.environment must be a KEY: VALUE mapping")
     ema_alpha = float(config.get("dashboard", {}).get("ema_alpha", DEFAULT_DASHBOARD_EMA_ALPHA))
     if not 0 < ema_alpha <= 1:
         raise ValueError("dashboard.ema_alpha must be greater than 0 and at most 1")
@@ -160,6 +185,20 @@ def validate_config(config: Dict[str, Any]) -> None:
 def _ask(label: str, default: Any) -> str:
     answer = input(f"{label} [{default}]: ").strip()
     return answer or str(default)
+
+
+def _parse_environment(value: str) -> Dict[str, str]:
+    environment: Dict[str, str] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, separator, setting = item.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise ValueError(f"Invalid environment variable {item!r}; expected KEY=VALUE")
+        environment[key] = setting.strip()
+    return environment
 
 
 def detect_shell() -> Tuple[str, Path]:
@@ -241,13 +280,27 @@ def run_setup(
     target = config_path(path)
     if target.exists() and not force:
         raise FileExistsError(f"{target} already exists; pass --force to replace it")
+    initial = effective_defaults()
     config = copy.deepcopy(USER_DEFAULTS)
+    config["cluster"] = {"namespace": initial["cluster"]["namespace"]}
+    config["runtime"] = {"volumes": initial["runtime"]["volumes"], "environment": {}}
     if not non_interactive:
         print(f"Falcon setup for {logname()} ({namespace_from_logname()})")
+        config["cluster"]["namespace"] = _ask(
+            "Kubernetes namespace", config["cluster"]["namespace"]
+        )
+        mount_default = ", ".join(config["runtime"]["volumes"])
+        config["runtime"]["volumes"] = [
+            value.strip()
+            for value in _ask("Mount paths (comma-separated)", mount_default).split(",")
+            if value.strip()
+        ]
+        environment = input("Environment variables (comma-separated KEY=VALUE) [none]: ").strip()
+        config["runtime"]["environment"] = _parse_environment(environment)
         config["resources"]["shared_memory_percent"] = float(
             _ask("Shared memory as % of allocated RAM", config["resources"]["shared_memory_percent"])
         )
-    validate_config(_merge(effective_defaults(), config))
+    validate_config(_merge(INFRASTRUCTURE_DEFAULTS, config))
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)

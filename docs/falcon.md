@@ -11,11 +11,27 @@ command falcon setup --force  # use without --force on a fresh install
 
 Use `command falcon setup` for the one-time migration because `command` bypasses an older `falcon()` shell function. Add `--force` when replacing the earlier preview `.falconrc`. Setup writes a small `~/.falconrc`, creates a stable `~/.local/bin/falcon` launcher pinned to the Python environment where Falcon is installed, and installs a managed initialization block in the active shell's `~/.zshrc` or `~/.bashrc`. Falcon therefore remains available when another Conda environment—or `base`—is active. The block also enables dynamic completion. Use `--no-shell` to skip the rc-file change.
 
-Cluster plumbing is intentionally not prompted or written to `.falconrc`. The image, pull secret, scheduler, kube-state-metrics endpoint, and container shell are internal deployment defaults. Identity-based settings are derived automatically:
+The image, pull secret, scheduler, kube-state-metrics endpoint, and container shell remain internal deployment defaults. Setup uses `LOGNAME` once to seed identity-based values in `.falconrc` and prompts for the namespace, comma-separated mount paths, optional comma-separated `KEY=VALUE` environment variables, and shared-memory percentage. Press Enter at any prompt to retain its displayed default:
 
 - `LOGNAME=divyam.c` gives namespace `divyamc-dev`.
 - User mount: `/media/beegfs/users/divyam.c/`.
 - Team mount: `/media/beegfs/teams/`.
+
+After setup, Falcon reads the namespace and all mount paths exclusively from `.falconrc`; changing `LOGNAME` does not change runtime behavior. Edit these persisted values directly when needed:
+
+```yaml
+cluster:
+  namespace: divyamc-dev
+runtime:
+  volumes:
+    - /media/beegfs/users/divyam.c/
+    - /media/beegfs/teams/
+  environment:
+    WANDB_MODE: offline
+    HF_HOME: /media/beegfs/users/divyam.c/.cache/huggingface
+```
+
+Environment variables in `.falconrc` are passed to every Falcon pod. They merge over Falcon's internal environment defaults, so an explicitly configured key wins.
 
 The default config contains GPU eviction thresholds, dashboard display behavior, and `resources.shared_memory_percent: 15`. Dashboard sampling is fixed at a fast one-second target and is not a setup question. A preset can override the shared-memory percentage:
 
@@ -63,7 +79,7 @@ falcon 2080tix3 --shm-percent 25 -- python train.py
 falcon h100 --shm-size 40Gi -- python train.py
 ```
 
-CPU, RAM, job name, namespace, and raw Jet arguments remain overridable:
+CPU, RAM, job name, and raw Jet arguments remain overridable. Namespace has no CLI override; Falcon uses the value persisted in `.falconrc`:
 
 ```bash
 falcon 2080tix3 -c 48:48 -m 50Gi:50Gi -j experiment -- python train.py
@@ -96,7 +112,7 @@ falcon clean
 
 When the job argument is omitted, Falcon uses the most recently launched or selected job. Tab completion lists live job names for `logs`, `attach`, `top`, and `delete`. Command, option, preset, and valid GPU-count completion are also dynamic.
 
-Falcon passes the active `CONDA_PREFIX` or `VIRTUAL_ENV` to Jet as `--pyenv`. Jet mounts that environment and places its `bin` directory first on the pod's `PATH`; Falcon also sets `CONDA_AUTO_ACTIVATE_BASE=false` in the pod so an interactive shell cannot replace the selected environment with base. The `IN_JET_POD` guard in an existing `.zshrc` may still be kept to skip unrelated host-only shell initialization, but Python selection no longer depends on that guard.
+Falcon passes the active `CONDA_PREFIX` or `VIRTUAL_ENV` to Jet as `--pyenv`. Jet mounts that environment and places its `bin` directory first on the pod's `PATH`; Falcon also sets Conda's standard `CONDA_AUTO_ACTIVATE_BASE=false` configuration variable so a freshly initialized interactive shell does not replace the selected environment with base. This does not suppress an explicit `conda activate base` command written by the user in shell startup files.
 
 Completion can be inspected manually with `falcon completion zsh` or `falcon completion bash`.
 
