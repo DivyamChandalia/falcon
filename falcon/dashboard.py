@@ -28,6 +28,8 @@ from .config import DEFAULT_DASHBOARD_EMA_ALPHA
 
 
 DASHBOARD_REFRESH_SECONDS = 1.0
+KUBERNETES_INVENTORY_SECONDS = 5.0
+KUBERNETES_USAGE_SECONDS = 5.0
 ABSOLUTE_MINIMUM_WIDTH = 42
 ABSOLUTE_MINIMUM_HEIGHT = 14
 EMA_WARMUP_SAMPLES = 5
@@ -173,11 +175,13 @@ def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
         ["exec", "-n", namespace, pod, "--", "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
         timeout=8,
     )
-    if not output:
-        return GpuSample()
+    return _parse_gpu_lines(output.splitlines() if output else [])
+
+
+def _parse_gpu_lines(lines: List[str]) -> GpuSample:
     utils: List[float] = []
     used = total = 0.0
-    for line in output.splitlines():
+    for line in lines:
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 3:
             continue
@@ -192,10 +196,98 @@ def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
     return GpuSample(sum(utils) / len(utils), used, total, len(utils))
 
 
+class StreamingGpuSampler:
+    """Keep one nvidia-smi stream per running pod instead of execing each frame."""
+
+    def __init__(self, namespace: str, interval_ms: int = 1000):
+        self.namespace = namespace
+        self.interval_ms = interval_ms
+        self._lock = threading.Lock()
+        self._processes: Dict[str, subprocess.Popen] = {}
+        self._samples: Dict[str, GpuSample] = {}
+        self._ready: Dict[str, threading.Event] = {}
+
+    def _stop(self, pod: str) -> None:
+        process = self._processes.pop(pod, None)
+        self._ready.pop(pod, None)
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=0.2)
+        with self._lock:
+            self._samples.pop(pod, None)
+
+    def _start(self, pod: str, gpu_count: int) -> None:
+        query = "utilization.gpu,memory.used,memory.total"
+        try:
+            process = subprocess.Popen(
+                [
+                    "kubectl", "exec", "-n", self.namespace, pod, "--", "nvidia-smi",
+                    f"--query-gpu={query}", "--format=csv,noheader,nounits",
+                    f"--loop-ms={self.interval_ms}",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except OSError:
+            return
+        self._processes[pod] = process
+        ready = self._ready[pod] = threading.Event()
+
+        def read_samples() -> None:
+            batch: List[str] = []
+            stream = process.stdout
+            if stream is None:
+                return
+            try:
+                for line in stream:
+                    line = line.strip()
+                    if len(line.split(",")) != 3:
+                        continue
+                    batch.append(line)
+                    if len(batch) < gpu_count:
+                        continue
+                    sample = _parse_gpu_lines(batch[:gpu_count])
+                    batch.clear()
+                    if sample.utilization is not None:
+                        with self._lock:
+                            self._samples[pod] = sample
+                        ready.set()
+            finally:
+                ready.set()
+
+        threading.Thread(target=read_samples, name=f"falcon-gpu-{pod}", daemon=True).start()
+
+    def samples(self, pods: Dict[str, int]) -> Dict[str, GpuSample]:
+        for pod in list(self._processes):
+            process = self._processes[pod]
+            if pod not in pods or process.poll() is not None:
+                self._stop(pod)
+        started: List[str] = []
+        for pod, gpu_count in pods.items():
+            if pod not in self._processes:
+                self._start(pod, gpu_count)
+                started.append(pod)
+        deadline = time.monotonic() + 0.5
+        for pod in started:
+            ready = self._ready.get(pod)
+            if ready:
+                ready.wait(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            return {pod: self._samples.get(pod, GpuSample()) for pod in pods}
+
+    def close(self) -> None:
+        for pod in list(self._processes):
+            self._stop(pod)
+
+
 class UsageCollector:
     def __init__(
         self, namespace: str, thresholds: Dict[str, float], ema_alpha: float,
         job_filter: Optional[str] = None, ema_warmup_samples: int = EMA_WARMUP_SAMPLES,
+        streaming_gpu: bool = False,
     ):
         self.namespace = namespace
         self.thresholds = thresholds
@@ -204,6 +296,19 @@ class UsageCollector:
         self.ema_warmup_samples = ema_warmup_samples
         self.ema: Dict[str, float] = {}
         self.ema_samples: Dict[str, int] = {}
+        self._items: Optional[List[Dict]] = None
+        self._items_at = 0.0
+        self._live: Optional[Dict[str, Tuple[float, float]]] = None
+        self._live_at = 0.0
+        self._gpu_sampler = StreamingGpuSampler(namespace) if streaming_gpu else None
+
+    def invalidate(self) -> None:
+        self._items_at = 0.0
+        self._live_at = 0.0
+
+    def close(self) -> None:
+        if self._gpu_sampler:
+            self._gpu_sampler.close()
 
     def _update_ema(self, job: str, utilization: float) -> float:
         samples = self.ema_samples.get(job, 0)
@@ -221,23 +326,36 @@ class UsageCollector:
         return ema
 
     def collect(self) -> List[JobUsage]:
-        get_args = ["get", "pods", "-n", self.namespace]
-        if self.job_filter:
-            get_args.extend(["-l", f"job-name={self.job_filter}"])
-        get_args.extend(["-o", "json"])
-        raw = _kubectl(get_args)
-        if not raw:
+        now = time.monotonic()
+        if self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
+            get_args = ["get", "pods", "-n", self.namespace]
+            if self.job_filter:
+                get_args.extend(["-l", f"job-name={self.job_filter}"])
+            get_args.extend(["-o", "json"])
+            raw = _kubectl(get_args)
+            if raw:
+                try:
+                    self._items = json.loads(raw).get("items", [])
+                    self._items_at = now
+                except json.JSONDecodeError:
+                    pass
+        if self._items is None:
             return []
-        try:
-            items = json.loads(raw).get("items", [])
-        except json.JSONDecodeError:
-            return []
-        top = _kubectl(["top", "pods", "-n", self.namespace, "--no-headers"], timeout=10) or ""
-        live = {
-            parts[0]: (parse_cpu_cores(parts[1]), parse_memory_gib(parts[2]))
-            for line in top.splitlines() if len(parts := line.split()) >= 3
-        }
-        running_gpu_pods = []
+        items = self._items
+        if self._live is None or now - self._live_at >= KUBERNETES_USAGE_SECONDS:
+            top_args = ["top", "pods", "-n", self.namespace]
+            if self.job_filter:
+                top_args.extend(["-l", f"job-name={self.job_filter}"])
+            top_args.append("--no-headers")
+            top = _kubectl(top_args, timeout=10)
+            if top is not None:
+                self._live = {
+                    parts[0]: (parse_cpu_cores(parts[1]), parse_memory_gib(parts[2]))
+                    for line in top.splitlines() if len(parts := line.split()) >= 3
+                }
+                self._live_at = now
+        live = self._live or {}
+        running_gpu_pods: Dict[str, int] = {}
         for item in items:
             spec = item.get("spec", {})
             gpu_count = sum(
@@ -245,11 +363,15 @@ class UsageCollector:
                 for container in spec.get("containers", [])
             )
             if item.get("status", {}).get("phase") == "Running" and gpu_count:
-                running_gpu_pods.append(item.get("metadata", {}).get("name", ""))
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(running_gpu_pods)))) as pool:
-            samples = dict(
-                zip(running_gpu_pods, pool.map(lambda pod: _gpu_metrics(self.namespace, pod), running_gpu_pods))
-            )
+                running_gpu_pods[item.get("metadata", {}).get("name", "")] = gpu_count
+        if self._gpu_sampler:
+            samples = self._gpu_sampler.samples(running_gpu_pods)
+        else:
+            pod_names = list(running_gpu_pods)
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(pod_names)))) as pool:
+                samples = dict(
+                    zip(pod_names, pool.map(lambda pod: _gpu_metrics(self.namespace, pod), pod_names))
+                )
 
         groups: Dict[str, Dict] = {}
         for item in items:
@@ -370,6 +492,11 @@ class FalconDashboard(App):
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
 
+    def on_unmount(self) -> None:
+        close = getattr(self.collector, "close", None)
+        if close:
+            close()
+
     def on_resize(self, event: events.Resize) -> None:
         self._render()
 
@@ -394,6 +521,9 @@ class FalconDashboard(App):
             self._render()
 
     def action_update_data(self) -> None:
+        invalidate = getattr(self.collector, "invalidate", None)
+        if invalidate:
+            invalidate()
         self._request_update()
 
     def action_open_nvitop(self) -> None:
@@ -661,13 +791,17 @@ def run_dashboard(
     collector = UsageCollector(
         namespace, thresholds, float(dashboard.get("ema_alpha", DEFAULT_DASHBOARD_EMA_ALPHA)),
         job_filter=job, ema_warmup_samples=sample_count if snapshot else EMA_WARMUP_SAMPLES,
+        streaming_gpu=not snapshot or sample_count > 1,
     )
     if snapshot:
-        rows: List[JobUsage] = []
-        for index in range(sample_count):
-            rows = collector.collect()
-            if index + 1 < sample_count:
-                time.sleep(sample_interval)
-        print(format_snapshot(rows, namespace, json_output=json_output, sample_count=sample_count))
+        try:
+            rows: List[JobUsage] = []
+            for index in range(sample_count):
+                rows = collector.collect()
+                if index + 1 < sample_count:
+                    time.sleep(sample_interval)
+            print(format_snapshot(rows, namespace, json_output=json_output, sample_count=sample_count))
+        finally:
+            collector.close()
         return
     FalconDashboard(collector).run(mouse=True)

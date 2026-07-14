@@ -13,6 +13,7 @@ from falcon.dashboard import (
     FalconDashboard,
     GpuSample,
     JobUsage,
+    StreamingGpuSampler,
     UsageCollector,
     _job_sort_key,
     _metric_color,
@@ -172,6 +173,54 @@ class MetricTests(unittest.TestCase):
         with patch("falcon.dashboard._kubectl", side_effect=fake_kubectl):
             UsageCollector("test-dev", {}, 0.02, job_filter="train-job").collect()
         self.assertIn("job-name=train-job", calls[0])
+        self.assertIn("job-name=train-job", calls[1])
+
+    def test_inventory_and_cpu_metrics_are_cached_while_gpu_stays_live(self):
+        pod = {
+            "metadata": {"name": "active", "labels": {"job-name": "train"}},
+            "status": {"phase": "Running"},
+            "spec": {"containers": [{"resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"},
+                "limits": {"nvidia.com/gpu": "1"},
+            }}]},
+        }
+        calls = []
+
+        def fake_kubectl(args, timeout=15):
+            calls.append(args[:2])
+            return json.dumps({"items": [pod]}) if args[:2] == ["get", "pods"] else "active 1 2Gi\n"
+
+        with patch("falcon.dashboard._kubectl", side_effect=fake_kubectl), patch(
+            "falcon.dashboard._gpu_metrics", return_value=GpuSample(70, 2, 10, 1)
+        ) as gpu:
+            collector = UsageCollector("test-dev", {}, 0.1)
+            collector.collect()
+            collector.collect()
+        self.assertEqual(calls.count(["get", "pods"]), 1)
+        self.assertEqual(calls.count(["top", "pods"]), 1)
+        self.assertEqual(gpu.call_count, 2)
+
+    def test_streaming_gpu_sampler_uses_one_long_lived_exec(self):
+        class Process:
+            stdout = iter(["40, 1024, 11264\n", "80, 2048, 11264\n"])
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("falcon.dashboard.subprocess.Popen", return_value=Process()) as popen:
+            sampler = StreamingGpuSampler("test-dev")
+            sample = sampler.samples({"pod-a": 2})["pod-a"]
+            sampler.samples({"pod-a": 2})
+            sampler.close()
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(sample.utilization, 60)
+        self.assertEqual(sample.memory_used_gib, 3)
 
 
 class DashboardTests(unittest.IsolatedAsyncioTestCase):

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import yaml
 
 from falcon.cli import _looks_like_legacy_submission, _main_parser, main, resolve_preset, run_legacy
-from falcon.completion import candidates, shell_script
+from falcon.completion import candidates, preset_tokens, shell_script
 from falcon.config import (
     DEFAULT_CONFIG,
     DEFAULT_DASHBOARD_EMA_ALPHA,
@@ -18,7 +18,7 @@ from falcon.config import (
     _remove_legacy_falcon_shell,
 )
 from falcon.launcher import build_jet_command
-from falcon.resources import ResourcePlan
+from falcon.resources import NodeResources, ResourcePlan
 
 
 class FalconCliTests(unittest.TestCase):
@@ -167,14 +167,31 @@ class FalconCliTests(unittest.TestCase):
         self.assertEqual(migrated, "before\nafter\n")
 
     def test_shell_completion_replaces_old_function_and_is_dynamic(self):
-        generated = shell_script("zsh")
+        with patch("falcon.completion.preset_tokens", return_value=["h100", "h100x2", "2080ti", "2080tix2"]):
+            generated = shell_script("zsh", config=DEFAULT_CONFIG)
         self.assertIn("function falcon", generated)
-        self.assertIn("/.local/bin/falcon _complete jobs", generated)
-        self.assertIn("words[CURRENT-1]", generated)
+        self.assertNotIn("_complete", generated)
+        self.assertIn("command kubectl get jobs.batch", generated)
+        self.assertIn("_falcon_job_cache_time", generated)
+        self.assertIn("h100x2", generated)
+        self.assertIn("--shm-percent", generated)
         self.assertNotIn("function h100", generated)
         options = candidates("options", DEFAULT_CONFIG, "2080tix3")
         self.assertIn("--shm-percent", options)
         self.assertIn("--max", options)
+
+    def test_preset_capacity_completion_is_cached_across_shells(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "falcon.completion._preset_cache_path", return_value=Path(directory) / "presets.json"
+        ), patch(
+            "falcon.completion.fetch_nodes",
+            return_value=[NodeResources("node", gpu_total=4, gpu_product="2080 Ti")],
+        ) as fetch:
+            first = preset_tokens(DEFAULT_CONFIG)
+            second = preset_tokens(DEFAULT_CONFIG)
+        self.assertIn("2080tix4", first)
+        self.assertEqual(first, second)
+        self.assertEqual(fetch.call_count, 1)
 
     def test_namespace_is_not_a_user_facing_option(self):
         self.assertNotIn("--namespace", candidates("options", DEFAULT_CONFIG, "2080tix3"))

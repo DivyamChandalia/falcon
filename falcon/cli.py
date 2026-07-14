@@ -263,7 +263,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return clean(namespace)
         if args.command in {"shell-init", "completion"}:
             shell = args.shell or detect_shell()[0]
-            print(shell_script(shell))
+            print(shell_script(shell, config=config))
             return 0
         if args.command == "config":
             print(config_path(active_path))
