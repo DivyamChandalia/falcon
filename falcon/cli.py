@@ -249,6 +249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_dashboard(
                 load_config(active_path), namespace, once=args.once, json_output=args.json,
                 job=args.job, samples=args.samples, sample_interval=args.interval,
+                config_file=active_path,
             )
             return 0
         if args.command == "logs":

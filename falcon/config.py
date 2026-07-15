@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import yaml
 
@@ -47,7 +47,11 @@ USER_DEFAULTS: Dict[str, Any] = {
         "a6000": {"gpu_type": "a6000", "minimum_utilization": 30},
         "2080ti": {"gpu_type": "2080ti", "minimum_utilization": 30},
     },
-    "dashboard": {"ema_alpha": DEFAULT_DASHBOARD_EMA_ALPHA},
+    "dashboard": {
+        "ema_alpha": DEFAULT_DASHBOARD_EMA_ALPHA,
+        "sort_field": "Age",
+        "sort_direction": "desc",
+    },
 }
 
 
@@ -114,7 +118,7 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
     if isinstance(raw.get("dashboard"), dict):
         user_raw["dashboard"] = {
             key: value for key, value in raw["dashboard"].items()
-            if key == "ema_alpha"
+            if key in {"ema_alpha", "hidden_panes", "sort_field", "sort_direction"}
         }
         # Preview/setup versions wrote 0.25, 0.08, and later 0.02 into every config.
         # Treat those known generated values as legacy defaults so existing users
@@ -152,6 +156,51 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
     return config
 
 
+def _save_dashboard_settings(settings: Dict[str, Any], path: Optional[str] = None) -> Path:
+    """Persist selected dashboard settings without replacing unrelated user config."""
+    target = config_path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"Falcon config not found: {target}. Run 'falcon setup'.")
+    with target.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Falcon config must be a YAML mapping: {target}")
+    dashboard = raw.setdefault("dashboard", {})
+    if not isinstance(dashboard, dict):
+        raise ValueError("dashboard must be a YAML mapping")
+    for key, value in settings.items():
+        if value is None:
+            dashboard.pop(key, None)
+        else:
+            dashboard[key] = value
+    with target.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(raw, handle, sort_keys=False)
+    try:
+        target.chmod(0o600)
+    except OSError:
+        pass
+    return target
+
+
+def save_hidden_panes(panes: Iterable[str], path: Optional[str] = None) -> Path:
+    """Persist dashboard pane visibility."""
+    hidden = sorted(set(panes))
+    if any(pane not in {"selected", "resources", "events"} for pane in hidden):
+        raise ValueError("dashboard.hidden_panes must contain only selected, resources, or events")
+    return _save_dashboard_settings({"hidden_panes": hidden or None}, path)
+
+
+def save_dashboard_sort(field: str, direction: str, path: Optional[str] = None) -> Path:
+    """Persist the dashboard Jobs sort selection."""
+    if field not in {"Age", "Name", "Status"}:
+        raise ValueError("dashboard.sort_field must be Age, Name, or Status")
+    if direction not in {"asc", "desc"}:
+        raise ValueError("dashboard.sort_direction must be asc or desc")
+    if field == "Status":
+        direction = "asc"
+    return _save_dashboard_settings({"sort_field": field, "sort_direction": direction}, path)
+
+
 def validate_config(config: Dict[str, Any]) -> None:
     if config.get("version") != 1:
         raise ValueError("Unsupported .falconrc version (expected 1)")
@@ -174,6 +223,17 @@ def validate_config(config: Dict[str, Any]) -> None:
     ema_alpha = float(config.get("dashboard", {}).get("ema_alpha", DEFAULT_DASHBOARD_EMA_ALPHA))
     if not 0 < ema_alpha <= 1:
         raise ValueError("dashboard.ema_alpha must be greater than 0 and at most 1")
+    hidden_panes = config.get("dashboard", {}).get("hidden_panes", [])
+    if not isinstance(hidden_panes, list) or any(
+        pane not in {"selected", "resources", "events"} for pane in hidden_panes
+    ):
+        raise ValueError("dashboard.hidden_panes must contain only selected, resources, or events")
+    sort_field = config.get("dashboard", {}).get("sort_field", "Age")
+    sort_direction = config.get("dashboard", {}).get("sort_direction", "desc")
+    if sort_field not in {"Age", "Name", "Status"}:
+        raise ValueError("dashboard.sort_field must be Age, Name, or Status")
+    if sort_direction not in {"asc", "desc"}:
+        raise ValueError("dashboard.sort_direction must be asc or desc")
     for name, preset in config["presets"].items():
         if not preset.get("gpu_type"):
             raise ValueError(f"presets.{name}.gpu_type is required")

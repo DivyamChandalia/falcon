@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import expanded
-from .resources import ResourcePlan, parse_memory_gib
+from .resources import ResourcePlan, canonical_gpu, parse_memory_gib
 
 
 def job_name(command: Sequence[str]) -> str:
@@ -68,7 +68,11 @@ def build_jet_command(
     for volume in runtime.get("volumes", []):
         result += ["--volume", expanded(str(volume))]
     for key, value in runtime.get("environment", {}).items():
+        if key == "FALCON_DEBUG_PROMPT":
+            continue
         result += ["--env", f"{key}={expanded(str(value))}"]
+    if not command:
+        result += ["--env", f"FALCON_DEBUG_PROMPT={canonical_gpu(plan.gpu_type)}x{plan.gpu_count}"]
     python_env = os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_PREFIX")
     if python_env:
         result += ["--pyenv", python_env]

@@ -25,7 +25,7 @@ from textual.binding import Binding
 from textual.widgets import Footer, Header, Static
 
 from .commands import top as open_job_top
-from .config import DEFAULT_DASHBOARD_EMA_ALPHA
+from .config import DEFAULT_DASHBOARD_EMA_ALPHA, save_dashboard_sort, save_hidden_panes
 from .resources import canonical_gpu, fetch_nodes
 
 
@@ -1129,6 +1129,7 @@ def format_snapshot(
 def run_dashboard(
     config: Dict, namespace: Optional[str] = None, once: bool = False, json_output: bool = False,
     job: Optional[str] = None, samples: Optional[int] = None, sample_interval: float = 1.0,
+    config_file: Optional[str] = None,
 ) -> None:
     namespace = namespace or config["cluster"]["namespace"]
     thresholds = {
@@ -1161,4 +1162,11 @@ def run_dashboard(
         finally:
             collector.close()
         return
-    FalconDashboard(collector).run(mouse=True)
+    FalconDashboard(
+        collector,
+        hidden_panes=dashboard.get("hidden_panes", []),
+        sort_field=dashboard.get("sort_field", "Age"),
+        sort_direction=dashboard.get("sort_direction", "desc"),
+        persist_hidden_panes=lambda panes: save_hidden_panes(panes, config_file),
+        persist_sort=lambda field, direction: save_dashboard_sort(field, direction, config_file),
+    ).run(mouse=True)

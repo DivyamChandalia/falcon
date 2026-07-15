@@ -30,7 +30,10 @@ from falcon.dashboard import (
     parse_memory_gib,
     run_dashboard,
 )
-from falcon.dashboard_ui import CleanupDialog, FilterDialog, KillDialog, MetricPoint, _scaled_history
+from falcon.dashboard_ui import (
+    CleanupDialog, FilterDialog, KillDialog, MetricPoint, PaneVisibilityDialog,
+    _job_status_display, _scaled_history,
+)
 from falcon.resources import NodeResources
 
 
@@ -345,13 +348,23 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
     def test_refresh_target_is_fast_and_fixed(self):
         self.assertEqual(DASHBOARD_REFRESH_SECONDS, 1.0)
 
-    def test_gpu_live_utilization_colors_follow_dashboard_bands(self):
+    def test_metric_and_job_state_colors_follow_dashboard_scheme(self):
         self.assertEqual(_metric_color(29.9), "#55FF55")
         self.assertEqual(_metric_color(30), "#FFFF55")
         self.assertEqual(_metric_color(60), "#FFFF55")
         self.assertEqual(_metric_color(80), "#FF5555")
         self.assertEqual(_metric_color(80.1), "#FF5555")
         self.assertEqual(_metric_color(100), "#FF5555")
+
+        states = []
+        for status, at_risk in (
+            ("Running", False), ("Pending", False), ("Queued", False),
+            ("Succeeded", False), ("Failed", False), ("Running", True),
+        ):
+            row = usage(at_risk=at_risk)
+            row.status = status
+            states.append(_job_status_display(row)[2])
+        self.assertEqual(states, ["#4DDDDD", "#F2F2F2", "#F2F2F2", "#55FF55", "#FF5555", "#FFFF55"])
 
     def test_snapshot_never_exposes_namespace(self):
         rendered = format_snapshot([usage()], "secret-dev")
@@ -443,37 +456,47 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_minimum_terminal_boundary_preserves_a_usable_layout(self):
         app = FalconDashboard(FakeCollector(), 60)
-        async with app.run_test(size=(80, 29)) as pilot:
+        async with app.run_test(size=(80, 21)) as pilot:
             await pilot.pause(0.3)
             self.assertTrue(app.query_one("#resize-message").display)
             self.assertFalse(app.query_one("#jobs-pane").display)
-            self.assertIn("80×30", render_text(app.query_one("#resize-message").content, 79))
+            self.assertIn("80×22", render_text(app.query_one("#resize-message").content, 79))
             app.exit()
 
         app = FalconDashboard(FakeCollector(), 60)
-        async with app.run_test(size=(80, 30)) as pilot:
+        async with app.run_test(size=(80, 22)) as pilot:
             await pilot.pause(0.3)
-            app.rows = [usage(f"job-{index}") for index in range(6)]
+            app.rows = [usage(f"job-{index}") for index in range(30)]
             app.job_events = []
             app._filter_rows()
             app._render_all()
-            self.assertGreaterEqual(app._visible_job_count(), 4)
-            self.assertEqual(app.query_one("#events-pane").styles.height.value, 7)
+            jobs = app.query_one("#jobs-pane")
+            self.assertEqual(app._visible_job_count(), jobs.content_size.height - 1)
+            rendered = render_text(jobs.content, 78).rstrip().splitlines()
+            self.assertEqual(len(rendered), jobs.content_size.height)
+            self.assertEqual(app.query_one("#resources-pane").styles.height.value, 4)
+            self.assertEqual(app.query_one("#events-pane").styles.height.value, 3)
             self.assertEqual(app.query_one("#summary").styles.height.value, 2)
             app.exit()
 
     async def test_summary_shows_free_over_total_gpu_state(self):
-        app = FalconDashboard(FakeCollector(), 60)
-        async with app.run_test(size=(140, 32)) as pilot:
-            await pilot.pause(0.3)
-            rendered = render_text(app.query_one("#summary").content, 138)
-            self.assertIn("RESOURCES AVAILABLE", rendered)
-            self.assertIn("2080Ti 3/8", rendered)
-            self.assertIn("A6000 1/4", rendered)
-            self.assertIn("H100 2/4", rendered)
-            self.assertEqual(rendered.count("FREE"), 0)
-            self.assertNotIn("GPU 77%", rendered)
-            app.exit()
+        for width in (80, 140):
+            with self.subTest(width=width):
+                app = FalconDashboard(FakeCollector(), 60)
+                async with app.run_test(size=(width, 32)) as pilot:
+                    await pilot.pause(0.3)
+                    rendered = render_text(app.query_one("#summary").content, width - 2)
+                    self.assertIn("2080Ti 3/8", rendered)
+                    self.assertIn("A6000 1/4", rendered)
+                    self.assertIn("H100 2/4", rendered)
+                    self.assertNotIn("GPU 77%", rendered)
+                    if width < 130:
+                        self.assertNotIn("JOBS", rendered)
+                        self.assertNotIn("NODES", rendered)
+                        self.assertNotIn("RESOURCES AVAILABLE", rendered)
+                    else:
+                        self.assertIn("RESOURCES AVAILABLE", rendered)
+                    app.exit()
 
     async def test_eviction_risk_status_is_not_clipped(self):
         app = FalconDashboard(FakeCollector(), 60)
@@ -737,7 +760,11 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             app.exit()
 
     async def test_tab_and_shift_tab_cycle_normal_and_expanded_panes(self):
-        app = FalconDashboard(FakeCollector(), 60)
+        persisted_panes = []
+        app = FalconDashboard(
+            FakeCollector(), 60,
+            persist_hidden_panes=lambda panes: persisted_panes.append(set(panes)),
+        )
         async with app.run_test(size=(100, 32)) as pilot:
             await pilot.pause(0.3)
             self.assertEqual(app.state.focused_pane, "jobs")
@@ -762,6 +789,18 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.expanded_pane, "resources")
             await pilot.press("shift+tab")
             self.assertEqual(app.state.expanded_pane, "selected")
+
+            await pilot.press("escape")
+            await pilot.press("v")
+            self.assertIsInstance(app.screen, PaneVisibilityDialog)
+            await pilot.press("down", "down", "space", "enter")
+            await pilot.pause()
+            self.assertIn("events", app.state.hidden_panes)
+            self.assertEqual(persisted_panes, [{"events"}])
+            self.assertFalse(app.query_one("#events-pane").display)
+            app.action_focus_resources()
+            await pilot.press("tab")
+            self.assertEqual(app.state.focused_pane, "jobs")
             app.exit()
 
     async def test_expanded_mouse_scroll_does_not_switch_jobs(self):
@@ -787,11 +826,30 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             app.exit()
 
     async def test_jobs_footer_exposes_sort_shortcut(self):
-        app = FalconDashboard(FakeCollector(), 60)
+        persisted_sort = []
+        app = FalconDashboard(
+            FakeCollector(), 60,
+            persist_sort=lambda field, direction: persisted_sort.append((field, direction)),
+        )
         async with app.run_test(size=(120, 32)) as pilot:
             await pilot.pause(0.3)
             footer = render_text(app.query_one("#falcon-footer").content, 118)
             self.assertIn("s Sort", footer)
+            rows = []
+            for status in ("Succeeded", "Failed", "Pending", "Running", "Queued"):
+                row = usage(status.lower())
+                row.status = status
+                rows.append(row)
+            app.rows = rows
+            app._filter_rows()
+            await pilot.press("s", "s")
+            self.assertEqual(app.state.sort_field, "Status")
+            self.assertEqual(app.state.sort_direction, "asc")
+            self.assertEqual(
+                [row.status for row in app.filtered_rows],
+                ["Running", "Pending", "Queued", "Failed", "Succeeded"],
+            )
+            self.assertEqual(persisted_sort[-1], ("Status", "asc"))
             app.exit()
 
     async def test_filter_and_kill_dialogs_are_keyboard_accessible(self):

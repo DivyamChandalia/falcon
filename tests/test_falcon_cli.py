@@ -17,6 +17,8 @@ from falcon.config import (
     load_config,
     namespace_from_logname,
     run_setup,
+    save_dashboard_sort,
+    save_hidden_panes,
     _remove_legacy_falcon_shell,
 )
 from falcon.launcher import build_jet_command
@@ -151,10 +153,22 @@ class FalconCliTests(unittest.TestCase):
             path.write_text(
                 "version: 1\n" + self.persisted_identity
                 + "dashboard:\n  refresh_seconds: 99\n  ema_alpha: 0.4\n"
+                + "  hidden_panes: [events]\n  sort_field: Name\n  sort_direction: asc\n"
             )
             config = load_config(str(path))
             self.assertNotIn("refresh_seconds", config["dashboard"])
             self.assertEqual(config["dashboard"]["ema_alpha"], 0.4)
+            self.assertEqual(config["dashboard"]["hidden_panes"], ["events"])
+            self.assertEqual(config["dashboard"]["sort_field"], "Name")
+            self.assertEqual(config["dashboard"]["sort_direction"], "asc")
+            save_hidden_panes({"resources", "selected"}, str(path))
+            save_dashboard_sort("Status", "desc", str(path))
+            persisted = yaml.safe_load(path.read_text())
+            self.assertEqual(persisted["dashboard"]["hidden_panes"], ["resources", "selected"])
+            self.assertEqual(persisted["dashboard"]["sort_field"], "Status")
+            self.assertEqual(persisted["dashboard"]["sort_direction"], "asc")
+            self.assertEqual(persisted["cluster"]["namespace"], "test-dev")
+            self.assertEqual(persisted["runtime"]["volumes"][0], "/media/beegfs/users/test/")
 
     def test_generated_legacy_ema_alpha_migrates_to_smoother_default(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -190,6 +204,8 @@ class FalconCliTests(unittest.TestCase):
         self.assertIn("_falcon_job_cache_time", generated)
         self.assertIn("h100x2", generated)
         self.assertIn("--shm-percent", generated)
+        self.assertIn("FALCON_DEBUG_PROMPT", generated)
+        self.assertIn("%F{81}", generated)
         self.assertNotIn("function h100", generated)
         options = candidates("options", DEFAULT_CONFIG, "2080tix3")
         self.assertIn("--shm-percent", options)
@@ -221,6 +237,7 @@ class FalconCliTests(unittest.TestCase):
         self.assertNotIn("kubernetes.io/hostname=nodex1", command)
         self.assertIn("falcon.dev/managed=true", command)
         self.assertNotIn("IN_JET_POD=1", command)
+        self.assertFalse(any("FALCON_DEBUG_PROMPT=" in value for value in command))
         self.assertIn("CONDA_AUTO_ACTIVATE_BASE=false", command)
         self.assertEqual(command[command.index("--shm-size") + 1], "42.4Gi")
         self.assertIn("--dry-run", command)
@@ -229,6 +246,7 @@ class FalconCliTests(unittest.TestCase):
         plan = ResourcePlan("h100", "h100", 1, "48:48", "282.6Gi:282.6Gi", "nodex1", True)
         command = build_jet_command(DEFAULT_CONFIG, plan, [], name="debug", pin_node=True)
         self.assertIn("kubernetes.io/hostname=nodex1", command)
+        self.assertIn("FALCON_DEBUG_PROMPT=h100x1", command)
 
     def test_preset_can_override_shared_memory_percentage(self):
         config = copy.deepcopy(DEFAULT_CONFIG)

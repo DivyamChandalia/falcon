@@ -177,7 +177,10 @@ _falcon_native() {
   fi
   compadd -- $values
 }
-compdef _falcon_native falcon'''
+compdef _falcon_native falcon
+if [[ -n "${FALCON_DEBUG_PROMPT:-}" && "${PROMPT:-}" != *"${FALCON_DEBUG_PROMPT}"* ]]; then
+  PROMPT="(%B%F{81}${FALCON_DEBUG_PROMPT}%f%b) ${PROMPT:-%~ %# }"
+fi'''
         for marker, value in replacements.items():
             script = script.replace(marker, value)
         return script
@@ -230,7 +233,10 @@ _falcon_native() {
   fi
   COMPREPLY=( $(compgen -W "${values[*]}" -- "$cur") )
 }
-complete -F _falcon_native falcon'''
+complete -F _falcon_native falcon
+if [[ -n "${FALCON_DEBUG_PROMPT:-}" && "${PS1:-}" != *"${FALCON_DEBUG_PROMPT}"* ]]; then
+  PS1="\[\e[1;38;5;81m\](${FALCON_DEBUG_PROMPT})\[\e[0m\] ${PS1:-\w\\$ }"
+fi'''
         for marker, value in replacements.items():
             script = script.replace(marker, value)
         return script

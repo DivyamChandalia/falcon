@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from rich import box
 from rich.align import Align
@@ -40,7 +40,7 @@ GRAY = "#AAAAAA"
 MUTED = "#666666"
 BORDER = "#555555"
 MINIMUM_WIDTH = 80
-MINIMUM_HEIGHT = 30
+MINIMUM_HEIGHT = 22
 
 
 @dataclass
@@ -68,6 +68,7 @@ class ViewState:
     last_successful_refresh: float = 0.0
     loading_states: Dict[str, bool] = field(default_factory=dict)
     gpu_availability: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    hidden_panes: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -160,11 +161,23 @@ def _scaled_history(
 
 def _status_style(status: str) -> Tuple[str, str]:
     lowered = status.lower()
-    if lowered in {"running", "succeeded"}:
-        return ("●" if lowered == "running" else "✓", GREEN)
+    if lowered == "running":
+        return ("●", CYAN_2)
+    if lowered == "succeeded":
+        return ("✓", GREEN)
     if lowered in {"failed", "unknown"}:
         return ("✕", RED)
+    if lowered in {"queued", "pending"}:
+        return ("●", WHITE)
     return ("●", YELLOW)
+
+
+def _job_status_display(row: JobUsage) -> Tuple[str, str, str]:
+    """Return icon, label, and color for the Jobs-table status cell."""
+    if row.at_risk:
+        return "●", "Eviction risk", YELLOW
+    icon, color = _status_style(row.status)
+    return icon, row.status, color
 
 
 def _gpu_display(gpu_type: str, count: int) -> str:
@@ -400,6 +413,65 @@ class FilterDialog(ModalScreen[Optional[Dict[str, str]]]):
     def action_cancel(self) -> None: self.dismiss(None)
 
 
+class PaneVisibilityDialog(ModalScreen[Optional[Set[str]]]):
+    CSS = f"""
+    PaneVisibilityDialog {{ align: center middle; background: #000000; }}
+    #panes-box {{ width: 62; height: 14; border: solid {CYAN}; background: #000000; padding: 1 2; }}
+    #panes-text {{ background: #000000; color: {WHITE}; }}
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("enter", "apply", "Apply", priority=True),
+        Binding("up", "up", "Previous", priority=True),
+        Binding("down", "down", "Next", priority=True),
+        Binding("space", "toggle", "Toggle", priority=True),
+    ]
+
+    def __init__(self, hidden: Set[str]):
+        super().__init__()
+        self.hidden = set(hidden)
+        self.panes = ["selected", "resources", "events"]
+        self.index = 0
+
+    def compose(self) -> ComposeResult:
+        with Container(id="panes-box"):
+            yield Static(id="panes-text")
+
+    def on_mount(self) -> None:
+        self._render_dialog()
+
+    def _render_dialog(self) -> None:
+        labels = {"selected": "Selected Job", "resources": "Resource Usage", "events": "Events"}
+        text = Text("VISIBLE PANES\n", style=f"bold {CYAN}")
+        text.append("Jobs is always visible. Toggle optional panes below.\n\n", style=GRAY)
+        for index, pane in enumerate(self.panes):
+            selected = index == self.index
+            marker = "[ ]" if pane in self.hidden else "[x]"
+            text.append("> " if selected else "  ", style=CYAN if selected else GRAY)
+            text.append(f"{marker} {labels[pane]}\n", style=CYAN if selected else WHITE)
+        text.append("\n↑/↓ Select   Space Toggle   Enter Apply   Esc Cancel", style=GRAY)
+        self.query_one("#panes-text", Static).update(text)
+
+    def action_up(self) -> None:
+        self.index = (self.index - 1) % len(self.panes)
+        self._render_dialog()
+
+    def action_down(self) -> None:
+        self.index = (self.index + 1) % len(self.panes)
+        self._render_dialog()
+
+    def action_toggle(self) -> None:
+        pane = self.panes[self.index]
+        if pane in self.hidden:
+            self.hidden.remove(pane)
+        else:
+            self.hidden.add(pane)
+        self._render_dialog()
+
+    def action_apply(self) -> None: self.dismiss(self.hidden)
+    def action_cancel(self) -> None: self.dismiss(None)
+
+
 CSS = f"""
 Screen {{ background: #000000; color: {WHITE}; overflow: hidden; }}
 Static, Input, Container {{ background: #000000; }}
@@ -411,8 +483,8 @@ DashboardPane {{ border: solid {BORDER}; background: #000000; color: {WHITE}; pa
 DashboardPane:focus {{ border: solid {CYAN}; }}
 #jobs-pane {{ height: 1fr; min-height: 7; }}
 #selected-pane {{ height: 3; min-height: 3; }}
-#resources-pane {{ height: 6; min-height: 5; }}
-#events-pane {{ height: 7; min-height: 7; }}
+#resources-pane {{ height: 6; min-height: 4; }}
+#events-pane {{ height: 7; min-height: 3; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #falcon-footer {{ height: 1; color: {GRAY}; padding: 0 1; }}
 """
@@ -441,6 +513,7 @@ class FalconDashboard(App):
         Binding("m", "marked_only", "Marked only", show=False), Binding("f9", "kill", "Kill", show=False),
         Binding("c", "cleanup", "Clean succeeded", show=False),
         Binding("/", "search", "Search", show=False), Binding("f", "filters", "Filters", show=False),
+        Binding("v", "panes", "Visible panes", show=False),
         Binding("s", "cycle_sort", "Sort", show=False), Binding("?", "help", "Help", show=False),
         Binding("R", "cycle_resource_range", "Range", show=False),
         Binding("Z", "cycle_resource_zoom", "Zoom", show=False),
@@ -448,11 +521,24 @@ class FalconDashboard(App):
         Binding("minus", "resource_zoom_out", "Zoom out", show=False),
     ]
 
-    def __init__(self, collector, refresh_seconds: float = 1.0):
+    def __init__(
+        self, collector, refresh_seconds: float = 1.0,
+        hidden_panes: Optional[List[str]] = None,
+        sort_field: str = "Age", sort_direction: str = "desc",
+        persist_hidden_panes: Optional[Callable[[Set[str]], None]] = None,
+        persist_sort: Optional[Callable[[str, str], None]] = None,
+    ):
         super().__init__()
         self.collector = collector
         self.refresh_seconds = refresh_seconds
         self.state = ViewState()
+        self.state.hidden_panes = set(hidden_panes or []) & {"selected", "resources", "events"}
+        self.state.sort_field = sort_field if sort_field in {"Age", "Name", "Status"} else "Age"
+        self.state.sort_direction = sort_direction if sort_direction in {"asc", "desc"} else "desc"
+        if self.state.sort_field == "Status":
+            self.state.sort_direction = "asc"
+        self._persist_hidden_panes = persist_hidden_panes
+        self._persist_sort = persist_sort
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
@@ -572,12 +658,21 @@ class FalconDashboard(App):
             if filters["marked"] == "Marked" and row.uid not in self.state.marked_job_uids:
                 continue
             result.append(row)
-        reverse = self.state.sort_direction == "desc"
-        key = {
-            "Name": lambda row: row.job.lower(),
-            "Status": lambda row: row.status,
-            "Age": lambda row: -_timestamp(row.created_at),
-        }.get(self.state.sort_field, lambda row: -_timestamp(row.created_at))
+        if self.state.sort_field == "Status":
+            status_order = {
+                "running": 0,
+                "pending": 1, "queued": 1, "suspended": 1,
+                "failed": 2, "unknown": 2,
+                "succeeded": 3,
+            }
+            key = lambda row: (status_order.get(row.status.lower(), 2), -_timestamp(row.created_at))
+            reverse = False
+        else:
+            reverse = self.state.sort_direction == "desc"
+            key = {
+                "Name": lambda row: row.job.lower(),
+                "Age": lambda row: -_timestamp(row.created_at),
+            }.get(self.state.sort_field, lambda row: -_timestamp(row.created_at))
         self.filtered_rows = sorted(result, key=key, reverse=reverse)
         if self.state.cursor_job_uid not in {row.uid for row in self.filtered_rows}:
             self.state.cursor_job_uid = self.filtered_rows[0].uid if self.filtered_rows else ""
@@ -616,7 +711,11 @@ class FalconDashboard(App):
                 rows = self.collector.collect()
                 selected = next((row for row in rows if row.uid == selected_uid), rows[0] if rows else None)
                 events_method = getattr(self.collector, "events", None)
-                job_events = events_method(selected) if events_method and selected else []
+                job_events = (
+                    events_method(selected)
+                    if events_method and selected and "events" not in self.state.hidden_panes
+                    else []
+                )
                 payload = (
                     rows, job_events, selected.uid if selected else "",
                     getattr(self.collector, "last_error", "") or None,
@@ -687,19 +786,26 @@ class FalconDashboard(App):
         succeeded = sum(row.status == "Succeeded" for row in self.rows)
         failed = sum(row.status == "Failed" for row in self.rows)
         nodes = len({row.nodes for row in self.rows if row.nodes not in {"—", "-"}})
-        left = Text()
-        for value, label, color in (
+        width = self.size.width
+        state_items = [
             (running, "RUNNING", GREEN), (risk, "RISK", YELLOW),
             (succeeded, "SUCCESS", GREEN), (failed, "FAILED", RED),
             (len(self.rows), "JOBS", WHITE), (nodes, "NODES", WHITE),
-        ):
+        ]
+        if width < 100:
+            state_items = [state_items[1], state_items[3]]
+        elif width < 130:
+            state_items = state_items[:4]
+
+        left = Text()
+        for value, label, color in state_items:
             if left:
                 left.append("   ")
             left.append(f"{value} {label}", style=f"bold {color}")
 
-        right = Text("RESOURCES AVAILABLE  ", style=f"bold {GRAY}")
+        right = Text("RESOURCES AVAILABLE  " if width >= 130 else "", style=f"bold {GRAY}")
         for gpu_type, label in (("2080ti", "2080Ti"), ("a6000", "A6000"), ("h100", "H100")):
-            if not right.plain.endswith("  "):
+            if right and not right.plain.endswith("  "):
                 right.append("   ")
             free_total = self.state.gpu_availability.get(gpu_type)
             availability = "—/—" if free_total is None else f"{free_total[0]}/{free_total[1]}"
@@ -711,7 +817,7 @@ class FalconDashboard(App):
                 f"{label} {availability}",
                 style=f"bold {_metric_color(used_percent) if used_percent is not None else MUTED}",
             )
-        gap = max(2, self.size.width - len(left.plain) - len(right.plain) - 4)
+        gap = max(2, width - len(left.plain) - len(right.plain) - 4)
         left.append(" " * gap)
         left.append_text(right)
         self.query_one("#summary", Static).update(left)
@@ -735,7 +841,10 @@ class FalconDashboard(App):
 
     def _visible_job_count(self) -> int:
         widget = self.query_one("#jobs-pane", DashboardPane)
-        return max(1, widget.size.height - 3)
+        # DashboardPane.size is already its usable content area. The border is
+        # outside it, so the Jobs table consumes only one content line for its
+        # header and every remaining line can hold a Job.
+        return max(1, widget.content_size.height - 1)
 
     def _ensure_cursor_visible(self) -> None:
         count = self._visible_job_count() if self.is_mounted else 4
@@ -785,22 +894,20 @@ class FalconDashboard(App):
             marked = row.uid in self.state.marked_job_uids
             marker = ">" if selected else " "
             mark = "[x]" if marked else "[ ]"
-            icon, status_color = _status_style("Pending" if row.at_risk else row.status)
-            status_text = "Eviction risk" if row.at_risk else row.status
+            icon, status_text, status_color = _job_status_display(row)
             selection_active = selected and jobs_focused
             cells: List[Text] = [Text(f"{marker}{mark}", style=CYAN if selection_active or marked else GRAY)]
-            name_style = f"bold {CYAN}" if selection_active else (f"bold {WHITE}" if selected else WHITE)
+            name_style = f"bold {WHITE}" if selected else WHITE
             cells.append(Text(row.job, style=name_style, no_wrap=True, overflow="ellipsis"))
             cells.append(Text(f"{icon} {status_text}", style=status_color))
-            pod_color = RED if row.active_pod_state in {"CrashLoopBackOff", "OOMKilled", "ImagePullBackOff", "Evicted"} else WHITE
-            cells.append(Text(row.active_pod_state, style=pod_color, no_wrap=True, overflow="ellipsis"))
+            cells.append(Text(row.active_pod_state, style=WHITE, no_wrap=True, overflow="ellipsis"))
             if width >= 90:
-                cells.append(Text(row.nodes, style=GRAY))
+                cells.append(Text(row.nodes, style=WHITE))
             if width >= 115:
                 cells.append(Text(_gpu_display(row.gpu_type, row.gpu_count), style=WHITE))
             if expanded:
-                cells.extend([Text(str(row.restarts), style=GRAY), Text(row.completions, style=GRAY)])
-            cells.append(Text(row.age, style=GRAY))
+                cells.extend([Text(str(row.restarts), style=WHITE), Text(row.completions, style=WHITE)])
+            cells.append(Text(row.age, style=WHITE))
             table.add_row(*cells)
         position = f" {min(start + 1, len(self.filtered_rows))}-{min(start + count, len(self.filtered_rows))}/{len(self.filtered_rows)} "
         target.border_subtitle = position if len(self.filtered_rows) > count else ""
@@ -1250,23 +1357,23 @@ class FalconDashboard(App):
             return
         marked = len(self.state.marked_job_uids)
         if self.state.focused_pane == "jobs":
-            value = "↑/↓ Navigate   s Sort   Space Mark   f Filters   k/F9 Kill   c Clean   Enter Expand   Tab Next pane   / Search   r Refresh   q Quit"
+            value = "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   k/F9 Kill   c Clean   Enter Expand   Tab Next pane   / Search   r Refresh   q Quit"
             if marked:
                 value += f"      {marked} marked"
         elif self.state.focused_pane == "selected":
             value = (
                 "↑/↓ Command   PgUp/PgDn Page   Home/End   Tab Next pane   Esc Restore   r Refresh   q Quit"
                 if self.state.expanded_pane == "selected"
-                else "↑/↓ Change Job   Enter Expand   Tab Next pane   r Refresh   q Quit"
+                else "↑/↓ Change Job   v Panes   Enter Expand   Tab Next pane   r Refresh   q Quit"
             )
         elif self.state.focused_pane == "resources":
             zoom = round(100 / self.state.resource_zoom)
             if self.state.expanded_pane == "resources":
                 value = f"←/→ History   R Range   +/- Zoom {zoom}%   Z Cycle   r Refresh   Tab Next pane   Esc Restore   q Quit"
             else:
-                value = f"←/→ History   Home/End Range   +/- Zoom {zoom}%   Enter Expand   Tab Next pane   r Refresh   q Quit"
+                value = f"←/→ History   Home/End Range   +/- Zoom {zoom}%   v Panes   Enter Expand   Tab Next pane   r Refresh   q Quit"
         else:
-            value = "↑/↓ Scroll   PgUp/PgDn Page   Home Oldest   End Newest   / Search   Enter Expand   Tab Next pane   q Quit"
+            value = "↑/↓ Scroll   PgUp/PgDn Page   Home Oldest   End Newest   / Search   v Panes   Enter Expand   Tab Next pane   q Quit"
         self.query_one("#falcon-footer", Static).update(Text(value, style=GRAY))
 
     def _render_all(self) -> None:
@@ -1298,6 +1405,11 @@ class FalconDashboard(App):
             )
             return
         resize.display = False
+        visible_panes = self._visible_panes()
+        if self.state.focused_pane not in visible_panes:
+            self.state.focused_pane = "jobs"
+        if self.state.expanded_pane and self.state.expanded_pane not in visible_panes:
+            self.state.expanded_pane = None
         if self.state.expanded_pane:
             active = self.state.expanded_pane + "-pane"
             for pane_id in pane_ids:
@@ -1305,29 +1417,37 @@ class FalconDashboard(App):
             self.query_one(f"#{active}").styles.height = "1fr"
             return
         for pane_id in pane_ids:
-            self.query_one(f"#{pane_id}").display = True
+            pane = pane_id.removesuffix("-pane")
+            self.query_one(f"#{pane_id}").display = pane_id in {"summary", "controls"} or pane in visible_panes
         self.query_one("#jobs-pane").styles.height = "1fr"
         self.query_one("#summary").styles.height = 2
         self.query_one("#selected-pane").styles.height = 3
-        self.query_one("#resources-pane").styles.height = 6
-        self.query_one("#events-pane").styles.height = 7
+        emergency_fit = self.size.height < 28
+        self.query_one("#resources-pane").styles.height = 4 if emergency_fit else 6
+        self.query_one("#events-pane").styles.height = 3 if emergency_fit else 7
+
+    def _visible_panes(self) -> List[str]:
+        return [pane for pane in ("jobs", "selected", "resources", "events") if pane not in self.state.hidden_panes]
 
     def _focus(self, pane: str) -> None:
+        if pane not in self._visible_panes():
+            self.notify(f"{pane.title()} pane is hidden · press v to configure panes")
+            return
         self.state.focused_pane = pane
         self.query_one(f"#{pane}-pane", DashboardPane).focus()
         self._set_titles()
         self._render_footer()
 
     def action_next_pane(self) -> None:
-        panes = ["jobs", "selected", "resources", "events"]
-        self._cycle_pane(1, panes)
+        self._cycle_pane(1)
 
     def action_previous_pane(self) -> None:
-        panes = ["jobs", "selected", "resources", "events"]
-        self._cycle_pane(-1, panes)
+        self._cycle_pane(-1)
 
     def _cycle_pane(self, amount: int, panes: Optional[List[str]] = None) -> None:
-        panes = panes or ["jobs", "selected", "resources", "events"]
+        panes = panes or self._visible_panes()
+        if self.state.focused_pane not in panes:
+            self.state.focused_pane = "jobs"
         pane = panes[(panes.index(self.state.focused_pane) + amount) % len(panes)]
         if self.state.expanded_pane:
             self.state.focused_pane = pane
@@ -1357,7 +1477,7 @@ class FalconDashboard(App):
         # Application bindings remain active while a ModalScreen is mounted in
         # the Textual version supported by Falcon.  Handle Escape here as well
         # as on each dialog so it can never leak through to the dashboard.
-        if isinstance(self.screen, (FilterDialog, KillDialog, CleanupDialog)):
+        if isinstance(self.screen, (FilterDialog, KillDialog, CleanupDialog, PaneVisibilityDialog)):
             self.screen.dismiss(None)
             return
         search = self.query_one("#search-input", Input)
@@ -1583,8 +1703,16 @@ class FalconDashboard(App):
         values = ["Age", "Name", "Status"]
         current = self.state.sort_field
         self.state.sort_field = values[(values.index(current) + 1) % len(values)]
+        self.state.sort_direction = {
+            "Age": "desc", "Name": "asc", "Status": "asc",
+        }[self.state.sort_field]
         self._filter_rows()
         self._render_all()
+        if self._persist_sort:
+            try:
+                self._persist_sort(self.state.sort_field, self.state.sort_direction)
+            except (OSError, ValueError) as exc:
+                self.notify(f"Could not save sort selection: {exc}", severity="error")
 
     def action_update_data(self) -> None:
         invalidate = getattr(self.collector, "invalidate", None)
@@ -1592,7 +1720,28 @@ class FalconDashboard(App):
         self._request_update()
 
     def action_help(self) -> None:
-        self.notify("Tab panes · 1/2/3 focus · Space mark · k/F9 delete · c clean succeeded · / search · z expand · r refresh · q quit", timeout=8)
+        self.notify("Tab panes · v show/hide panes · 1/2/3 focus · Space mark · k/F9 delete · c clean succeeded · / search · z expand · r refresh · q quit", timeout=8)
+
+    def action_panes(self) -> None:
+        self.push_screen(PaneVisibilityDialog(self.state.hidden_panes), self._panes_selected)
+
+    def _panes_selected(self, hidden: Optional[Set[str]]) -> None:
+        if hidden is None:
+            return
+        self.state.hidden_panes = set(hidden)
+        if self.state.focused_pane in hidden:
+            self.state.focused_pane = "jobs"
+        if self.state.expanded_pane in hidden:
+            self.state.expanded_pane = None
+        self._apply_layout()
+        self._focus(self.state.focused_pane)
+        self._render_all()
+        self._request_update()
+        if self._persist_hidden_panes:
+            try:
+                self._persist_hidden_panes(self.state.hidden_panes)
+            except (OSError, ValueError) as exc:
+                self.notify(f"Could not save pane visibility: {exc}", severity="error")
 
     def action_cleanup(self) -> None:
         targets = [row for row in self.rows if row.status == "Succeeded"]
