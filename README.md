@@ -1,152 +1,270 @@
-# Jet: A CLI Job Execution Toolkit (Jet) for Kubernetes
+# Falcon
 
-Skip the YAML. A lightweight command-line Job Execution Toolkit (Jet) for Kubernetes that simplifies batch job management with a focus on ML workloads.
+Cluster-aware Kubernetes jobs for GPU research, without writing YAML.
 
-[![PyPI version](https://badge.fury.io/py/jet-k8s.svg)](https://badge.fury.io/py/jet-k8s) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+Falcon turns requests such as `h100`, `a6000x2`, or `2080tix3` into schedulable Kubernetes Jobs, sizes CPU and memory from live node capacity, carries the active Python environment into the pod, and provides an nvitop-inspired dashboard for monitoring the result.
 
-## Features
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-4DDDDD.svg)](https://www.python.org/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Jobs-326CE5.svg)](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-55FF55.svg)](LICENSE)
 
-- 🚀 **Simplified Job Submission** - Define and submit Kubernetes jobs directly from the command line without writing YAML files manually.
-- 📊 **Easy Monitoring** - Track and manage batch jobs with a fast and responsive Terminal User Interface (TUI).
-- 📈 **Resource Management** - View available cluster resources (CPU, memory, GPU) with `kube-state-metrics` integration.
-- 📄 **Work with Templates** - Save custom job templates to standardize and simplify job configurations, making your experiments reproducible.
-- 📓 **Jupyter Integration** - Launch Jupyter notebooks on Kubernetes with automatic port forwarding.
-- 🐛 **Debug Sessions** - Spin up interactive debug pods for quick troubleshooting.
-- 🛠️ **Creating Services** - Easily create and manage Kubernetes services to expose your applications.
-- 🤖 **ML Focused** - Designed with Python machine learning workloads and data processing tasks in mind.
+<p align="center">
+  <img src="assets/falcon-dashboard.svg" alt="Falcon Dashboard showing Kubernetes Jobs, GPU availability, resource usage, and events" width="100%">
+</p>
 
-## Overview
+## Why Falcon?
 
-Jet eliminates the complexity of Kubernetes YAML configuration files, providing a streamlined CLI experience for:
-- Defining and submitting batch jobs
-- Monitoring job status and logs with a lightweight and fast Terminal User Interface (TUI) inspired by [`k9s`](https://k9scli.io/).
-- Viewing cluster resource availability (CPU, memory, GPU) with integration to `kube-state-metrics`.
-- Running interactive Jupyter notebook sessions on Kubernetes with automatic port forwarding.
-- Creating interactive shell debug environments for troubleshooting and debugging.
-- Automatic job cleanup for Jupyter and debug sessions.
-- Easily create and manage Kubernetes services to expose your applications.
-Perfect for ML engineers and researchers who want to leverage Kubernetes for ML training, inference and experimentation jobs without the YAML overhead.
+- **Dynamic GPU presets** — request any valid count: `2080ti`, `2080tix3`, `a6000x2`, `h100x4`.
+- **Resource-aware sizing** — select the strongest suitable node profile and derive proportional CPU and RAM without pinning Kubernetes placement.
+- **Safe overrides** — override CPU, RAM, shared memory, or request 95% of proportional node capacity with `--max`.
+- **Environment continuity** — mount the active Conda/virtual environment and keep its `bin` directory first in the pod.
+- **Interactive debug pods** — omit the command to enter a disposable shell with a visible prompt marker such as `(2080tix1)`.
+- **Job operations** — native `logs`, `attach`, `top`, `delete`, and succeeded-job cleanup.
+- **Fast completion** — commands, presets, GPU counts, options, and live Job names complete in Zsh and Bash.
+- **Agent-friendly monitoring** — bounded text and JSON snapshots avoid flooding an agent context with TUI frames.
+- **Jet underneath** — Falcon builds on Jet, and the original `jet` CLI remains available.
 
-## Installation
+## Quick start
 
-### Dependencies
+### Requirements
 
-1. Python 3.8.1 or higher.
+- Python 3.8.1 or newer.
+- `kubectl` configured for the target cluster.
+- NVIDIA GPU resource labels compatible with the cluster’s Jet configuration.
+- Shared storage for mounted home, team directories, and Python environments when Jobs can move between nodes.
 
-2. `kubectl` installed and configured on your local machine. Refer to the [official Kubernetes documentation](https://kubernetes.io/docs/tasks/tools/) for installation instructions.
-
-3. A running Kubernetes cluster, with kubeconfig properly set up to access the cluster from your local machine.
-
-4. For the `jet resources` command, `kube-state-metrics` must be installed in your cluster to fetch resource metrics. Currently tested with `kube-state-metrics` versions 7.0.0 and 7.1.0.
- 
-### Install Jet
-Jet can be installed using pip from PyPI:
+### Install from this fork
 
 ```bash
-pip install jet-k8s
+git clone https://github.com/DivyamChandalia/falcon.git
+cd falcon
+python -m pip install -e .
+falcon setup
 ```
 
-Installing as a `uv` tool:
+`falcon setup` writes `~/.falconrc`, installs an environment-independent launcher under `~/.local/bin`, and adds the appropriate shell initialization to Zsh or Bash. Open a new shell after setup, or source the shell rc file it reports.
+
+If migrating an older preview configuration:
 
 ```bash
-uv tool install jet-k8s
+falcon setup --force
 ```
 
-Verify the installation:
+## Launch Jobs
+
+Run a command on one H100:
 
 ```bash
-jet --version
-
-jet --help
+falcon h100 -- python train.py --config configs/pretrain.yaml
 ```
 
-## Usage
-After installation, you can use the `jet` command in your terminal. Here are some basic commands:
-
-### Falcon
-
-This fork ships an opinionated, cluster-aware workflow as the native `falcon` command. `falcon-next` remains as a temporary compatibility entry point.
+Request any GPU count supported by the cluster:
 
 ```bash
-command falcon setup --force  # migrate an older wrapper/preview config
-falcon h100 -- python train.py
-falcon 2080tix3 -m 50Gi:50Gi -- python train.py
+falcon 2080tix3 -- python train.py
+falcon a6000x2 -- python evaluate.py
+falcon h100x4 -- torchrun --nproc-per-node=4 train.py
+```
+
+Override resources when the automatic plan is not appropriate:
+
+```bash
+falcon 2080tix2 \
+  -c 48:48 \
+  -m 128Gi:128Gi \
+  --shm-percent 20 \
+  -- python train.py
+```
+
+Use proportional node capacity rather than currently free CPU and RAM:
+
+```bash
+falcon 2080tix4 --max -- python train.py
+```
+
+Falcon warns when an override cannot run immediately, but leaves the Job for Kubernetes to schedule when capacity becomes available.
+
+### Interactive debug pods
+
+Leave out the command to open a disposable debug shell:
+
+```bash
+falcon 2080ti
+```
+
+The prompt is clearly marked inside the pod while preserving the existing theme, current directory, and Git information:
+
+```text
+(2080tix1) ➜ falcon
+```
+
+Exiting the shell terminates the session and removes the debug Job. The marker is injected only into debug pods; local shells and command Jobs are unchanged.
+
+### Legacy-compatible submission
+
+Existing scripts using Jet-style Falcon flags continue to work:
+
+```bash
+falcon -j experiment-name -n 3 -g 2080ti -a -- python train.py
+```
+
+## Resource planning
+
+For a GPU request, Falcon inspects current node metrics and chooses a sizing profile with enough GPUs and the most useful remaining compute. If a node has four GPUs and the request asks for two, the default plan requests roughly half of that node’s CPU and RAM, capped to what is currently schedulable.
+
+Falcon does **not** pin the Job to the sizing node by default. Kubernetes remains free to place it on any compatible node. Use `--pin-node` only when explicit placement is required.
+
+`--max` changes CPU and RAM sizing to approximately 95% of the request’s proportional share of total node capacity, independent of current free capacity. Explicit `-c` and `-m` values still take precedence.
+
+Shared memory defaults to 15% of allocated RAM and can be changed globally, per preset, or per launch.
+
+## Dashboard
+
+```bash
 falcon dashboard
 ```
 
-Setup installs the native command wrapper and dynamic completion for the active zsh/bash shell. See [Native Falcon](docs/falcon.md) for resource planning, overrides, job controls, and dashboard behavior.
+The full-screen dashboard combines nvitop-style resource visibility with htop-style Job controls:
 
-Please refer to the following sections for detailed user guides.
+- Live Kubernetes Job and active-pod state.
+- Cluster-wide free/total counts for 2080Ti, A6000, and H100 GPUs.
+- GPU utilization, rolling average, VRAM, CPU, and RAM history.
+- Per-device GPU memory, utilization, temperature, power, ECC, and driver data.
+- Job events, search, filters, marking, sorting, cleanup, and guarded deletion.
+- Persistent pane visibility and sorting preferences stored in `.falconrc`.
+- Responsive layouts down to `80×22`.
 
-- [Submitting Jobs](https://github.com/manideep2510/jet-k8s/blob/main/docs/submitting-jobs.md)
-- [Starting Jupyter Notebook Sessions](https://github.com/manideep2510/jet-k8s/blob/main/docs/jupyter-notebooks.md)
-- [Starting Debug Sessions](https://github.com/manideep2510/jet-k8s/blob/main/docs/debug-sessions.md)
-- [Creating Services](https://github.com/manideep2510/jet-k8s/blob/main/docs/services.md)
-- [Using Job Templates](https://github.com/manideep2510/jet-k8s/blob/main/docs/templates.md)
-- [Monitoring Jobs](https://github.com/manideep2510/jet-k8s/blob/main/docs/monitoring-jobs.md)
-- [Other Commands](https://github.com/manideep2510/jet-k8s/blob/main/docs/other-commands.md)
+<p align="center">
+  <img src="assets/falcon-resources.svg" alt="Falcon expanded resource usage view with GPU, VRAM, CPU, RAM history and GPU device details" width="100%">
+</p>
 
-## Demos 
+### Essential controls
 
-> [!TIP]
-> Click the GIFs to view the demos on Asciinema player with media controls.
+| Key | Action |
+| --- | --- |
+| `Tab` / `Shift+Tab` | Move between visible panes |
+| `Enter` or `z` | Expand the focused pane |
+| `Esc` | Restore the dashboard or cancel |
+| `↑` / `↓` | Navigate the focused pane |
+| `Space` | Mark the current Job |
+| `f` | Open Job filters |
+| `s` | Cycle persistent sort fields |
+| `v` | Show or hide optional panes persistently |
+| `/` | Search Jobs or Events |
+| `k` or `F9` | Open the guarded deletion dialog |
+| `c` | Clean succeeded Jobs |
+| `r` | Refresh now |
+| `q` | Quit |
 
-### Submitting Jobs
-[![til](https://github.com/manideep2510/jet-k8s/raw/main/assets/job-launch.gif)](https://asciinema.org/a/WxvEBtyK4D02BvaLI9CC5a4G4)
+Status sorting always follows the operational order **Running → Pending/Queued → Failed → Succeeded**. Job rows stay white for readability; only the Status cell carries the state color.
 
-### Monitoring Jobs with TUI
-[![tui](https://github.com/manideep2510/jet-k8s/raw/main/assets/tui.gif)](https://asciinema.org/a/b1OGpHXfY2RZXieT1EnbVPBgu)
+Expanded resource history supports `←`/`→`, `Home`/`End`, `R` for range, and `+`/`-` or `Z` for zoom.
 
-### Starting Jupyter Notebook Sessions and Auto Port-forwarding
-[![jupyter](https://github.com/manideep2510/jet-k8s/raw/main/assets/jupyter-launch.gif)](https://asciinema.org/a/y5BqZj8wB79aQTBUnHibyeAY7)
+### Eviction-risk signal
 
-### Starting Interactive Debug Sessions
-[![debug](https://github.com/manideep2510/jet-k8s/raw/main/assets/debug-launch.gif)](https://asciinema.org/a/O3V6kAflQpTaczlKsO7kVAGK2)
+Falcon does not flag a Job because of a single low-utilization frame. Risk is evaluated only after a complete 60-sample rolling average:
 
-### Saving and Using Job Templates
-[![templates](https://github.com/manideep2510/jet-k8s/raw/main/assets/job-templates.gif)](https://asciinema.org/a/ECWaEYWkT2fJfQHy4zXkow1tP)
+- H100: below the configured 90% floor by default.
+- A6000 and 2080Ti: below the configured 30% floor by default.
 
-## Why Jobs?
+The dashboard continues to show instantaneous utilization separately from the eviction-risk average.
 
-Some key reasons for using Kubernetes Jobs for ML workloads:
+### Agent and script snapshots
 
-1. **Batch Workloads**: Jobs are designed for batch processing tasks, which aligns well with ML training and data processing workloads that are typically non-interactive and run to completion.
-2. **Automatic Retry**: Jobs have built-in retry mechanisms for failed tasks, which is beneficial for long-running ML jobs that may encounter transient failures.
-3. **Resource Management**: Jobs can be scheduled and managed more effectively with schedulers such as KAI-scheduler. For example, pods within jobs can be prempted and automatically rescheduled on different nodes if a high priority job needs resources or to organize pods to optimize cluster resource utilization.
-4. **Completion Tracking**: Jobs provide a clear way to track the completion status of tasks, making it easier to manage and monitor ML workloads.
+When stdout is not a terminal, the dashboard automatically emits a bounded, ANSI-free snapshot instead of repeated frames:
 
-## Notes
+```bash
+falcon dashboard --once
+falcon dashboard --json
+falcon dashboard --job experiment-name --json
+falcon dashboard --job experiment-name --samples 15 --interval 1 --json
+```
 
-1. Jet currently supports some of the frequently used job and pod spec configurations through command-line arguments. If you have specific requirements not currently supported, please raise an issue or contribute a PR to add the necessary features.
+## Manage Jobs
 
-2. Jet currently supports only Kubernetes clusters with NVIDIA GPU nodes.
-   
-3. Pod's `restartPolicy` is set to `Never` for all jobs types by default and job's themselves have `backoffLimit` set to None (so defaults to Kubernetes defaults of 6). This configuration is to ensure that when the containers in pods fail, they are not restarted indefinitely on the same resources, but instead rescheduled on different resources by the job controller. You can override this using the `--restart-policy` argument.
+```bash
+falcon logs experiment-name
+falcon attach experiment-name
+falcon top experiment-name
+falcon delete experiment-name
+falcon clean
+```
 
-4. The argument `--gpu-type` is implemented using node selectors. Ensure that your cluster nodes are labeled appropriately for the GPU types you intend to use.
-For example, to label a node with an A100 GPU, you can use:
-   ```bash
-   kubectl label nodes <node-name> gpu-type=a100
-   ```
+When a Job name is omitted, Falcon uses the most recently launched or selected Job where supported. `falcon clean` removes succeeded Jobs only; running and failed Jobs remain available for inspection.
 
-5. The pod security context is set to run containers with the same user and group ID as the user executing the `jet` command. This is to ensure proper file permission handling when mounting host directories or volumes. If your use case requires running containers with different user/group IDs, please raise an issue or contribute a PR to make this configurable.
+## Configuration
 
-6. The `--pyenv` argument mounts a Python virtual environment from the host into the container at the same path and updates the container's `PATH` accordingly.
+Setup creates a user-owned `~/.falconrc`. A representative configuration is:
 
-   - **Requirements:**
+```yaml
+version: 1
 
-      - **Shared storage**: The env directory must be accessible at the same path on the node where the pod runs. This works automatically with single-node clusters or shared storage (NFS, BeeGFS), but may not work on multi-node clusters without shared storage.
+resources:
+  shared_memory_percent: 15
 
-      - **Python compatibility**: The env's Python executable (read from `pyvenv.cfg`) must be available inside the container. This works if:
-         - The container image has Python installed at the same path (e.g., `/usr/bin/python3.x` for system Python envs), or
-         - The env includes its own Python rather than system Python (e.g., envs created with `uv` or `conda` using a specific Python version).
+presets:
+  h100:
+    gpu_type: h100
+    minimum_utilization: 90
+  a6000:
+    gpu_type: a6000
+    minimum_utilization: 30
+  2080ti:
+    gpu_type: 2080ti
+    minimum_utilization: 30
 
-## TODOs:
+dashboard:
+  ema_alpha: 0.1
+  sort_field: Status
+  sort_direction: asc
+  hidden_panes: []
 
-- [ ] Add support for fractional GPUs using HAMi plugin (In dev: [KAI-scheduler #60](https://github.com/NVIDIA/KAI-Scheduler/pull/60)).
-- [ ] Add support for other accelerator types such as AMDs and TPUs.
-- [ ] Evaluate support for other kubernetes schedulers such as Volcano.
-- [ ] Ability to submit jobs with parallism and gang scheduling for usecases such as multi-node training jobs.
-- [ ] Add support for job dependencies and chaining.
-- [ ] Add TUI support for port forwarding.
-- [ ] Add TUI support to change namespaces and contexts.
+cluster:
+  namespace: your-namespace
+
+runtime:
+  volumes:
+    - /media/beegfs/users/your-user/
+    - /media/beegfs/teams/
+  environment:
+    EXPERIMENT_ROOT: /media/beegfs/teams/experiments
+```
+
+Namespace, mounts, and environment variables are read from this file after setup rather than being regenerated from `LOGNAME`. Infrastructure-specific image, scheduler, labels, and pull-secret defaults remain internal to the deployment.
+
+Use a different configuration without modifying the default:
+
+```bash
+falcon --config /path/to/falconrc dashboard
+FALCON_CONFIG=/path/to/falconrc falcon h100 -- python train.py
+```
+
+See [docs/falcon.md](docs/falcon.md) for the complete behavior and key reference.
+
+## Jet compatibility
+
+Falcon is implemented alongside the original Jet toolkit. Existing Jet workflows remain available, including raw Job launches, Jupyter sessions, services, templates, and the Jet TUI.
+
+- [Submitting Jet Jobs](docs/submitting-jobs.md)
+- [Debug Sessions](docs/debug-sessions.md)
+- [Jupyter Sessions](docs/jupyter-notebooks.md)
+- [Services](docs/services.md)
+- [Templates](docs/templates.md)
+- [Monitoring](docs/monitoring-jobs.md)
+- [Other Jet Commands](docs/other-commands.md)
+
+## Development
+
+Install the project in an environment with its development dependencies, then run:
+
+```bash
+python -m pytest -q
+```
+
+The suite covers resource planning, shell integration, configuration persistence, bounded agent output, Kubernetes collection, and responsive dashboard interaction.
+
+## Attribution and license
+
+Falcon is built on [Jet: A CLI Job Execution Toolkit for Kubernetes](https://github.com/manideep2510/jet-k8s) by Manideep Kolla and contributors.
+
+Licensed under the [Apache License 2.0](LICENSE).
