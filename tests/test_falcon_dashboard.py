@@ -564,6 +564,56 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(command[-2:], ["--namespace", "test-dev"])
                 app.exit()
 
+        source = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "finished-job",
+                "labels": {"falcon.dev/gpu-type": "2080ti", "batch.kubernetes.io/job-name": "finished-job"},
+                "annotations": {"example": "preserved"},
+            },
+            "spec": {
+                "selector": {"matchLabels": {"controller-uid": "old"}},
+                "template": {
+                    "metadata": {
+                        "labels": {"app": "training", "controller-uid": "old", "job-name": "finished-job"},
+                    },
+                    "spec": {"restartPolicy": "Never", "containers": [{"name": "main", "image": "test"}]},
+                },
+            },
+        }
+        calls = []
+
+        def restart_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[:3] == ["kubectl", "get", "job"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps(source), "")
+            if command[:3] == ["kubectl", "delete", "job"]:
+                return subprocess.CompletedProcess(command, 0, "deleted", "")
+            if command[:3] == ["kubectl", "create", "-f"]:
+                return subprocess.CompletedProcess(command, 0, "created", "")
+            raise AssertionError(command)
+
+        app = FalconDashboard(CompletedCollector(), 60)
+        with patch("falcon.dashboard_ui.subprocess.run", side_effect=restart_run):
+            async with app.run_test(size=(100, 32)) as pilot:
+                await pilot.pause(0.3)
+                await pilot.press("k", "down")
+                self.assertEqual(app.screen.action, "restart")
+                await pilot.press("enter")
+                await pilot.pause(0.5)
+                create_call = next(call for call in calls if call[0][:3] == ["kubectl", "create", "-f"])
+                manifest = json.loads(create_call[1]["input"])
+                self.assertEqual(manifest["metadata"]["name"], "finished-job")
+                self.assertEqual(manifest["metadata"]["namespace"], "test-dev")
+                restart_delete = next(call for call in calls if call[0][:3] == ["kubectl", "delete", "job"])
+                self.assertIn("--wait=true", restart_delete[0])
+                self.assertLess(calls.index(restart_delete), calls.index(create_call))
+                self.assertNotIn("selector", manifest["spec"])
+                self.assertEqual(manifest["spec"]["template"]["metadata"]["labels"], {"app": "training"})
+                self.assertEqual(manifest["metadata"]["labels"], {"falcon.dev/gpu-type": "2080ti"})
+                app.exit()
+
     async def test_three_job_delete_accepts_y_confirmation(self):
         app = FalconDashboard(FakeCollector(), 60)
         completed = subprocess.CompletedProcess([], 0, "", "")
@@ -864,6 +914,15 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIsInstance(app.screen, KillDialog)
             self.assertEqual(app.screen.rows[0].uid, app.state.cursor_job_uid)
+            self.assertEqual(app.screen.action, "job")
+            await pilot.press("down")
+            self.assertEqual(app.screen.action, "pod")
+            await pilot.press("down")
+            self.assertEqual(app.screen.action, "restart")
+            await pilot.press("up")
+            self.assertEqual(app.screen.action, "pod")
+            await pilot.press("up")
+            self.assertEqual(app.screen.action, "job")
             await pilot.press("escape")
             await pilot.pause()
             app.exit()

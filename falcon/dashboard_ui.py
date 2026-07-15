@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import subprocess
 import threading
 import textwrap
@@ -41,6 +43,46 @@ MUTED = "#666666"
 BORDER = "#555555"
 MINIMUM_WIDTH = 80
 MINIMUM_HEIGHT = 22
+
+
+def _restart_job_manifest(job: Dict, new_name: str, namespace: str) -> Dict:
+    """Create a portable manifest for rerunning an existing Kubernetes Job."""
+    metadata = job.get("metadata", {})
+    labels = copy.deepcopy(metadata.get("labels") or {})
+    annotations = copy.deepcopy(metadata.get("annotations") or {})
+    controller_labels = {
+        "controller-uid", "batch.kubernetes.io/controller-uid",
+        "job-name", "batch.kubernetes.io/job-name",
+    }
+    for key in controller_labels:
+        labels.pop(key, None)
+    annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+
+    spec = copy.deepcopy(job.get("spec") or {})
+    spec.pop("selector", None)
+    spec.pop("manualSelector", None)
+    template_metadata = spec.setdefault("template", {}).setdefault("metadata", {})
+    template_labels = copy.deepcopy(template_metadata.get("labels") or {})
+    template_annotations = copy.deepcopy(template_metadata.get("annotations") or {})
+    for key in controller_labels:
+        template_labels.pop(key, None)
+    template_metadata.clear()
+    if template_labels:
+        template_metadata["labels"] = template_labels
+    if template_annotations:
+        template_metadata["annotations"] = template_annotations
+
+    new_metadata = {"name": new_name, "namespace": namespace}
+    if labels:
+        new_metadata["labels"] = labels
+    if annotations:
+        new_metadata["annotations"] = annotations
+    return {
+        "apiVersion": job.get("apiVersion", "batch/v1"),
+        "kind": "Job",
+        "metadata": new_metadata,
+        "spec": spec,
+    }
 
 
 @dataclass
@@ -236,6 +278,8 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
         Binding("enter", "advance", "Confirm", priority=True),
         Binding("left", "toggle_action", "Action", priority=True),
         Binding("right", "toggle_action", "Action", priority=True),
+        Binding("up", "previous_action", "Previous action", priority=True),
+        Binding("down", "next_action", "Next action", priority=True),
         Binding("y", "advance", "Confirm", show=False, priority=True),
         Binding("shift+y", "advance", "Confirm", show=False, priority=True),
     ]
@@ -243,6 +287,7 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
     def __init__(self, rows: List[JobUsage]):
         super().__init__()
         self.rows = rows
+        self.actions = ["job", "restart"] if all(row.status == "Succeeded" for row in rows) else ["job", "pod", "restart"]
         self.action = "job"
         self.stage = 0
 
@@ -250,7 +295,7 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
         with Container(id="kill-box"):
             yield Static(id="kill-text")
             yield Input(
-                placeholder=f"Type {len(self.rows)} to confirm deletion",
+                placeholder=f"Type {len(self.rows)} to confirm action",
                 id="kill-count", disabled=True,
             )
 
@@ -261,26 +306,45 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
         names = "\n".join(f"  {row.job}" for row in self.rows[:12])
         if len(self.rows) > 12:
             names += f"\n  … and {len(self.rows) - 12} more"
-        job_marker = "●" if self.action == "job" else "○"
-        pod_marker = "●" if self.action == "pod" else "○"
+        verb = "Restart" if self.action == "restart" else "Delete"
         prompt = "Enter Confirm    Esc Cancel"
         if self.stage == 1:
-            prompt = f"Delete {len(self.rows)} Jobs? Press y or Enter to confirm."
+            prompt = f"{verb} {len(self.rows)} Jobs? Press y or Enter to confirm."
         elif self.stage == 2:
-            prompt = f"Type {len(self.rows)} to confirm deletion:"
+            prompt = f"Type {len(self.rows)} to confirm {verb.lower()}:"
         text = Text()
-        text.append(f"Kill Jobs\n\nDelete {len(self.rows)} Job{'s' if len(self.rows) != 1 else ''}?\n\n", style=f"bold {RED}")
+        text.append(f"Job Actions\n\nChoose an action for {len(self.rows)} Job{'s' if len(self.rows) != 1 else ''}:\n\n", style=f"bold {RED}")
         text.append(names + "\n\n", style=WHITE)
         text.append("Action\n", style=GRAY)
-        text.append(f"  {job_marker} Delete Job and managed pods\n", style=CYAN if self.action == "job" else WHITE)
-        text.append(f"  {pod_marker} Delete active pod only\n", style=CYAN if self.action == "pod" else WHITE)
+        action_labels = {
+            "job": "Delete Job and managed pods",
+            "pod": "Delete active pod only",
+            "restart": "Restart Job with the same name",
+        }
+        for action in self.actions:
+            marker = "●" if self.action == action else "○"
+            text.append(
+                f"  {marker} {action_labels[action]}\n",
+                style=CYAN if self.action == action else WHITE,
+            )
         if self.action == "pod":
             text.append("\nThe Job controller may create another pod.\n", style=YELLOW)
+        elif self.action == "restart":
+            text.append("\nThe current Job will be deleted and recreated with the same name.\n", style=YELLOW)
         text.append("\n" + prompt, style=GRAY)
         self.query_one("#kill-text", Static).update(text)
 
     def action_toggle_action(self) -> None:
-        self.action = "pod" if self.action == "job" else "job"
+        self.action_next_action()
+
+    def action_next_action(self) -> None:
+        index = (self.actions.index(self.action) + 1) % len(self.actions)
+        self.action = self.actions[index]
+        self._render_dialog()
+
+    def action_previous_action(self) -> None:
+        index = (self.actions.index(self.action) - 1) % len(self.actions)
+        self.action = self.actions[index]
         self._render_dialog()
 
     def action_advance(self) -> None:
@@ -1357,7 +1421,7 @@ class FalconDashboard(App):
             return
         marked = len(self.state.marked_job_uids)
         if self.state.focused_pane == "jobs":
-            value = "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   k/F9 Kill   c Clean   Enter Expand   Tab Next pane   / Search   r Refresh   q Quit"
+            value = "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   k/F9 Actions   c Clean   Enter Expand   Tab Next pane   / Search   r Refresh   q Quit"
             if marked:
                 value += f"      {marked} marked"
         elif self.state.focused_pane == "selected":
@@ -1720,7 +1784,7 @@ class FalconDashboard(App):
         self._request_update()
 
     def action_help(self) -> None:
-        self.notify("Tab panes · v show/hide panes · 1/2/3 focus · Space mark · k/F9 delete · c clean succeeded · / search · z expand · r refresh · q quit", timeout=8)
+        self.notify("Tab panes · v show/hide panes · 1/2/3 focus · Space mark · k/F9 actions · c clean succeeded · / search · z expand · r refresh · q quit", timeout=8)
 
     def action_panes(self) -> None:
         self.push_screen(PaneVisibilityDialog(self.state.hidden_panes), self._panes_selected)
@@ -1752,7 +1816,7 @@ class FalconDashboard(App):
 
     def _cleanup_confirmed(self, confirmed: bool, targets: List[JobUsage]) -> None:
         if confirmed:
-            self._delete_confirmed(("job", targets))
+            self._job_action_confirmed(("job", targets))
 
     def action_kill(self) -> None:
         selected = self._selected_row()
@@ -1760,16 +1824,44 @@ class FalconDashboard(App):
         if not targets and selected: targets = [selected]
         if not targets: return
         self.state.kill_dialog.update({"isOpen": True, "targets": [row.uid for row in targets]})
-        self.push_screen(KillDialog(targets), self._delete_confirmed)
+        self.push_screen(KillDialog(targets), self._job_action_confirmed)
 
-    def _delete_confirmed(self, result: Optional[Tuple[str, List[JobUsage]]]) -> None:
+    def _job_action_confirmed(self, result: Optional[Tuple[str, List[JobUsage]]]) -> None:
         self.state.kill_dialog["isOpen"] = False
         if not result: return
         action, rows = result
 
-        def delete_targets() -> None:
+        def apply_action() -> None:
             succeeded = 0
             for row in rows:
+                if action == "restart":
+                    try:
+                        fetched = subprocess.run(
+                            ["kubectl", "get", "job", row.job, "--namespace", self.collector.namespace, "-o", "json"],
+                            capture_output=True, text=True, timeout=20,
+                        )
+                        if fetched.returncode != 0:
+                            continue
+                        manifest = _restart_job_manifest(json.loads(fetched.stdout), row.job, self.collector.namespace)
+                        deleted = subprocess.run(
+                            [
+                                "kubectl", "delete", "job", row.job,
+                                "--namespace", self.collector.namespace,
+                                "--wait=true", "--timeout=30s",
+                            ],
+                            capture_output=True, text=True, timeout=40,
+                        )
+                        if deleted.returncode != 0:
+                            continue
+                        created = subprocess.run(
+                            ["kubectl", "create", "-f", "-", "--namespace", self.collector.namespace],
+                            input=json.dumps(manifest), capture_output=True, text=True, timeout=20,
+                        )
+                        if created.returncode == 0:
+                            succeeded += 1
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        pass
+                    continue
                 if action == "pod":
                     if not row.active_pod: continue
                     command = [
@@ -1787,11 +1879,19 @@ class FalconDashboard(App):
                 except (OSError, subprocess.SubprocessError):
                     pass
             def finish() -> None:
-                if succeeded == len(rows): self.notify(f"Deleted {succeeded} Job{'s' if succeeded != 1 else ''}")
-                else: self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
+                if action == "restart":
+                    if succeeded == len(rows):
+                        detail = f" {rows[0].job}" if succeeded == 1 else ""
+                        self.notify(f"Restarted {succeeded} Job{'s' if succeeded != 1 else ''}{detail}")
+                    else:
+                        self.notify(f"Restarted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
+                elif succeeded == len(rows):
+                    self.notify(f"Deleted {succeeded} Job{'s' if succeeded != 1 else ''}")
+                else:
+                    self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
                 invalidate = getattr(self.collector, "invalidate", None)
                 if invalidate: invalidate()
                 self._request_update()
             self.call_from_thread(finish)
 
-        threading.Thread(target=delete_targets, name="falcon-delete", daemon=True).start()
+        threading.Thread(target=apply_action, name="falcon-job-action", daemon=True).start()

@@ -19,7 +19,7 @@ Falcon turns requests such as `h100`, `a6000x2`, or `2080tix3` into schedulable 
 - **Safe overrides** — override CPU, RAM, shared memory, or request 95% of proportional node capacity with `--max`.
 - **Environment continuity** — mount the active Conda/virtual environment and keep its `bin` directory first in the pod.
 - **Interactive debug pods** — omit the command to enter a disposable shell with a visible prompt marker such as `(2080tix1)`.
-- **Job operations** — native `logs`, `attach`, `top`, `delete`, and succeeded-job cleanup.
+- **Job operations** — native `logs`, `attach`, `top`, `delete`, same-name Job restart, and succeeded-job cleanup.
 - **Fast completion** — commands, presets, GPU counts, options, and live Job names complete in Zsh and Bash.
 - **Agent-friendly monitoring** — bounded text and JSON snapshots avoid flooding an agent context with TUI frames.
 - **Jet underneath** — Falcon builds on Jet, and the original `jet` CLI remains available.
