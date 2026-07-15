@@ -1,5 +1,6 @@
 import copy
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ import yaml
 
 from falcon.cli import _looks_like_legacy_submission, _main_parser, main, resolve_preset, run_legacy
 from falcon.completion import candidates, preset_tokens, shell_script
+from falcon.commands import clean
 from falcon.config import (
     DEFAULT_CONFIG,
     DEFAULT_DASHBOARD_EMA_ALPHA,
@@ -26,6 +28,19 @@ class FalconCliTests(unittest.TestCase):
         "cluster:\n  namespace: test-dev\n"
         "runtime:\n  volumes:\n    - /media/beegfs/users/test/\n    - /media/beegfs/teams/\n"
     )
+
+    def test_clean_deletes_succeeded_jobs_only(self):
+        inventory = subprocess.CompletedProcess([], 0, (
+            '{"items": ['
+            '{"metadata": {"name": "done"}, "status": {"succeeded": 1}},'
+            '{"metadata": {"name": "failed"}, "status": {"failed": 1}},'
+            '{"metadata": {"name": "running"}, "status": {"active": 1}}'
+            ']}'
+        ), "")
+        deleted = subprocess.CompletedProcess([], 0, "", "")
+        with patch("falcon.commands.kubectl", side_effect=[inventory, deleted]) as kubectl:
+            self.assertEqual(clean("test-dev"), 0)
+        self.assertEqual(kubectl.call_args_list[1].args[0], ["delete", "job.batch", "done", "-n", "test-dev"])
 
     def test_dynamic_preset_counts_include_odd_counts(self):
         self.assertEqual(resolve_preset("h100", DEFAULT_CONFIG), ("h100", 1))

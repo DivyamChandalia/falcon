@@ -1,4 +1,4 @@
-"""Responsive nvitop-style monitoring with one boxed slot per Kubernetes Job."""
+"""Kubernetes Job metric collection and bounded Falcon dashboard snapshots."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from rich.columns import Columns
 from rich.console import Group
@@ -25,15 +26,33 @@ from textual.widgets import Footer, Header, Static
 
 from .commands import top as open_job_top
 from .config import DEFAULT_DASHBOARD_EMA_ALPHA
+from .resources import canonical_gpu, fetch_nodes
 
 
 DASHBOARD_REFRESH_SECONDS = 1.0
 KUBERNETES_INVENTORY_SECONDS = 5.0
 KUBERNETES_USAGE_SECONDS = 5.0
+EVENT_REFRESH_SECONDS = 5.0
+GPU_AVAILABILITY_SECONDS = 15.0
 ABSOLUTE_MINIMUM_WIDTH = 42
 ABSOLUTE_MINIMUM_HEIGHT = 14
 EMA_WARMUP_SAMPLES = 5
+RISK_AVERAGE_SAMPLES = 60
 AGENT_DEFAULT_SAMPLES = 5
+
+
+@dataclass
+class GpuDevice:
+    index: int
+    name: str = "—"
+    uuid: str = "—"
+    memory_used_gib: Optional[float] = None
+    memory_total_gib: Optional[float] = None
+    utilization: Optional[float] = None
+    temperature_c: Optional[float] = None
+    power_w: Optional[float] = None
+    ecc_errors: Optional[int] = None
+    driver_version: str = "—"
 
 
 @dataclass
@@ -42,6 +61,7 @@ class GpuSample:
     memory_used_gib: float = 0.0
     memory_total_gib: float = 0.0
     gpu_count: int = 0
+    devices: List[GpuDevice] = field(default_factory=list)
 
 
 @dataclass
@@ -62,18 +82,111 @@ class JobUsage:
     memory_requested_gib: float
     age: str
     at_risk: bool
+    uid: str = ""
+    active_pod: str = ""
+    active_pod_uid: str = ""
+    active_pod_state: str = "Unknown"
+    command: str = ""
+    created_at: str = ""
+    started_at: str = ""
+    restarts: int = 0
+    completions: str = ""
+    metrics_updated_at: float = 0.0
+    gpu_metrics_available: bool = True
+    cpu_metrics_available: bool = True
+    gpu_devices: List[GpuDevice] = field(default_factory=list)
+    gpu_risk_average: Optional[float] = None
+    gpu_risk_threshold: Optional[float] = None
 
     @property
     def gpu_memory_percent(self) -> Optional[float]:
-        return _percent(self.gpu_memory_used_gib, self.gpu_memory_total_gib)
+        return _percent(self.gpu_memory_used_gib, self.gpu_memory_total_gib) if self.gpu_metrics_available else None
 
     @property
     def cpu_percent(self) -> Optional[float]:
-        return _percent(self.cpu_used, self.cpu_requested)
+        return _percent(self.cpu_used, self.cpu_requested) if self.cpu_metrics_available else None
 
     @property
     def memory_percent(self) -> Optional[float]:
-        return _percent(self.memory_used_gib, self.memory_requested_gib)
+        return _percent(self.memory_used_gib, self.memory_requested_gib) if self.cpu_metrics_available else None
+
+
+@dataclass
+class JobEvent:
+    timestamp: str
+    event_type: str
+    reason: str
+    message: str
+    object_name: str = ""
+    count: int = 1
+
+
+def _timestamp(value: str) -> float:
+    try:
+        return datetime.fromisoformat((value or "").replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pod_state(item: Dict) -> str:
+    metadata, status = item.get("metadata", {}), item.get("status", {})
+    if metadata.get("deletionTimestamp"):
+        return "Terminating"
+    waiting: List[str] = []
+    terminated: List[str] = []
+    restarts = 0
+    for container in status.get("containerStatuses", []):
+        restarts += int(container.get("restartCount", 0) or 0)
+        state = container.get("state", {})
+        if state.get("waiting", {}).get("reason"):
+            waiting.append(state["waiting"]["reason"])
+        if state.get("terminated", {}).get("reason"):
+            terminated.append(state["terminated"]["reason"])
+    failure_order = ["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerError"]
+    for reason in failure_order:
+        if reason in waiting:
+            return reason
+    if waiting:
+        return waiting[0]
+    failure_terminated = [value for value in terminated if value not in {"Completed"}]
+    if failure_terminated:
+        return failure_terminated[0]
+    if status.get("reason"):
+        return str(status["reason"])
+    return str(status.get("phase") or "Unknown")
+
+
+def _active_pod(pods: List[Dict]) -> Optional[Dict]:
+    if not pods:
+        return None
+    nonterminal = [pod for pod in pods if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}]
+    choices = nonterminal or pods
+    return max(choices, key=lambda pod: _timestamp(pod.get("metadata", {}).get("creationTimestamp", "")))
+
+
+def _job_status(job_item: Optional[Dict], pod_states: List[str]) -> str:
+    if job_item:
+        spec, status = job_item.get("spec", {}), job_item.get("status", {})
+        if spec.get("suspend"):
+            return "Suspended"
+        for condition in status.get("conditions", []):
+            if condition.get("status") != "True":
+                continue
+            if condition.get("type") == "Complete":
+                return "Succeeded"
+            if condition.get("type") == "Failed":
+                return "Failed"
+        if status.get("active"):
+            return "Running"
+    if "Running" in pod_states:
+        return "Running"
+    if "Pending" in pod_states:
+        return "Pending"
+    if "Failed" in pod_states:
+        return "Failed"
+    if pod_states and all(value == "Succeeded" for value in pod_states):
+        return "Succeeded"
+    return "Pending" if job_item else (pod_states[0] if pod_states else "Unknown")
 
 
 def _percent(used: float, requested: float) -> Optional[float]:
@@ -132,12 +245,12 @@ def _short_memory(value: float) -> str:
 
 def _metric_color(value: Optional[float]) -> str:
     if value is None:
-        return "#8793aa"
-    if value > 80:
-        return "#ff5f6d"
+        return "#666666"
+    if value >= 80:
+        return "#FF5555"
     if value >= 30:
-        return "#ffd166"
-    return "#5cffb1"
+        return "#FFFF55"
+    return "#55FF55"
 
 
 def _job_sort_key(row: JobUsage) -> Tuple[bool, bool, bool, str]:
@@ -170,7 +283,10 @@ def _age(timestamp: str) -> str:
 
 
 def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
-    query = "utilization.gpu,memory.used,memory.total"
+    query = (
+        "index,name,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu,"
+        "power.draw,ecc.errors.uncorrected.volatile.total,driver_version"
+    )
     output = _kubectl(
         ["exec", "-n", namespace, pod, "--", "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
         timeout=8,
@@ -181,19 +297,49 @@ def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
 def _parse_gpu_lines(lines: List[str]) -> GpuSample:
     utils: List[float] = []
     used = total = 0.0
+    devices: List[GpuDevice] = []
+
+    def number(value: str) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     for line in lines:
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 3:
+        if len(parts) == 3:  # Backward-compatible parser for cached/test samples.
+            util, memory_used, memory_total = map(number, parts)
+            if util is None or memory_used is None or memory_total is None:
+                continue
+            utils.append(util)
+            used += memory_used / 1024
+            total += memory_total / 1024
+            devices.append(GpuDevice(
+                index=len(devices), utilization=util,
+                memory_used_gib=memory_used / 1024, memory_total_gib=memory_total / 1024,
+            ))
             continue
-        try:
-            utils.append(float(parts[0]))
-            used += float(parts[1]) / 1024
-            total += float(parts[2]) / 1024
-        except ValueError:
+        if len(parts) != 10:
             continue
+        memory_used, memory_total = number(parts[3]), number(parts[4])
+        utilization = number(parts[5])
+        if utilization is not None:
+            utils.append(utilization)
+        if memory_used is not None:
+            used += memory_used / 1024
+        if memory_total is not None:
+            total += memory_total / 1024
+        ecc = number(parts[8])
+        devices.append(GpuDevice(
+            index=int(number(parts[0]) or len(devices)), name=parts[1] or "—", uuid=parts[2] or "—",
+            memory_used_gib=None if memory_used is None else memory_used / 1024,
+            memory_total_gib=None if memory_total is None else memory_total / 1024,
+            utilization=utilization, temperature_c=number(parts[6]), power_w=number(parts[7]),
+            ecc_errors=None if ecc is None else int(ecc), driver_version=parts[9] or "—",
+        ))
     if not utils:
-        return GpuSample()
-    return GpuSample(sum(utils) / len(utils), used, total, len(utils))
+        return GpuSample(devices=devices)
+    return GpuSample(sum(utils) / len(utils), used, total, len(devices), devices)
 
 
 class StreamingGpuSampler:
@@ -221,7 +367,10 @@ class StreamingGpuSampler:
             self._samples.pop(pod, None)
 
     def _start(self, pod: str, gpu_count: int) -> None:
-        query = "utilization.gpu,memory.used,memory.total"
+        query = (
+            "index,name,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu,"
+            "power.draw,ecc.errors.uncorrected.volatile.total,driver_version"
+        )
         try:
             process = subprocess.Popen(
                 [
@@ -244,7 +393,7 @@ class StreamingGpuSampler:
             try:
                 for line in stream:
                     line = line.strip()
-                    if len(line.split(",")) != 3:
+                    if len(line.split(",")) not in {3, 10}:
                         continue
                     batch.append(line)
                     if len(batch) < gpu_count:
@@ -287,7 +436,8 @@ class UsageCollector:
     def __init__(
         self, namespace: str, thresholds: Dict[str, float], ema_alpha: float,
         job_filter: Optional[str] = None, ema_warmup_samples: int = EMA_WARMUP_SAMPLES,
-        streaming_gpu: bool = False,
+        streaming_gpu: bool = False, metrics_url: Optional[str] = None,
+        risk_average_samples: int = RISK_AVERAGE_SAMPLES,
     ):
         self.namespace = namespace
         self.thresholds = thresholds
@@ -296,11 +446,19 @@ class UsageCollector:
         self.ema_warmup_samples = ema_warmup_samples
         self.ema: Dict[str, float] = {}
         self.ema_samples: Dict[str, int] = {}
+        self.risk_average_samples = max(1, risk_average_samples)
+        self.risk_samples: Dict[str, Deque[float]] = {}
         self._items: Optional[List[Dict]] = None
         self._items_at = 0.0
         self._live: Optional[Dict[str, Tuple[float, float]]] = None
         self._live_at = 0.0
         self._gpu_sampler = StreamingGpuSampler(namespace) if streaming_gpu else None
+        self._event_cache: Dict[str, Tuple[float, List[JobEvent]]] = {}
+        self.metrics_url = metrics_url
+        self.gpu_availability: Dict[str, Tuple[int, int]] = {}
+        self._availability_at = 0.0
+        self.last_error = ""
+        self.last_successful_refresh = 0.0
 
     def invalidate(self) -> None:
         self._items_at = 0.0
@@ -309,6 +467,119 @@ class UsageCollector:
     def close(self) -> None:
         if self._gpu_sampler:
             self._gpu_sampler.close()
+
+    def _refresh_gpu_availability(self, now: float) -> None:
+        if now - self._availability_at < GPU_AVAILABILITY_SECONDS:
+            return
+        if self.metrics_url:
+            try:
+                nodes = fetch_nodes(self.metrics_url, timeout=5)
+            except Exception:
+                nodes = []
+            if nodes:
+                availability: Dict[str, Tuple[int, int]] = {}
+                for node in nodes:
+                    if node.unschedulable or not node.gpu_total:
+                        continue
+                    gpu_type = canonical_gpu(node.gpu_product)
+                    free, total = availability.get(gpu_type, (0, 0))
+                    availability[gpu_type] = (free + node.gpu_free, total + node.gpu_total)
+                self.gpu_availability = availability
+                self._availability_at = now
+                return
+        raw = _kubectl(["get", "nodes,pods", "--all-namespaces", "-o", "json"], timeout=15)
+        if raw is None:
+            return
+        try:
+            items = json.loads(raw).get("items", [])
+        except json.JSONDecodeError:
+            return
+        nodes: Dict[str, Dict[str, object]] = {}
+        for item in items:
+            if item.get("kind") != "Node":
+                continue
+            metadata, spec, status = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
+            total = int(status.get("allocatable", {}).get("nvidia.com/gpu", 0) or 0)
+            if not total or spec.get("unschedulable"):
+                continue
+            labels = metadata.get("labels", {})
+            product = (
+                labels.get("nvidia.com/gpu.product")
+                or labels.get("nvidia_com_gpu_product")
+                or labels.get("gpu-type")
+                or ""
+            )
+            nodes[metadata.get("name", "")] = {"type": canonical_gpu(product), "total": total, "used": 0}
+        for item in items:
+            if item.get("kind") != "Pod":
+                continue
+            status, spec = item.get("status", {}), item.get("spec", {})
+            node = nodes.get(spec.get("nodeName", ""))
+            if node is None or status.get("phase") in {"Succeeded", "Failed"}:
+                continue
+            used = 0
+            for container in spec.get("containers", []):
+                resources = container.get("resources", {})
+                requests, limits = resources.get("requests", {}), resources.get("limits", {})
+                used += int(requests.get("nvidia.com/gpu", limits.get("nvidia.com/gpu", 0)) or 0)
+            node["used"] = int(node["used"]) + used
+        availability: Dict[str, Tuple[int, int]] = {}
+        for values in nodes.values():
+            gpu_type = str(values["type"])
+            if not gpu_type:
+                continue
+            free, total = availability.get(gpu_type, (0, 0))
+            node_total, node_used = int(values["total"]), int(values["used"])
+            availability[gpu_type] = (free + max(0, node_total - node_used), total + node_total)
+        self.gpu_availability = availability
+        self._availability_at = now
+
+    def events(self, row: JobUsage, force: bool = False) -> List[JobEvent]:
+        cached = self._event_cache.get(row.uid)
+        now = time.monotonic()
+        if cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
+            return cached[1]
+        names = [row.job] + ([row.active_pod] if row.active_pod else [])
+        collected: Dict[Tuple[str, str, str, str], JobEvent] = {}
+        had_response = False
+        for name in names:
+            raw = _kubectl([
+                "get", "events", "-n", self.namespace,
+                "--field-selector", f"involvedObject.name={name}", "-o", "json",
+            ])
+            if raw is None:
+                continue
+            had_response = True
+            try:
+                items = json.loads(raw).get("items", [])
+            except json.JSONDecodeError:
+                continue
+            for item in items:
+                metadata = item.get("metadata", {})
+                timestamp = (
+                    item.get("eventTime") or item.get("lastTimestamp")
+                    or item.get("series", {}).get("lastObservedTime")
+                    or metadata.get("creationTimestamp", "")
+                )
+                event = JobEvent(
+                    timestamp=str(timestamp),
+                    event_type=str(item.get("type") or "Normal"),
+                    reason=str(item.get("reason") or "Unknown"),
+                    message=str(item.get("message") or ""),
+                    object_name=str(item.get("involvedObject", {}).get("name") or name),
+                    count=int(item.get("count") or item.get("series", {}).get("count") or 1),
+                )
+                key = (event.timestamp, event.reason, event.message, event.object_name)
+                previous = collected.get(key)
+                if previous:
+                    previous.count = max(previous.count, event.count)
+                else:
+                    collected[key] = event
+        events = sorted(collected.values(), key=lambda value: _timestamp(value.timestamp))[-200:]
+        if had_response:
+            self._event_cache[row.uid] = (now, events)
+            return events
+        return cached[1] if cached else []
 
     def _update_ema(self, job: str, utilization: float) -> float:
         samples = self.ema_samples.get(job, 0)
@@ -325,10 +596,25 @@ class UsageCollector:
         self.ema_samples[job] = samples + 1
         return ema
 
+    def _update_risk_average(self, job: str, utilization: float) -> float:
+        samples = self.risk_samples.setdefault(job, deque(maxlen=self.risk_average_samples))
+        samples.append(utilization)
+        return sum(samples) / len(samples)
+
+    def _eviction_risk(self, job: str, average: Optional[float], gpu_count: int, threshold: float) -> bool:
+        """Flag only a complete rolling arithmetic average, never an individual frame."""
+        return (
+            average is not None
+            and gpu_count > 0
+            and len(self.risk_samples.get(job, ())) >= self.risk_average_samples
+            and average < threshold
+        )
+
     def collect(self) -> List[JobUsage]:
         now = time.monotonic()
+        self._refresh_gpu_availability(now)
         if self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
-            get_args = ["get", "pods", "-n", self.namespace]
+            get_args = ["get", "jobs.batch,pods", "-n", self.namespace]
             if self.job_filter:
                 get_args.extend(["-l", f"job-name={self.job_filter}"])
             get_args.extend(["-o", "json"])
@@ -337,11 +623,20 @@ class UsageCollector:
                 try:
                     self._items = json.loads(raw).get("items", [])
                     self._items_at = now
+                    self.last_error = ""
+                    self.last_successful_refresh = time.time()
                 except json.JSONDecodeError:
-                    pass
+                    self.last_error = "invalid Kubernetes API response"
+            else:
+                self.last_error = "Kubernetes API unavailable"
         if self._items is None:
             return []
-        items = self._items
+        all_items = self._items
+        job_items = {
+            item.get("metadata", {}).get("name", ""): item
+            for item in all_items if item.get("kind") == "Job"
+        }
+        items = [item for item in all_items if item.get("kind") != "Job"]
         if self._live is None or now - self._live_at >= KUBERNETES_USAGE_SECONDS:
             top_args = ["top", "pods", "-n", self.namespace]
             if self.job_filter:
@@ -355,6 +650,7 @@ class UsageCollector:
                 }
                 self._live_at = now
         live = self._live or {}
+        live_pods = set(live)
         running_gpu_pods: Dict[str, int] = {}
         for item in items:
             spec = item.get("spec", {})
@@ -374,6 +670,14 @@ class UsageCollector:
                 )
 
         groups: Dict[str, Dict] = {}
+        for job, item in job_items.items():
+            groups[job] = {
+                "statuses": [], "nodes": set(), "gpu_types": set(), "gpu_count": 0, "pods": 0,
+                "gpu_weighted": 0.0, "gpu_samples": 0, "vram_used": 0.0, "vram_total": 0.0,
+                "cpu_used": 0.0, "cpu_requested": 0.0, "memory_used": 0.0,
+                "memory_requested": 0.0, "created": [], "pod_items": [], "job_item": item,
+                "gpu_devices": [],
+            }
         for item in items:
             metadata, spec, status = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
             is_running = status.get("phase") == "Running"
@@ -384,8 +688,10 @@ class UsageCollector:
                 "statuses": [], "nodes": set(), "gpu_types": set(), "gpu_count": 0, "pods": 0,
                 "gpu_weighted": 0.0, "gpu_samples": 0, "vram_used": 0.0, "vram_total": 0.0,
                 "cpu_used": 0.0, "cpu_requested": 0.0, "memory_used": 0.0,
-                "memory_requested": 0.0, "created": [],
+                "memory_requested": 0.0, "created": [], "pod_items": [], "job_item": job_items.get(job),
+                "gpu_devices": [],
             })
+            group["pod_items"].append(item)
             group["statuses"].append(status.get("phase", "Unknown"))
             if spec.get("nodeName"):
                 group["nodes"].add(spec["nodeName"])
@@ -411,26 +717,57 @@ class UsageCollector:
                 group["gpu_samples"] += sample.gpu_count
             group["vram_used"] += sample.memory_used_gib
             group["vram_total"] += sample.memory_total_gib
+            group["gpu_devices"].extend(sample.devices)
 
         result: List[JobUsage] = []
         for job, group in groups.items():
             utilization = (
                 group["gpu_weighted"] / group["gpu_samples"] if group["gpu_samples"] else None
             )
+            cpu_metrics_available = any(
+                pod.get("metadata", {}).get("name", "") in live_pods
+                for pod in group["pod_items"]
+                if pod.get("status", {}).get("phase") == "Running"
+            )
             ema = None
+            risk_average = None
             if utilization is not None:
                 ema = self._update_ema(job, utilization)
+                risk_average = self._update_risk_average(job, utilization)
+            relevant = _active_pod(group["pod_items"])
+            relevant_metadata = relevant.get("metadata", {}) if relevant else {}
+            relevant_spec = relevant.get("spec", {}) if relevant else {}
+            relevant_status = relevant.get("status", {}) if relevant else {}
             gpu_types = sorted(group["gpu_types"])
             gpu_type = ",".join(gpu_types) if gpu_types else "-"
             threshold = max((self.thresholds.get(value.lower(), 30) for value in gpu_types), default=30)
-            at_risk = ema is not None and group["gpu_count"] > 0 and ema < threshold
+            at_risk = self._eviction_risk(job, risk_average, group["gpu_count"], threshold)
             statuses = group["statuses"]
-            status = "Running" if "Running" in statuses else ("Pending" if "Pending" in statuses else statuses[0])
-            created = min((value for value in group["created"] if value), default="")
+            status = _job_status(group.get("job_item"), statuses)
+            job_metadata = (group.get("job_item") or {}).get("metadata", {})
+            job_spec = (group.get("job_item") or {}).get("spec", {})
+            created = job_metadata.get("creationTimestamp") or min(
+                (value for value in group["created"] if value), default=""
+            )
+            owner = next(
+                (value for value in relevant_metadata.get("ownerReferences", []) if value.get("kind") == "Job"),
+                {},
+            )
+            uid = str(job_metadata.get("uid") or owner.get("uid") or job)
+            containers = relevant_spec.get("containers", [])
+            primary = containers[0] if containers else {}
+            command_parts = [
+                str(value) for value in (primary.get("command") or []) + (primary.get("args") or [])
+            ]
+            restarts = sum(
+                int(value.get("restartCount", 0) or 0)
+                for value in relevant_status.get("containerStatuses", [])
+            )
+            completions = str(job_spec.get("completions", 1)) if group.get("job_item") else "—"
             result.append(JobUsage(
                 job=job,
                 status=status,
-                nodes=",".join(sorted(group["nodes"])) or "-",
+                nodes=str(relevant_spec.get("nodeName") or "—"),
                 gpu_type=gpu_type,
                 gpu_count=group["gpu_count"],
                 pod_count=group["pods"],
@@ -444,6 +781,21 @@ class UsageCollector:
                 memory_requested_gib=group["memory_requested"],
                 age=_age(created),
                 at_risk=at_risk,
+                uid=uid,
+                active_pod=str(relevant_metadata.get("name") or ""),
+                active_pod_uid=str(relevant_metadata.get("uid") or ""),
+                active_pod_state=_pod_state(relevant) if relevant else "No active pod",
+                command=" ".join(command_parts),
+                created_at=created,
+                started_at=str(relevant_status.get("startTime") or ""),
+                restarts=restarts,
+                completions=completions,
+                metrics_updated_at=time.time() if utilization is not None or live else 0.0,
+                gpu_metrics_available=utilization is not None,
+                cpu_metrics_available=cpu_metrics_available,
+                gpu_devices=group["gpu_devices"],
+                gpu_risk_average=risk_average,
+                gpu_risk_threshold=threshold,
             ))
         return sorted(result, key=_job_sort_key)
 
@@ -737,6 +1089,11 @@ class FalconDashboard(App):
         self.sub_title = f"{position} · {' · '.join(cues + ['wheel/j/k navigate', 'Enter nvitop'])}"
 
 
+# The full-screen implementation lives separately so the collector remains
+# usable by bounded agent snapshots without initializing Textual view state.
+from .dashboard_ui import FalconDashboard as FalconDashboard
+
+
 def format_snapshot(
     rows: List[JobUsage], namespace: str, json_output: bool = False, sample_count: int = 1
 ) -> str:
@@ -751,12 +1108,10 @@ def format_snapshot(
                 "memory_percent": row.memory_percent,
             })
             jobs.append(item)
-        return json.dumps({
-            "namespace": namespace, "job_count": len(rows), "sample_count": sample_count, "jobs": jobs,
-        }, sort_keys=True)
+        return json.dumps({"job_count": len(rows), "sample_count": sample_count, "jobs": jobs}, sort_keys=True)
 
     risk = sum(row.at_risk for row in rows)
-    lines = [f"namespace={namespace} jobs={len(rows)} samples={sample_count} eviction_risk={risk}"]
+    lines = [f"jobs={len(rows)} samples={sample_count} eviction_risk={risk}"]
     percent = lambda value: "--" if value is None else f"{value:.0f}%"
     for row in rows:
         lines.append(
@@ -792,6 +1147,8 @@ def run_dashboard(
         namespace, thresholds, float(dashboard.get("ema_alpha", DEFAULT_DASHBOARD_EMA_ALPHA)),
         job_filter=job, ema_warmup_samples=sample_count if snapshot else EMA_WARMUP_SAMPLES,
         streaming_gpu=not snapshot or sample_count > 1,
+        metrics_url=config.get("cluster", {}).get("kube_state_metrics_url"),
+        risk_average_samples=sample_count if snapshot else RISK_AVERAGE_SAMPLES,
     )
     if snapshot:
         try:

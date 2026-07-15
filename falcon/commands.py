@@ -81,11 +81,11 @@ def clean(namespace: str) -> int:
     completed = []
     for item in data.get("items", []):
         status = item.get("status", {})
-        if not status.get("active") and (status.get("succeeded") or status.get("failed")):
+        if not status.get("active") and status.get("succeeded"):
             completed.append(item.get("metadata", {}).get("name"))
     completed = [name for name in completed if name]
     if not completed:
-        print("[falcon] No completed or failed jobs to clean.")
+        print("[falcon] No succeeded jobs to clean.")
         return 0
     print(f"[falcon] Cleaning {len(completed)} job(s): {' '.join(completed)}")
     return delete(namespace, completed)
