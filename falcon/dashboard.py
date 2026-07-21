@@ -477,9 +477,24 @@ class UsageCollector:
             except Exception:
                 nodes = []
             if nodes:
+                unschedulable_names = set()
+                if any(not node.scheduling_info_available for node in nodes):
+                    raw_nodes = _kubectl(["get", "nodes", "-o", "json"], timeout=15)
+                    if isinstance(raw_nodes, str):
+                        try:
+                            for item in json.loads(raw_nodes).get("items", []):
+                                spec = item.get("spec", {})
+                                taints = spec.get("taints", []) or []
+                                if spec.get("unschedulable") or any(
+                                    taint.get("effect") in {"NoSchedule", "NoExecute"}
+                                    for taint in taints
+                                ):
+                                    unschedulable_names.add(item.get("metadata", {}).get("name", ""))
+                        except (TypeError, json.JSONDecodeError):
+                            pass
                 availability: Dict[str, Tuple[int, int]] = {}
                 for node in nodes:
-                    if node.unschedulable or not node.gpu_total:
+                    if node.unschedulable or node.name in unschedulable_names or not node.gpu_total:
                         continue
                     gpu_type = canonical_gpu(node.gpu_product)
                     free, total = availability.get(gpu_type, (0, 0))

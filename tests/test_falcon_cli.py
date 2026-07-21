@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import yaml
 
-from falcon.cli import _looks_like_legacy_submission, _main_parser, main, resolve_preset, run_legacy
+from falcon.cli import _looks_like_cpu_submission, _looks_like_legacy_submission, _main_parser, main, resolve_preset, run_legacy
 from falcon.completion import candidates, preset_tokens, shell_script
 from falcon.commands import clean
 from falcon.config import (
@@ -22,7 +22,7 @@ from falcon.config import (
     _remove_legacy_falcon_shell,
 )
 from falcon.launcher import build_jet_command
-from falcon.resources import NodeResources, ResourcePlan
+from falcon.resources import NodeResources, ResourcePlan, plan_cpu_resources
 
 
 class FalconCliTests(unittest.TestCase):
@@ -63,6 +63,9 @@ class FalconCliTests(unittest.TestCase):
         self.assertTrue(args.async_mode)
         self.assertEqual(args.command[-2:], ["python", "train.py"])
         self.assertTrue(_looks_like_legacy_submission(["-j", "legacy-job", "-g", "h100"]))
+        self.assertTrue(_looks_like_cpu_submission(["-c", "2:4", "-m", "12Gi:12Gi", "--", "python", "x.py"]))
+        self.assertTrue(_looks_like_cpu_submission(["--cpu=2", "--memory=12Gi", "--", "python", "x.py"]))
+        self.assertFalse(_looks_like_cpu_submission(["-c", "2", "-g", "h100", "--", "python", "x.py"]))
 
     def test_logname_derives_namespace(self):
         self.assertEqual(namespace_from_logname("divyam.c"), "divyamc-dev")
@@ -85,6 +88,7 @@ class FalconCliTests(unittest.TestCase):
             self.assertNotIn("scheduler", raw["runtime"])
             self.assertEqual(raw["runtime"]["environment"], {})
             self.assertEqual(raw["resources"]["shared_memory_percent"], 15)
+            self.assertIsNone(raw["job"]["backoff_limit"])
             self.assertNotIn("refresh_seconds", raw["dashboard"])
             config = load_config(str(path))
             self.assertEqual(config["presets"]["h100"]["minimum_utilization"], 90)
@@ -241,6 +245,16 @@ class FalconCliTests(unittest.TestCase):
         self.assertIn("CONDA_AUTO_ACTIVATE_BASE=false", command)
         self.assertEqual(command[command.index("--shm-size") + 1], "42.4Gi")
         self.assertIn("--dry-run", command)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["job"]["backoff_limit"] = 3
+        retry_command = build_jet_command(config, plan, ["python", "train.py"], name="retry", dry_run=True)
+        self.assertEqual(retry_command[retry_command.index("--backoff-limit") + 1], "3")
+        cpu_plan = plan_cpu_resources("2:4", "12Gi:12Gi")
+        cpu_command = build_jet_command(DEFAULT_CONFIG, cpu_plan, ["python", "preprocess.py"], name="cpu", dry_run=True)
+        self.assertNotIn("--gpu", cpu_command)
+        self.assertNotIn("--gpu-type", cpu_command)
+        self.assertIn("falcon.dev/managed=true", cpu_command)
+        self.assertEqual(cpu_command[cpu_command.index("--cpu") + 1], "2:2")
 
     def test_explicit_pin_node_adds_hostname_selector(self):
         plan = ResourcePlan("h100", "h100", 1, "48:48", "282.6Gi:282.6Gi", "nodex1", True)

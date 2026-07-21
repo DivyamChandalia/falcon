@@ -13,7 +13,7 @@ from .completion import candidates, shell_script
 from .config import DEFAULT_CONFIG, config_path, detect_shell, load_config, run_setup
 from .dashboard import run_dashboard
 from .launcher import build_jet_command, job_name, launch
-from .resources import canonical_gpu, fetch_nodes, plan_resources
+from .resources import canonical_gpu, fetch_nodes, plan_cpu_resources, plan_resources
 
 
 def resolve_preset(token: str, config: Dict[str, Any]) -> Optional[Tuple[str, int]]:
@@ -67,6 +67,15 @@ def _legacy_run_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cpu_run_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="falcon -c CPU -m MEMORY",
+        description="Launch a CPU-only Falcon Job",
+    )
+    _add_run_arguments(parser)
+    return parser
+
+
 def _print_plan(plan: Any, shm_size: str, pin_node: bool = False) -> None:
     if pin_node and plan.node:
         target = f"pinned to {plan.node}"
@@ -77,11 +86,8 @@ def _print_plan(plan: Any, shm_size: str, pin_node: bool = False) -> None:
     else:
         target = "scheduler queue"
     state = "ready now" if plan.immediately_schedulable else "pending"
-    print(
-        f"[falcon] {plan.gpu_type} x{plan.gpu_count} | CPU {plan.cpu} | RAM {plan.memory} | "
-        f"SHM {shm_size} | target {target} | {state}",
-        flush=True,
-    )
+    resource = "CPU only" if not plan.gpu_count else f"{plan.gpu_type} x{plan.gpu_count}"
+    print(f"[falcon] {resource} | CPU {plan.cpu} | RAM {plan.memory} | SHM {shm_size} | target {target} | {state}", flush=True)
     if plan.warning:
         print(f"[falcon] WARNING: {plan.warning}", file=sys.stderr)
 
@@ -133,6 +139,40 @@ def _launch_request(preset_name: str, count: int, args: argparse.Namespace, conf
     )
 
 
+def _launch_cpu_request(args: argparse.Namespace, config: Dict[str, Any]) -> int:
+    plan = plan_cpu_resources(args.cpu, args.memory)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    name = args.job or job_name(command)
+    jet_args: List[str] = []
+    for item in args.jet_arg:
+        jet_args.extend(shlex.split(item))
+    invocation = build_jet_command(
+        config=config,
+        plan=plan,
+        command=command,
+        name=name,
+        async_mode=args.async_mode,
+        dry_run=args.dry_run,
+        shm_size=args.shm_size,
+        shm_percent=args.shm_percent,
+        pin_node=False,
+        extra_jet_args=jet_args,
+    )
+    shm_index = invocation.index("--shm-size")
+    _print_plan(plan, invocation[shm_index + 1])
+    if args.explain:
+        print(f"[falcon] {shlex.join(invocation)}", flush=True)
+    remember_job(name)
+    return launch(
+        invocation,
+        name,
+        cleanup=bool(command) and not args.async_mode and not args.dry_run,
+        namespace=config["cluster"]["namespace"],
+    )
+
+
 def run_preset(token: str, argv: Sequence[str], config: Dict[str, Any]) -> int:
     preset_name, count = resolve_preset(token, config) or (None, None)
     if preset_name is None:
@@ -167,6 +207,15 @@ def _looks_like_legacy_submission(argv: Sequence[str]) -> bool:
         return False
     first = before_command[0]
     return first in flags or any(first.startswith(flag + "=") for flag in flags if flag.startswith("--"))
+
+
+def _looks_like_cpu_submission(argv: Sequence[str]) -> bool:
+    before_command = list(argv[:argv.index("--")]) if "--" in argv else list(argv)
+    cpu_flags = {"-c", "--cpu", "-m", "--memory"}
+    gpu_flags = {"-g", "--gpu-type", "-n", "--gpu", "--num-gpus", "--num_gpus"}
+    has_cpu = any(token in cpu_flags or token.startswith(("--cpu=", "--memory=")) for token in before_command)
+    has_gpu = any(token in gpu_flags or token.startswith(("--gpu-type=", "--gpu=", "--num-gpus=", "--num_gpus=")) for token in before_command)
+    return has_cpu and not has_gpu
 
 
 def _main_parser(config: Dict[str, Any]) -> argparse.ArgumentParser:
@@ -222,6 +271,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if bootstrap_command not in {"setup", "shell-init", "completion", "config"}:
                 raise
             config = DEFAULT_CONFIG
+        if _looks_like_cpu_submission(argv):
+            return _launch_cpu_request(_cpu_run_parser().parse_args(list(argv)), config)
         if _looks_like_legacy_submission(argv):
             return run_legacy(argv, config)
         if argv and resolve_preset(argv[0], config):

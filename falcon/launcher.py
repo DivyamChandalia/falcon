@@ -42,7 +42,7 @@ def build_jet_command(
 ) -> List[str]:
     runtime = config["runtime"]
     cluster = config["cluster"]
-    preset = config["presets"][plan.preset]
+    preset = config["presets"].get(plan.preset, {})
     percent = float(
         shm_percent
         if shm_percent is not None
@@ -72,7 +72,8 @@ def build_jet_command(
             continue
         result += ["--env", f"{key}={expanded(str(value))}"]
     if not command:
-        result += ["--env", f"FALCON_DEBUG_PROMPT={canonical_gpu(plan.gpu_type)}x{plan.gpu_count}"]
+        debug_resource = "cpu" if plan.gpu_count == 0 else f"{canonical_gpu(plan.gpu_type)}x{plan.gpu_count}"
+        result += ["--env", f"FALCON_DEBUG_PROMPT={debug_resource}"]
     python_env = os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_PREFIX")
     if python_env:
         result += ["--pyenv", python_env]
@@ -81,10 +82,17 @@ def build_jet_command(
         "--cpu", plan.cpu,
         "--memory", plan.memory,
         "--shm-size", shm_size or calculated_shm_text,
-        "--gpu", str(plan.gpu_count),
-        "--gpu-type", plan.gpu_type,
-        "--job-labels", "falcon.dev/managed=true", f"falcon.dev/gpu-type={plan.gpu_type}",
+        "--job-labels", "falcon.dev/managed=true",
     ]
+    if plan.gpu_count:
+        result += [
+            "--gpu", str(plan.gpu_count),
+            "--gpu-type", plan.gpu_type,
+            "--job-labels", f"falcon.dev/gpu-type={plan.gpu_type}",
+        ]
+    backoff_limit = config.get("job", {}).get("backoff_limit")
+    if backoff_limit is not None:
+        result += ["--backoff-limit", str(int(backoff_limit))]
     if pin_node and plan.node:
         result += ["--node-selector", f"{cluster.get('hostname_label', 'kubernetes.io/hostname')}={plan.node}"]
     if command:

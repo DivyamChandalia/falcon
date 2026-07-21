@@ -42,6 +42,9 @@ INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
 USER_DEFAULTS: Dict[str, Any] = {
     "version": 1,
     "resources": {"shared_memory_percent": 15},
+    # None preserves Kubernetes' built-in Job backoff default. Set an integer
+    # here to make retry behavior explicit for every Falcon command Job.
+    "job": {"backoff_limit": None},
     "presets": {
         "h100": {"gpu_type": "h100", "minimum_utilization": 90},
         "a6000": {"gpu_type": "a6000", "minimum_utilization": 30},
@@ -112,7 +115,7 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
     # sections. Container and scheduler plumbing remains internal. Also discard
     # retired aliases and fixed shm_size fields while retaining custom presets.
     user_raw: Dict[str, Any] = {}
-    for key in ("version", "resources"):
+    for key in ("version", "resources", "job"):
         if key in raw:
             user_raw[key] = raw[key]
     if isinstance(raw.get("dashboard"), dict):
@@ -207,6 +210,10 @@ def validate_config(config: Dict[str, Any]) -> None:
     percent = float(config.get("resources", {}).get("shared_memory_percent", 15))
     if not 0 < percent <= 100:
         raise ValueError("resources.shared_memory_percent must be between 0 and 100")
+    backoff_limit = config.get("job", {}).get("backoff_limit")
+    if backoff_limit is not None:
+        if isinstance(backoff_limit, bool) or int(backoff_limit) != backoff_limit or int(backoff_limit) < 0:
+            raise ValueError("job.backoff_limit must be an integer >= 0 or null")
     if not config.get("presets"):
         raise ValueError("At least one GPU preset is required")
     if not config.get("cluster", {}).get("namespace"):

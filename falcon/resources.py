@@ -23,6 +23,9 @@ class NodeResources:
     gpu_used: int = 0
     gpu_product: str = ""
     unschedulable: bool = False
+    # Metrics may omit node schedulability; the dashboard can supplement those
+    # snapshots from the Kubernetes Node API when this is false.
+    scheduling_info_available: bool = True
 
     @property
     def cpu_free(self) -> float:
@@ -63,6 +66,9 @@ def canonical_gpu(product: str) -> str:
 
 def nodes_from_metrics(text: str) -> List[NodeResources]:
     metrics = _parse_prometheus_metrics(text)
+    schedulability_metrics = bool(
+        metrics.get("kube_node_spec_unschedulable") or metrics.get("kube_node_spec_taint")
+    )
     nodes: Dict[str, NodeResources] = {}
     phases: Dict[str, str] = {}
     requests: Dict[Tuple[str, str, str], Dict[str, float]] = {}
@@ -116,6 +122,8 @@ def nodes_from_metrics(text: str) -> List[NodeResources]:
         current.cpu_used += request["cpu"]
         current.memory_used_gib += request["memory"]
         current.gpu_used += int(request["gpu"])
+    for current in nodes.values():
+        current.scheduling_info_available = schedulability_metrics
     return list(nodes.values())
 
 
@@ -160,6 +168,28 @@ def _format_memory(value: float) -> str:
     rounded = max(0.1, math.floor((value + 1e-9) * 10) / 10)
     rendered = str(int(rounded)) if rounded.is_integer() else f"{rounded:.1f}"
     return f"{rendered}Gi:{rendered}Gi"
+
+
+def plan_cpu_resources(cpu: str, memory: str) -> ResourcePlan:
+    """Build an explicit CPU-only plan without querying GPU node inventory."""
+    if not cpu:
+        raise ValueError("CPU-only jobs require -c/--cpu")
+    if not memory:
+        raise ValueError("CPU-only jobs require -m/--memory")
+    # Jet normalizes request:limit pairs to equal requests for Falcon jobs.
+    normalized_cpu = _pair(cpu)
+    normalized_memory = _pair(memory)
+    parse_cpu(normalized_cpu)
+    parse_memory_gib(normalized_memory)
+    return ResourcePlan(
+        preset="cpu",
+        gpu_type="cpu",
+        gpu_count=0,
+        cpu=normalized_cpu,
+        memory=normalized_memory,
+        node=None,
+        immediately_schedulable=True,
+    )
 
 
 def plan_resources(

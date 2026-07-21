@@ -2,7 +2,7 @@
 
 Cluster-aware Kubernetes jobs for GPU research, without writing YAML.
 
-Falcon turns requests such as `h100`, `a6000x2`, or `2080tix3` into schedulable Kubernetes Jobs, sizes CPU and memory from live node capacity, carries the active Python environment into the pod, and provides an nvitop-inspired dashboard for monitoring the result.
+Falcon turns requests such as `h100`, `a6000x2`, or `2080tix3` into schedulable Kubernetes Jobs, sizes CPU and memory from live node capacity, carries the active Python environment into the pod, and provides an nvitop-inspired dashboard for monitoring the result. Explicit CPU-only Jobs are also supported with `falcon -c 2:4 -m 12Gi:12Gi -- command`; GPU flags are omitted and Kubernetes schedules the Job normally.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-4DDDDD.svg)](https://www.python.org/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-Jobs-326CE5.svg)](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
@@ -201,6 +201,10 @@ version: 1
 
 resources:
   shared_memory_percent: 15
+
+job:
+  # null keeps Kubernetes' default; use 0 to disable retries.
+  backoff_limit: null
 
 presets:
   h100:

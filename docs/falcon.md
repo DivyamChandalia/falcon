@@ -33,7 +33,7 @@ runtime:
 
 Environment variables in `.falconrc` are passed to every Falcon pod. They merge over Falcon's internal environment defaults, so an explicitly configured key wins.
 
-The default config contains GPU eviction thresholds, dashboard display behavior, and `resources.shared_memory_percent: 15`. Dashboard sampling is fixed at a fast one-second target and is not a setup question. A preset can override the shared-memory percentage:
+The default config contains GPU eviction thresholds, dashboard display behavior, `resources.shared_memory_percent: 15`, and `job.backoff_limit: null`. A null backoff limit leaves Kubernetes' default retry behavior unchanged; set `job.backoff_limit` to a non-negative integer to control retries for every Falcon command Job (`0` disables retries). Dashboard sampling is fixed at a fast one-second target and is not a setup question. A preset can override the shared-memory percentage:
 
 ```yaml
 presets:
@@ -85,6 +85,14 @@ CPU, RAM, job name, and raw Jet arguments remain overridable. Namespace has no C
 falcon 2080tix3 -c 48:48 -m 50Gi:50Gi -j experiment -- python train.py
 falcon h100 --jet-arg='--priority high-priority' -- python train.py
 ```
+
+CPU-only Jobs use the same wrapper and leave GPU placement completely unspecified. Provide explicit CPU and memory requests; Falcon omits `--gpu` and `--gpu-type`, so the Kubernetes scheduler can place the Job on any suitable node:
+
+```bash
+falcon -c 2:4 -m 12Gi:12Gi -- python preprocess.py
+```
+
+CPU-only requests require both `-c`/`--cpu` and `-m`/`--memory`. As with GPU requests, Falcon normalizes each request:limit pair to equal values before launching.
 
 If an override is not currently schedulable, Falcon clearly warns that the job will remain pending. Use `--dry-run --explain` to inspect the generated YAML and Jet invocation without submitting.
 

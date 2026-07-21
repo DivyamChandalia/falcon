@@ -119,6 +119,21 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(collector.gpu_availability["2080ti"], (5, 8))
         self.assertEqual(collector.gpu_availability["h100"], (6, 8))
 
+        metrics_nodes = [
+            NodeResources(name="node7", gpu_total=4, gpu_product="RTX 2080 Ti", scheduling_info_available=False),
+            NodeResources(name="node9", gpu_total=4, gpu_product="RTX 2080 Ti", scheduling_info_available=False),
+        ]
+        node_payload = {"items": [
+            {"metadata": {"name": "node7"}, "spec": {}},
+            {"metadata": {"name": "node9"}, "spec": {"unschedulable": True}},
+        ]}
+        collector = UsageCollector("test-dev", {}, 0.1, metrics_url="http://metrics")
+        with patch("falcon.dashboard.fetch_nodes", return_value=metrics_nodes), patch(
+            "falcon.dashboard._kubectl", return_value=json.dumps(node_payload)
+        ):
+            collector._refresh_gpu_availability(100)
+        self.assertEqual(collector.gpu_availability["2080ti"], (4, 4))
+
     def test_gpu_availability_is_aggregated_cluster_wide_by_type(self):
         payload = {"items": [
             {

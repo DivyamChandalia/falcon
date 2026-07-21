@@ -1267,15 +1267,24 @@ class FalconDashboard(App):
         devices = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), header_style=f"bold {CYAN}")
         devices.add_column("GPU", width=4)
         if full:
-            devices.add_column("MODEL / UUID", ratio=3, overflow="ellipsis", no_wrap=True)
-        devices.add_column("VRAM", width=15, justify="right")
-        devices.add_column("UTIL", width=7, justify="right")
-        devices.add_column("TEMP", width=7, justify="right")
+            if self.size.width < 160:
+                devices.add_column("MODEL / UUID", width=24, overflow="ellipsis", no_wrap=True)
+            else:
+                devices.add_column("MODEL / UUID", ratio=2, overflow="ellipsis", no_wrap=True)
+        devices.add_column("VRAM", width=13, justify="right")
+        devices.add_column("UTIL", width=6, justify="right")
+        devices.add_column("TEMP", width=6, justify="right")
         if full:
-            devices.add_column("POWER", width=9, justify="right")
-            devices.add_column("ECC", width=7, justify="right")
-            devices.add_column("DRIVER", width=10)
-        limit = 2 if layout == "collapsed" else 4
+            devices.add_column("POWER", width=8, justify="right")
+            devices.add_column("ECC", width=5, justify="right")
+            devices.add_column("DRIVER", width=8, overflow="ellipsis", no_wrap=True)
+        if layout == "collapsed":
+            pane_height = self.query_one("#resources-pane", DashboardPane).size.height
+            limit = min(len(row.gpu_devices), max(1, pane_height - 10))
+        else:
+            # Expanded resource views have enough vertical space to show all
+            # device rows; never hide real GPUs behind an arbitrary four-row cap.
+            limit = len(row.gpu_devices)
         for device in row.gpu_devices[:limit]:
             memory = (
                 "—" if device.memory_used_gib is None or device.memory_total_gib is None
@@ -1283,7 +1292,7 @@ class FalconDashboard(App):
             )
             cells = [Text(str(device.index), style=WHITE)]
             if full:
-                identity = device.name if self.size.width < 150 else f"{device.name} · {device.uuid}"
+                identity = device.name if self.size.width < 160 else f"{device.name} · {device.uuid}"
                 cells.append(Text(identity, style=WHITE, no_wrap=True, overflow="ellipsis"))
             cells.extend([
                 Text(memory, style=WHITE),

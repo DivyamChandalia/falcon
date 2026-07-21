@@ -18,6 +18,7 @@ BASE_COMMANDS = [
     "config", "shell-init", "completion",
 ]
 LEGACY_SUBMISSION_OPTIONS = ["-j", "--job", "-g", "--gpu-type", "-n", "--num-gpus"]
+CPU_SUBMISSION_OPTIONS = ["-c", "--cpu", "-m", "--memory"]
 JOB_COMMANDS = {"logs", "attach", "top", "delete", "kill"}
 PRESET_CACHE_TTL_SECONDS = 300
 
@@ -76,7 +77,7 @@ def preset_tokens(config: Dict[str, Any]) -> List[str]:
 
 def candidates(kind: str, config: Dict[str, Any], command: str = "") -> List[str]:
     if kind == "commands":
-        return BASE_COMMANDS + preset_tokens(config) + LEGACY_SUBMISSION_OPTIONS
+        return BASE_COMMANDS + preset_tokens(config) + LEGACY_SUBMISSION_OPTIONS + CPU_SUBMISSION_OPTIONS
     if kind == "jobs":
         return job_names(config["cluster"]["namespace"])
     if kind == "options":
@@ -88,6 +89,8 @@ def candidates(kind: str, config: Dict[str, Any], command: str = "") -> List[str
             return ["--force", "--non-interactive", "--no-shell"]
         if command in {"completion", "shell-init"}:
             return ["zsh", "bash"]
+        if command in CPU_SUBMISSION_OPTIONS:
+            return ["-c", "--cpu", "-m", "--memory", "--shm-size", "--shm-percent", "--job", "--async", "--dry-run", "--explain", "--jet-arg", "--"]
         is_preset = any(
             command == name or (
                 command.startswith(name + "x") and command[len(name) + 1:].isdigit()
@@ -164,8 +167,10 @@ _falcon_native() {
     values=("${_falcon_dashboard_options[@]}")
   elif [[ "$subject" == "setup" ]]; then
     values=("${_falcon_setup_options[@]}")
-  elif [[ "$subject" == "completion" || "$subject" == "shell-init" ]]; then
+elif [[ "$subject" == "completion" || "$subject" == "shell-init" ]]; then
     values=("${_falcon_shell_options[@]}")
+  elif [[ "$subject" == "-c" || "$subject" == "--cpu" || "$subject" == "-m" || "$subject" == "--memory" ]]; then
+    values=("-c" "--cpu" "-m" "--memory" "--shm-size" "--shm-percent" "--job" "--async" "--dry-run" "--explain" "--jet-arg" "--")
   else
     local preset
     for preset in "${_falcon_presets[@]}"; do
@@ -221,6 +226,8 @@ _falcon_native() {
     values=("${_falcon_setup_options[@]}")
   elif [[ "$subject" =~ ^(completion|shell-init)$ ]]; then
     values=("${_falcon_shell_options[@]}")
+  elif [[ "$subject" == "-c" || "$subject" == "--cpu" || "$subject" == "-m" || "$subject" == "--memory" ]]; then
+    values=("-c" "--cpu" "-m" "--memory" "--shm-size" "--shm-percent" "--job" "--async" "--dry-run" "--explain" "--jet-arg" "--")
   else
     local preset suffix
     for preset in "${_falcon_presets[@]}"; do
