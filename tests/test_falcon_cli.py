@@ -10,7 +10,7 @@ import yaml
 
 from falcon.cli import _looks_like_cpu_submission, _looks_like_legacy_submission, _main_parser, main, resolve_preset, run_legacy
 from falcon.completion import candidates, preset_tokens, shell_script
-from falcon.commands import clean
+from falcon.commands import attach as attach_job, clean
 from falcon.config import (
     DEFAULT_CONFIG,
     DEFAULT_DASHBOARD_EMA_ALPHA,
@@ -21,7 +21,7 @@ from falcon.config import (
     save_hidden_panes,
     _remove_legacy_falcon_shell,
 )
-from falcon.launcher import build_jet_command
+from falcon.launcher import build_jet_command, launch
 from falcon.resources import NodeResources, ResourcePlan, plan_cpu_resources
 
 
@@ -49,6 +49,18 @@ class FalconCliTests(unittest.TestCase):
         self.assertEqual(resolve_preset("h100x2", DEFAULT_CONFIG), ("h100", 2))
         self.assertEqual(resolve_preset("2080tix3", DEFAULT_CONFIG), ("2080ti", 3))
         self.assertIsNone(resolve_preset("2080", DEFAULT_CONFIG))
+
+    def test_preset_with_memory_override_is_not_dispatched_as_cpu_only(self):
+        with patch("falcon.cli._launch_request", return_value=0) as launch_request:
+            result = main([
+                "2080tix1", "-m", "4Gi:4Gi", "--",
+                "python", "digital_id_metadata_benchmark.py",
+            ])
+        self.assertEqual(result, 0)
+        preset, count, args, _ = launch_request.call_args.args
+        self.assertEqual((preset, count), ("2080ti", 1))
+        self.assertEqual(args.memory, "4Gi:4Gi")
+        self.assertEqual(args.command[-2:], ["python", "digital_id_metadata_benchmark.py"])
 
     def test_legacy_submission_syntax_maps_to_native_preset(self):
         with patch("falcon.cli._launch_request", return_value=0) as launch_request:
@@ -245,6 +257,7 @@ class FalconCliTests(unittest.TestCase):
         self.assertIn("CONDA_AUTO_ACTIVATE_BASE=false", command)
         self.assertEqual(command[command.index("--shm-size") + 1], "42.4Gi")
         self.assertIn("--dry-run", command)
+        self.assertNotIn("--follow", command)
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["job"]["backoff_limit"] = 3
         retry_command = build_jet_command(config, plan, ["python", "train.py"], name="retry", dry_run=True)
@@ -268,6 +281,39 @@ class FalconCliTests(unittest.TestCase):
         plan = ResourcePlan("h100", "h100", 1, "48:48", "100Gi:100Gi", "nodex1", True)
         command = build_jet_command(config, plan, [], name="debug")
         self.assertEqual(command[command.index("--shm-size") + 1], "20Gi")
+
+    def test_foreground_launch_attaches_after_submission_then_cleans_up(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch("falcon.launcher.subprocess.run", return_value=completed) as run, patch(
+            "falcon.launcher.attach", return_value=0
+        ) as attach:
+            result = launch(["jet", "launch"], "training-job", cleanup=True, namespace="test-dev")
+        self.assertEqual(result, 0)
+        attach.assert_called_once_with("test-dev", "training-job")
+        self.assertEqual(
+            run.call_args_list[-1].args[0][-4:],
+            ["delete", "training-job", "-n", "test-dev"],
+        )
+
+    def test_async_launch_does_not_attach_or_clean_up(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch("falcon.launcher.subprocess.run", return_value=completed) as run, patch(
+            "falcon.launcher.attach"
+        ) as attach:
+            result = launch(["jet", "launch"], "training-job", cleanup=False, namespace="test-dev")
+        self.assertEqual(result, 0)
+        attach.assert_not_called()
+        run.assert_called_once_with(["jet", "launch"])
+
+    def test_attach_waits_for_and_attaches_to_the_job_pod(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch("jet.utils.wait_for_job_pods_ready", return_value="training-job-pod") as wait, patch(
+            "falcon.commands.remember_job"
+        ), patch("falcon.commands.kubectl", return_value=completed) as kubectl:
+            result = attach_job("test-dev", "training-job")
+        self.assertEqual(result, 0)
+        wait.assert_called_once_with("training-job", "test-dev", timeout=300)
+        kubectl.assert_called_once_with(["attach", "training-job-pod", "-n", "test-dev"])
 
 
 if __name__ == "__main__":

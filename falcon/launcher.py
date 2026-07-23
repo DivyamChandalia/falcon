@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from .commands import attach
 from .config import expanded
 from .resources import ResourcePlan, canonical_gpu, parse_memory_gib
 
@@ -97,8 +98,6 @@ def build_jet_command(
         result += ["--node-selector", f"{cluster.get('hostname_label', 'kubernetes.io/hostname')}={plan.node}"]
     if command:
         result += ["--command", shlex.join(list(command))]
-        if not async_mode:
-            result.append("--follow")
     if dry_run:
         result.append("--dry-run")
     result += list(extra_jet_args or [])
@@ -108,7 +107,10 @@ def build_jet_command(
 def launch(command: List[str], cleanup_name: Optional[str], cleanup: bool, namespace: Optional[str] = None) -> int:
     try:
         try:
-            return subprocess.run(command).returncode
+            result = subprocess.run(command).returncode
+            if result != 0 or not cleanup or not cleanup_name:
+                return result
+            return attach(namespace or "default", cleanup_name)
         except KeyboardInterrupt:
             return 130
     finally:

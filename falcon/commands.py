@@ -63,9 +63,17 @@ def logs(namespace: str, name: Optional[str]) -> int:
 
 
 def attach(namespace: str, name: Optional[str]) -> int:
+    from jet.defaults import DEFAULT_JOB_POD_WAITING_TIMEOUT
+    from jet.utils import wait_for_job_pods_ready
+
     target = _target(name)
     remember_job(target)
-    return kubectl(["attach", f"job.batch/{target}", "-n", namespace]).returncode
+    print("[falcon] Waiting for job pod to be ready...")
+    pod = wait_for_job_pods_ready(target, namespace, timeout=DEFAULT_JOB_POD_WAITING_TIMEOUT)
+    if not pod:
+        raise ValueError(f"no running pod found for job {target}")
+    print(f"[falcon] Attaching to pod {pod}. Use Control-C to detach.")
+    return kubectl(["attach", pod, "-n", namespace]).returncode
 
 
 def delete(namespace: str, names: Iterable[str]) -> int:

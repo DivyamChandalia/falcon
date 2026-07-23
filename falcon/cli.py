@@ -40,7 +40,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "--max", dest="maximize", action="store_true",
         help="Request 95%% of proportional node capacity instead of currently free CPU/RAM",
     )
-    parser.add_argument("-a", "--async", dest="async_mode", action="store_true", help="Submit without following or cleanup")
+    parser.add_argument("-a", "--async", dest="async_mode", action="store_true", help="Submit without attaching or cleanup")
     placement = parser.add_mutually_exclusive_group()
     placement.add_argument("--pin-node", action="store_true", help="Pin placement to Falcon's sizing node")
     placement.add_argument("--no-pin", dest="pin_node", action="store_false", help=argparse.SUPPRESS)
@@ -271,12 +271,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if bootstrap_command not in {"setup", "shell-init", "completion", "config"}:
                 raise
             config = DEFAULT_CONFIG
+        if argv and resolve_preset(argv[0], config):
+            return run_preset(argv[0], argv[1:], config)
         if _looks_like_cpu_submission(argv):
             return _launch_cpu_request(_cpu_run_parser().parse_args(list(argv)), config)
         if _looks_like_legacy_submission(argv):
             return run_legacy(argv, config)
-        if argv and resolve_preset(argv[0], config):
-            return run_preset(argv[0], argv[1:], config)
         if argv and argv[0] == "_complete":
             kind = argv[1] if len(argv) > 1 else "commands"
             if kind not in {"commands", "jobs", "options"}:
