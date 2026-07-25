@@ -97,6 +97,20 @@ class JobUsage:
     gpu_devices: List[GpuDevice] = field(default_factory=list)
     gpu_risk_average: Optional[float] = None
     gpu_risk_threshold: Optional[float] = None
+    # Durable request data comes from the Job's pod template and remains
+    # available after every Pod has terminated or been garbage-collected.
+    gpu_requested_type: str = "-"
+    gpu_requested_count: int = 0
+    # Allocation describes only currently active Pods.  It is intentionally
+    # empty for queued and completed Jobs.
+    gpu_allocated_type: str = "-"
+    gpu_allocated_count: int = 0
+    container_restarts: int = 0
+    pod_attempts: int = 0
+    succeeded_attempts: int = 0
+    failed_attempts: int = 0
+    backoff_limit: Optional[int] = None
+    attempt_pods: List[str] = field(default_factory=list)
 
     @property
     def gpu_memory_percent(self) -> Optional[float]:
@@ -176,8 +190,10 @@ def _job_status(job_item: Optional[Dict], pod_states: List[str]) -> str:
                 return "Succeeded"
             if condition.get("type") == "Failed":
                 return "Failed"
+        # ``status.active`` counts Pending as well as Running Pods.  Calling
+        # every active Job "Running" hides the most important queued state.
         if status.get("active"):
-            return "Running"
+            return "Running" if "Running" in pod_states else "Pending"
     if "Running" in pod_states:
         return "Running"
     if "Pending" in pod_states:
@@ -225,6 +241,54 @@ def parse_memory_gib(value: str) -> float:
     else:
         return 0.0
     return bytes_value / (1024 ** 3)
+
+
+def _resource_values(container: Dict) -> Tuple[float, float, int]:
+    resources = container.get("resources", {})
+    requests = resources.get("requests", {}) or {}
+    limits = resources.get("limits", {}) or {}
+    gpu_value = requests.get(
+        "nvidia.com/gpu", limits.get("nvidia.com/gpu", 0)
+    )
+    return (
+        parse_cpu_cores(requests.get("cpu", "0")),
+        parse_memory_gib(requests.get("memory", "0")),
+        int(gpu_value or 0),
+    )
+
+
+def _pod_request(spec: Dict) -> Tuple[float, float, int]:
+    """Return the scheduler-facing request for one Pod template/spec.
+
+    Application containers run together and are summed.  Init containers run
+    serially, so Kubernetes uses the largest init request per resource and the
+    larger of that value and the application sum.  Pod overhead is then added.
+    """
+    regular = [_resource_values(item) for item in spec.get("containers", [])]
+    init = [_resource_values(item) for item in spec.get("initContainers", [])]
+    regular_sum = tuple(sum(values[index] for values in regular) for index in range(3))
+    init_max = tuple(max((values[index] for values in init), default=0) for index in range(3))
+    overhead = spec.get("overhead", {}) or {}
+    return (
+        max(regular_sum[0], init_max[0])
+        + parse_cpu_cores(overhead.get("cpu", "0")),
+        max(regular_sum[1], init_max[1])
+        + parse_memory_gib(overhead.get("memory", "0")),
+        int(max(regular_sum[2], init_max[2])),
+    )
+
+
+def _gpu_model(spec: Dict, metadata: Optional[Dict] = None) -> str:
+    metadata = metadata or {}
+    selectors = spec.get("nodeSelector", {}) or {}
+    candidates = [
+        selectors.get("gpu-type"),
+        selectors.get("nvidia.com/gpu.product"),
+        selectors.get("nvidia_com_gpu_product"),
+        (metadata.get("labels", {}) or {}).get("falcon.dev/gpu-type"),
+        (metadata.get("annotations", {}) or {}).get("falcon.dev/gpu-type"),
+    ]
+    return next((str(value) for value in candidates if value), "-")
 
 
 def _short_cpu(value: float) -> str:
@@ -554,47 +618,66 @@ class UsageCollector:
         now = time.monotonic()
         if cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
             return cached[1]
-        names = [row.job] + ([row.active_pod] if row.active_pod else [])
+        names = {row.job} | {
+            name for name in row.attempt_pods if name and name != row.job
+        }
         collected: Dict[Tuple[str, str, str, str], JobEvent] = {}
-        had_response = False
-        for name in names:
-            raw = _kubectl([
-                "get", "events", "-n", self.namespace,
-                "--field-selector", f"involvedObject.name={name}", "-o", "json",
-            ])
-            if raw is None:
+        # One namespace query is considerably cheaper than one subprocess per
+        # historical attempt, especially for retried Jobs.
+        raw = _kubectl(
+            ["get", "events", "-n", self.namespace, "-o", "json"],
+            timeout=15,
+        )
+        try:
+            items = json.loads(raw).get("items", []) if raw is not None else []
+        except json.JSONDecodeError:
+            items = []
+            raw = None
+        for item in items:
+            object_name = str(
+                item.get("involvedObject", {}).get("name") or ""
+            )
+            if object_name not in names:
                 continue
-            had_response = True
-            try:
-                items = json.loads(raw).get("items", [])
-            except json.JSONDecodeError:
-                continue
-            for item in items:
-                metadata = item.get("metadata", {})
-                timestamp = (
-                    item.get("eventTime") or item.get("lastTimestamp")
-                    or item.get("series", {}).get("lastObservedTime")
-                    or metadata.get("creationTimestamp", "")
-                )
-                event = JobEvent(
-                    timestamp=str(timestamp),
-                    event_type=str(item.get("type") or "Normal"),
-                    reason=str(item.get("reason") or "Unknown"),
-                    message=str(item.get("message") or ""),
-                    object_name=str(item.get("involvedObject", {}).get("name") or name),
-                    count=int(item.get("count") or item.get("series", {}).get("count") or 1),
-                )
-                key = (event.timestamp, event.reason, event.message, event.object_name)
-                previous = collected.get(key)
-                if previous:
-                    previous.count = max(previous.count, event.count)
-                else:
-                    collected[key] = event
+            metadata = item.get("metadata", {})
+            timestamp = (
+                item.get("eventTime")
+                or item.get("lastTimestamp")
+                or item.get("series", {}).get("lastObservedTime")
+                or metadata.get("creationTimestamp", "")
+            )
+            event = JobEvent(
+                timestamp=str(timestamp),
+                event_type=str(item.get("type") or "Normal"),
+                reason=str(item.get("reason") or "Unknown"),
+                message=str(item.get("message") or ""),
+                object_name=object_name,
+                count=int(
+                    item.get("count")
+                    or item.get("series", {}).get("count")
+                    or 1
+                ),
+            )
+            key = (
+                event.timestamp,
+                event.reason,
+                event.message,
+                event.object_name,
+            )
+            previous = collected.get(key)
+            if previous:
+                previous.count = max(previous.count, event.count)
+            else:
+                collected[key] = event
         events = sorted(collected.values(), key=lambda value: _timestamp(value.timestamp))[-200:]
-        if had_response:
+        if raw is not None:
             self._event_cache[row.uid] = (now, events)
             return events
-        return cached[1] if cached else []
+        # Cache the failed attempt time while retaining the last valid data so
+        # an API outage cannot trigger a subprocess storm every frame.
+        retained = cached[1] if cached else []
+        self._event_cache[row.uid] = (now, retained)
+        return retained
 
     def _update_ema(self, job: str, utilization: float) -> float:
         samples = self.ema_samples.get(job, 0)
@@ -629,21 +712,51 @@ class UsageCollector:
         now = time.monotonic()
         self._refresh_gpu_availability(now)
         if self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
-            get_args = ["get", "jobs.batch,pods", "-n", self.namespace]
+            # Job objects do not normally carry the controller's ``job-name``
+            # Pod label, so a combined label-filtered query loses the durable
+            # Job template.  Fetch the named Job and its attempts separately.
             if self.job_filter:
-                get_args.extend(["-l", f"job-name={self.job_filter}"])
-            get_args.extend(["-o", "json"])
-            raw = _kubectl(get_args)
-            if raw:
-                try:
-                    self._items = json.loads(raw).get("items", [])
-                    self._items_at = now
-                    self.last_error = ""
-                    self.last_successful_refresh = time.time()
-                except json.JSONDecodeError:
-                    self.last_error = "invalid Kubernetes API response"
+                raw_job = _kubectl(
+                    [
+                        "get", "job.batch", self.job_filter, "-n",
+                        self.namespace, "-o", "json",
+                    ]
+                )
+                raw_pods = _kubectl(
+                    [
+                        "get", "pods", "-n", self.namespace, "-l",
+                        f"job-name={self.job_filter}", "-o", "json",
+                    ]
+                )
+                raw = None
+                if raw_job is not None and raw_pods is not None:
+                    try:
+                        raw = {
+                            "items": [json.loads(raw_job)]
+                            + list(json.loads(raw_pods).get("items", []))
+                        }
+                    except (TypeError, json.JSONDecodeError):
+                        raw = None
             else:
-                self.last_error = "Kubernetes API unavailable"
+                combined = _kubectl(
+                    [
+                        "get", "jobs.batch,pods", "-n", self.namespace,
+                        "-o", "json",
+                    ]
+                )
+                try:
+                    raw = json.loads(combined) if combined is not None else None
+                except json.JSONDecodeError:
+                    raw = None
+            # Advance the attempt timestamp on failure as well.  Retain the
+            # last-known-good inventory and retry at the bounded cadence.
+            self._items_at = now
+            if raw is not None:
+                self._items = raw.get("items", [])
+                self.last_error = ""
+                self.last_successful_refresh = time.time()
+            else:
+                self.last_error = "Kubernetes API unavailable or returned invalid JSON"
         if self._items is None:
             return []
         all_items = self._items
@@ -658,12 +771,12 @@ class UsageCollector:
                 top_args.extend(["-l", f"job-name={self.job_filter}"])
             top_args.append("--no-headers")
             top = _kubectl(top_args, timeout=10)
+            self._live_at = now
             if top is not None:
                 self._live = {
                     parts[0]: (parse_cpu_cores(parts[1]), parse_memory_gib(parts[2]))
                     for line in top.splitlines() if len(parts := line.split()) >= 3
                 }
-                self._live_at = now
         live = self._live or {}
         live_pods = set(live)
         running_gpu_pods: Dict[str, int] = {}
@@ -684,48 +797,87 @@ class UsageCollector:
                     zip(pod_names, pool.map(lambda pod: _gpu_metrics(self.namespace, pod), pod_names))
                 )
 
-        groups: Dict[str, Dict] = {}
-        for job, item in job_items.items():
-            groups[job] = {
-                "statuses": [], "nodes": set(), "gpu_types": set(), "gpu_count": 0, "pods": 0,
-                "gpu_weighted": 0.0, "gpu_samples": 0, "vram_used": 0.0, "vram_total": 0.0,
-                "cpu_used": 0.0, "cpu_requested": 0.0, "memory_used": 0.0,
-                "memory_requested": 0.0, "created": [], "pod_items": [], "job_item": item,
+        def new_group(job_item: Optional[Dict]) -> Dict:
+            template = (
+                (job_item or {}).get("spec", {}).get("template", {})
+                if job_item
+                else {}
+            )
+            template_spec = template.get("spec", {}) or {}
+            cpu_request, memory_request, gpu_request = _pod_request(template_spec)
+            containers = template_spec.get("containers", []) or []
+            primary = containers[0] if containers else {}
+            return {
+                "statuses": [],
+                "active_nodes": set(),
+                "requested_gpu_type": _gpu_model(
+                    template_spec, template.get("metadata", {})
+                ),
+                "requested_gpu_count": gpu_request,
+                "allocated_gpu_types": set(),
+                "allocated_gpu_count": 0,
+                "pods": 0,
+                "gpu_weighted": 0.0,
+                "gpu_samples": 0,
+                "vram_used": 0.0,
+                "vram_total": 0.0,
+                "cpu_used": 0.0,
+                "cpu_requested": cpu_request,
+                "memory_used": 0.0,
+                "memory_requested": memory_request,
+                "created": [],
+                "pod_items": [],
+                "job_item": job_item,
                 "gpu_devices": [],
+                "command": " ".join(
+                    str(value)
+                    for value in (
+                        (primary.get("command") or [])
+                        + (primary.get("args") or [])
+                    )
+                ),
             }
+
+        groups: Dict[str, Dict] = {
+            job: new_group(item) for job, item in job_items.items()
+        }
         for item in items:
             metadata, spec, status = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
             is_running = status.get("phase") == "Running"
             pod = metadata.get("name", "")
             labels = metadata.get("labels", {})
             job = labels.get("job-name", pod)
-            group = groups.setdefault(job, {
-                "statuses": [], "nodes": set(), "gpu_types": set(), "gpu_count": 0, "pods": 0,
-                "gpu_weighted": 0.0, "gpu_samples": 0, "vram_used": 0.0, "vram_total": 0.0,
-                "cpu_used": 0.0, "cpu_requested": 0.0, "memory_used": 0.0,
-                "memory_requested": 0.0, "created": [], "pod_items": [], "job_item": job_items.get(job),
-                "gpu_devices": [],
-            })
+            group = groups.setdefault(job, new_group(job_items.get(job)))
             group["pod_items"].append(item)
             group["statuses"].append(status.get("phase", "Unknown"))
-            if spec.get("nodeName"):
-                group["nodes"].add(spec["nodeName"])
-            gpu_type = spec.get("nodeSelector", {}).get("gpu-type", labels.get("falcon.dev/gpu-type"))
-            if gpu_type:
-                group["gpu_types"].add(gpu_type)
             group["pods"] += 1
             group["created"].append(metadata.get("creationTimestamp", ""))
+            if group["job_item"] is None and group["requested_gpu_count"] == 0:
+                pod_cpu_request, pod_memory_request, pod_gpu_request = _pod_request(spec)
+                group["cpu_requested"] = pod_cpu_request
+                group["memory_requested"] = pod_memory_request
+                group["requested_gpu_count"] = pod_gpu_request
+                group["requested_gpu_type"] = _gpu_model(spec, metadata)
+                containers = spec.get("containers", []) or []
+                primary = containers[0] if containers else {}
+                group["command"] = " ".join(
+                    str(value)
+                    for value in (
+                        (primary.get("command") or [])
+                        + (primary.get("args") or [])
+                    )
+                )
             if is_running:
+                if spec.get("nodeName"):
+                    group["active_nodes"].add(spec["nodeName"])
                 pod_cpu, pod_memory = live.get(pod, (0.0, 0.0))
                 group["cpu_used"] += pod_cpu
                 group["memory_used"] += pod_memory
-                for container in spec.get("containers", []):
-                    resources = container.get("resources", {})
-                    requests = resources.get("requests", {})
-                    limits = resources.get("limits", {})
-                    group["cpu_requested"] += parse_cpu_cores(requests.get("cpu", "0"))
-                    group["memory_requested"] += parse_memory_gib(requests.get("memory", "0"))
-                    group["gpu_count"] += int(limits.get("nvidia.com/gpu", 0) or 0)
+                _, _, allocated_gpus = _pod_request(spec)
+                group["allocated_gpu_count"] += allocated_gpus
+                allocated_type = _gpu_model(spec, metadata)
+                if allocated_type != "-":
+                    group["allocated_gpu_types"].add(allocated_type)
             sample = samples.get(pod, GpuSample())
             if sample.utilization is not None:
                 group["gpu_weighted"] += sample.utilization * sample.gpu_count
@@ -749,14 +901,35 @@ class UsageCollector:
             if utilization is not None:
                 ema = self._update_ema(job, utilization)
                 risk_average = self._update_risk_average(job, utilization)
-            relevant = _active_pod(group["pod_items"])
+            active_attempts = [
+                pod for pod in group["pod_items"]
+                if pod.get("status", {}).get("phase")
+                not in {"Succeeded", "Failed"}
+            ]
+            relevant = _active_pod(active_attempts)
             relevant_metadata = relevant.get("metadata", {}) if relevant else {}
             relevant_spec = relevant.get("spec", {}) if relevant else {}
             relevant_status = relevant.get("status", {}) if relevant else {}
-            gpu_types = sorted(group["gpu_types"])
-            gpu_type = ",".join(gpu_types) if gpu_types else "-"
-            threshold = max((self.thresholds.get(value.lower(), 30) for value in gpu_types), default=30)
-            at_risk = self._eviction_risk(job, risk_average, group["gpu_count"], threshold)
+            requested_gpu_type = (
+                group["requested_gpu_type"]
+                if group["requested_gpu_count"] > 0
+                else "-"
+            )
+            allocated_gpu_types = sorted(group["allocated_gpu_types"])
+            allocated_gpu_type = (
+                ",".join(allocated_gpu_types)
+                if group["allocated_gpu_count"] > 0
+                else "-"
+            )
+            threshold = self.thresholds.get(
+                canonical_gpu(requested_gpu_type), 30
+            )
+            at_risk = self._eviction_risk(
+                job,
+                risk_average,
+                group["allocated_gpu_count"],
+                threshold,
+            )
             statuses = group["statuses"]
             status = _job_status(group.get("job_item"), statuses)
             job_metadata = (group.get("job_item") or {}).get("metadata", {})
@@ -769,22 +942,29 @@ class UsageCollector:
                 {},
             )
             uid = str(job_metadata.get("uid") or owner.get("uid") or job)
-            containers = relevant_spec.get("containers", [])
-            primary = containers[0] if containers else {}
-            command_parts = [
-                str(value) for value in (primary.get("command") or []) + (primary.get("args") or [])
-            ]
             restarts = sum(
-                int(value.get("restartCount", 0) or 0)
-                for value in relevant_status.get("containerStatuses", [])
+                int(container_status.get("restartCount", 0) or 0)
+                for pod in group["pod_items"]
+                for status_key in (
+                    "initContainerStatuses",
+                    "containerStatuses",
+                )
+                for container_status in (
+                    pod.get("status", {}).get(status_key, []) or []
+                )
             )
+            succeeded_attempts = sum(
+                value == "Succeeded" for value in statuses
+            )
+            failed_attempts = sum(value == "Failed" for value in statuses)
             completions = str(job_spec.get("completions", 1)) if group.get("job_item") else "—"
             result.append(JobUsage(
                 job=job,
                 status=status,
-                nodes=str(relevant_spec.get("nodeName") or "—"),
-                gpu_type=gpu_type,
-                gpu_count=group["gpu_count"],
+                nodes=",".join(sorted(group["active_nodes"])) or "—",
+                # Compatibility fields now mean durable requested resources.
+                gpu_type=requested_gpu_type,
+                gpu_count=group["requested_gpu_count"],
                 pod_count=group["pods"],
                 gpu_util=utilization,
                 gpu_ema=ema,
@@ -800,17 +980,35 @@ class UsageCollector:
                 active_pod=str(relevant_metadata.get("name") or ""),
                 active_pod_uid=str(relevant_metadata.get("uid") or ""),
                 active_pod_state=_pod_state(relevant) if relevant else "No active pod",
-                command=" ".join(command_parts),
+                command=group["command"],
                 created_at=created,
                 started_at=str(relevant_status.get("startTime") or ""),
                 restarts=restarts,
                 completions=completions,
-                metrics_updated_at=time.time() if utilization is not None or live else 0.0,
+                metrics_updated_at=(
+                    time.time()
+                    if utilization is not None or cpu_metrics_available
+                    else 0.0
+                ),
                 gpu_metrics_available=utilization is not None,
                 cpu_metrics_available=cpu_metrics_available,
                 gpu_devices=group["gpu_devices"],
                 gpu_risk_average=risk_average,
                 gpu_risk_threshold=threshold,
+                gpu_requested_type=requested_gpu_type,
+                gpu_requested_count=group["requested_gpu_count"],
+                gpu_allocated_type=allocated_gpu_type,
+                gpu_allocated_count=group["allocated_gpu_count"],
+                container_restarts=restarts,
+                pod_attempts=group["pods"],
+                succeeded_attempts=succeeded_attempts,
+                failed_attempts=failed_attempts,
+                backoff_limit=job_spec.get("backoffLimit"),
+                attempt_pods=[
+                    str(pod.get("metadata", {}).get("name") or "")
+                    for pod in group["pod_items"]
+                    if pod.get("metadata", {}).get("name")
+                ],
             ))
         return sorted(result, key=_job_sort_key)
 
