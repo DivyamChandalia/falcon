@@ -33,20 +33,33 @@ def bundle_digest(hashes):
 
 
 class AgentSkillTests(unittest.TestCase):
-    def test_packaged_skill_is_portable_concise_and_progressive(self):
+    def test_packaged_skill_is_one_concise_human_command_workflow(self):
         root = resources.files("falcon.skills").joinpath("falcon")
         skill = root.joinpath("SKILL.md").read_text(encoding="utf-8")
-        reference = root.joinpath("reference.md").read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
 
         self.assertIn("name: falcon", frontmatter)
         self.assertIn("description:", frontmatter)
         self.assertNotIn("allowed-tools:", frontmatter)
-        self.assertLessEqual(len(skill.splitlines()), 40)
-        self.assertEqual(skill.count("- `falcon "), 8)
-        self.assertIn("[reference.md](reference.md)", skill)
-        self.assertIn("exit codes", skill)
-        self.assertIn("falcon get JOB --output json", reference)
+        self.assertLessEqual(len(skill.splitlines()), 30)
+        self.assertEqual(skill.count("- `falcon "), 5)
+        self.assertIn("falcon logs JOB --no-follow --tail 100", skill)
+        self.assertIn("falcon metrics JOB --interval 60", skill)
+        self.assertIn("falcon kill JOB", skill)
+        self.assertIn("report its name, and return", skill)
+        self.assertIn("Do not add `-f`", skill)
+        self.assertIn("H100 must stay at or above 90%", skill)
+        self.assertIn("A6000 and 2080Ti must stay at or above 30%", skill)
+        self.assertIn("one targeted `kubectl` command", skill)
+        for removed in (
+            "falcon jobs",
+            "falcon get",
+            "falcon resources",
+            "falcon top",
+            "falcon delete",
+            "reference.md",
+        ):
+            self.assertNotIn(removed, skill)
 
     def test_official_agent_paths_and_explicit_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,29 +138,29 @@ class AgentSkillTests(unittest.TestCase):
 
             self.assertEqual(updated.status, "updated")
             self.assertIn(
-                "falcon submit --gpu h100",
+                "falcon h100",
                 (result.path / "SKILL.md").read_text(encoding="utf-8"),
             )
             self.assertEqual(new_marker["bundle_version"], SKILL_BUNDLE_VERSION)
             self.assertNotEqual(new_marker["source_hash"], marker["source_hash"])
 
-    def test_managed_update_does_not_claim_an_untracked_future_file(self):
+    def test_managed_update_removes_obsolete_reference_file(self):
         with tempfile.TemporaryDirectory() as directory:
             installed = install_skill("codex", home=directory)
             marker_path = installed.path / METADATA_FILE
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            marker["files"].pop("reference.md")
+            reference = installed.path / "reference.md"
+            old_reference = b"old managed reference\n"
+            reference.write_bytes(old_reference)
+            marker["files"]["reference.md"] = sha256(old_reference)
             marker["bundle_version"] = 0
             marker["source_hash"] = bundle_digest(marker["files"])
             marker_path.write_text(json.dumps(marker), encoding="utf-8")
-            reference = installed.path / "reference.md"
-            reference.write_text("my private reference\n", encoding="utf-8")
 
             result = install_skill("codex", home=directory)
 
-            self.assertEqual(result.status, "conflict")
-            self.assertIn("unmanaged reference.md", result.detail)
-            self.assertEqual(reference.read_text(encoding="utf-8"), "my private reference\n")
+            self.assertEqual(result.status, "updated")
+            self.assertFalse(reference.exists())
 
     def test_user_modified_managed_copy_is_never_overwritten_or_removed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -192,7 +205,6 @@ class AgentSkillTests(unittest.TestCase):
 
             self.assertEqual(removed.status, "removed")
             self.assertFalse((installed.path / "SKILL.md").exists())
-            self.assertFalse((installed.path / "reference.md").exists())
             self.assertFalse((installed.path / METADATA_FILE).exists())
             self.assertEqual(note.read_text(encoding="utf-8"), "keep me\n")
             self.assertEqual(uninstall_skill("claude", home=directory).status, "unmanaged")

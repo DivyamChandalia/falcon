@@ -1,39 +1,69 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jet-k8s"
-version = "0.1.7"
+name = "falcon-k8s"
+version = "0.2.0"
 authors = [
-    { name = "Manideep Kolla", email = "manideep2510@gmail.com" }
+    { name = "Falcon contributors" }
 ]
-description = "A CLI Job Execution Toolkit (Jet) for Kubernetes"
+description = "Run and understand Kubernetes batch Jobs like local commands"
 readme = "README.md"
-requires-python = ">=3.8.1"
-keywords = ["kubernetes", "k8s", "cli", "job execution", "job management"]
+requires-python = ">=3.10"
+keywords = ["kubernetes", "gpu", "jobs", "tui", "machine-learning"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
 ]
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 dependencies = [
     "PyYAML>=6.0",
-    "kr8s>=0.19.0",
     "httpx>=0.23.0",
-    "textual>=2.0.0",
-    "tabulate>=0.9.0",
+    "textual>=2.0,<8",
 ]
 
 [project.urls]
-Homepage = "https://github.com/manideep2510/jet-k8s"
-Issues = "https://github.com/manideep2510/jet-k8s/issues"
+Homepage = "https://github.com/DivyamChandalia/falcon"
+Documentation = "https://github.com/DivyamChandalia/falcon/tree/main/docs"
+Issues = "https://github.com/DivyamChandalia/falcon/issues"
+Source = "https://github.com/DivyamChandalia/falcon"
 
 [project.scripts]
-jet = "jet.jet:cli"
 falcon = "falcon.cli:main"
-falcon-next = "falcon.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["jet*", "falcon*"]
+include = ["falcon*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+falcon = ["skills/falcon/*.md"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["build>=1.2", "ruff>=0.9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: requires Docker, kind, kubectl, and an opt-in environment variable",
+    "snapshot: deterministic Textual visual regression coverage",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = ["tests/snapshots", "artifacts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

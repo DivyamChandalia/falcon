@@ -1,25 +1,26 @@
-"""Operational job commands shared by the CLI and shell completion."""
+"""Operational Job commands shared by the CLI and completion."""
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .config import logname
+from .kubernetes import KubernetesClient, KubernetesError
 
 
 def state_path() -> Path:
-    cache = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "falcon"
-    return cache / "last-job"
+    cache = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    return cache / "falcon" / "last-job"
 
 
 def remember_job(name: str) -> None:
     target = state_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(name + "\n", encoding="utf-8")
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(name + "\n", encoding="utf-8")
+    temporary.replace(target)
 
 
 def last_job() -> Optional[str]:
@@ -30,16 +31,23 @@ def last_job() -> Optional[str]:
     return value or None
 
 
-def _target(name: Optional[str]) -> str:
+def target_job(name: Optional[str]) -> str:
     value = name or last_job()
     if not value:
-        raise ValueError("no job supplied and no previous Falcon job was recorded")
+        raise ValueError(
+            "no Job supplied and no previous Falcon Job was recorded"
+        )
     return value
 
 
-def kubectl(args: List[str], capture: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+def kubectl(
+    args: List[str],
+    capture: bool = False,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Compatibility wrapper retained for simple external command tests."""
     return subprocess.run(
-        ["kubectl"] + args,
+        ["kubectl", *args],
         capture_output=capture,
         text=True,
         timeout=timeout,
@@ -48,70 +56,76 @@ def kubectl(args: List[str], capture: bool = False, timeout: Optional[int] = Non
 
 
 def job_names(namespace: str) -> List[str]:
-    result = kubectl(
-        ["get", "jobs.batch", "-n", namespace, "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"],
-        capture=True,
-        timeout=8,
+    try:
+        payload = KubernetesClient(namespace).list_jobs()
+    except KubernetesError:
+        return []
+    return sorted(
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in payload.get("items", [])
+        if (item.get("metadata") or {}).get("name")
     )
-    return sorted(line for line in result.stdout.splitlines() if line) if result.returncode == 0 else []
 
 
-def logs(namespace: str, name: Optional[str]) -> int:
-    target = _target(name)
-    remember_job(target)
-    return kubectl(["logs", "-f", f"job.batch/{target}", "-n", namespace]).returncode
+def logs(
+    namespace: str,
+    name: Optional[str],
+    *,
+    tail: int = 100,
+    follow: bool = False,
+    container: Optional[str] = None,
+) -> int:
+    target = target_job(name)
+    result = KubernetesClient(namespace).logs(
+        target,
+        tail=tail,
+        follow=follow,
+        container=container,
+    )
+    if not follow and result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
+    if result.returncode == 0:
+        remember_job(target)
+    return result.returncode
 
 
 def attach(namespace: str, name: Optional[str]) -> int:
-    from jet.defaults import DEFAULT_JOB_POD_WAITING_TIMEOUT
-    from jet.utils import wait_for_job_pods_ready
-
-    target = _target(name)
-    remember_job(target)
-    print("[falcon] Waiting for job pod to be ready...")
-    pod = wait_for_job_pods_ready(target, namespace, timeout=DEFAULT_JOB_POD_WAITING_TIMEOUT)
-    if not pod:
-        raise ValueError(f"no running pod found for job {target}")
-    print(f"[falcon] Attaching to pod {pod}. Use Control-C to detach.")
-    return kubectl(["attach", pod, "-n", namespace]).returncode
+    target = target_job(name)
+    result = KubernetesClient(namespace).attach(target)
+    if result.returncode == 0:
+        remember_job(target)
+    return result.returncode
 
 
-def delete(namespace: str, names: Iterable[str]) -> int:
-    targets = list(names) or [_target(None)]
-    return kubectl(["delete", "job.batch", *targets, "-n", namespace]).returncode
+def kill(namespace: str, names: Iterable[str]) -> List[str]:
+    targets = list(names) or [target_job(None)]
+    KubernetesClient(namespace).delete_jobs(targets)
+    return targets
 
 
 def clean(namespace: str) -> int:
-    result = kubectl(["get", "jobs.batch", "-n", namespace, "-o", "json"], capture=True, timeout=10)
-    if result.returncode != 0:
-        return result.returncode
-    data = json.loads(result.stdout)
-    completed = []
-    for item in data.get("items", []):
-        status = item.get("status", {})
-        if not status.get("active") and status.get("succeeded"):
-            completed.append(item.get("metadata", {}).get("name"))
+    client = KubernetesClient(namespace)
+    payload = client.list_jobs()
+    completed = [
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in payload.get("items", [])
+        if not (item.get("status") or {}).get("active")
+        and (item.get("status") or {}).get("succeeded")
+    ]
     completed = [name for name in completed if name]
     if not completed:
-        print("[falcon] No succeeded jobs to clean.")
+        print("No succeeded Jobs to clean.")
         return 0
-    print(f"[falcon] Cleaning {len(completed)} job(s): {' '.join(completed)}")
-    return delete(namespace, completed)
+    client.delete_jobs(completed)
+    print(f"Deleted {len(completed)} succeeded Job(s).")
+    return 0
 
 
 def top(namespace: str, name: Optional[str]) -> int:
-    target = _target(name)
-    remember_job(target)
-    result = kubectl(
-        [
-            "get", "pods", "-n", namespace, "-l", f"job-name={target}",
-            "--field-selector=status.phase=Running", "-o", "jsonpath={.items[0].metadata.name}",
-        ],
-        capture=True,
-        timeout=8,
-    )
-    pod = result.stdout.strip()
-    if not pod:
-        raise ValueError(f"no running pod found for job {target}")
-    python = f"/media/beegfs/users/{logname()}/miniforge/bin/python"
-    return kubectl(["exec", "-it", "-n", namespace, pod, "--", python, "-m", "nvitop"]).returncode
+    target = target_job(name)
+    result = KubernetesClient(namespace).top(target)
+    if result.returncode == 0:
+        remember_job(target)
+    return result.returncode

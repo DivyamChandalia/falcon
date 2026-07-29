@@ -5,8 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
-import threading
 import textwrap
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,22 +27,28 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from .dashboard import (
-    KUBERNETES_USAGE_SECONDS, JobEvent, JobUsage, _metric_color, _percent,
-    _short_cpu, _short_memory, _timestamp,
+    KUBERNETES_USAGE_SECONDS,
+    JobEvent,
+    JobUsage,
+    _metric_color,
+    _percent,
+    _short_cpu,
+    _short_memory,
+    _timestamp,
 )
-
-
-CYAN = "#00FFFF"
-CYAN_2 = "#4DDDDD"
-GREEN = "#55FF55"
-YELLOW = "#FFFF55"
-RED = "#FF5555"
-WHITE = "#F2F2F2"
-GRAY = "#AAAAAA"
-MUTED = "#666666"
-BORDER = "#555555"
-MINIMUM_WIDTH = 80
-MINIMUM_HEIGHT = 22
+from .theme import (
+    BORDER,
+    CYAN,
+    CYAN_2,
+    GRAY,
+    GREEN,
+    MINIMUM_HEIGHT,
+    MINIMUM_WIDTH,
+    MUTED,
+    RED,
+    WHITE,
+    YELLOW,
+)
 
 
 def _restart_job_manifest(job: Dict, new_name: str, namespace: str) -> Dict:
@@ -224,7 +230,7 @@ def _job_status_display(row: JobUsage) -> Tuple[str, str, str]:
 
 def _gpu_display(gpu_type: str, count: int) -> str:
     if count <= 0:
-        return "CPU only"
+        return "-"
     normalized = gpu_type.strip().replace(" ", "").lower()
     return f"{normalized}x{count}"
 
@@ -450,18 +456,23 @@ class FilterDialog(ModalScreen[Optional[Dict[str, str]]]):
     def _render_dialog(self) -> None:
         text = Text("FILTER JOBS\n", style=f"bold {CYAN}")
         text.append("Choose a row, then change its value.\n\n", style=GRAY)
-        for index, field in enumerate(self.fields):
+        for index, field_name in enumerate(self.fields):
             selected = index == self.index
             text.append("> " if selected else "  ", style=CYAN if selected else GRAY)
-            text.append(f"{field.title():<10}  [ {self.values[field]} ]\n", style=CYAN if selected else WHITE)
+            text.append(
+                f"{field_name.title():<10}  [ {self.values[field_name]} ]\n",
+                style=CYAN if selected else WHITE,
+            )
         text.append("\n↑/↓ Select filter   ←/→ or Space Change   Enter Apply   Esc Cancel", style=GRAY)
         self.query_one("#filter-text", Static).update(text)
 
     def action_up(self) -> None:
-        self.index = (self.index - 1) % len(self.fields); self._render_dialog()
+        self.index = (self.index - 1) % len(self.fields)
+        self._render_dialog()
 
     def action_down(self) -> None:
-        self.index = (self.index + 1) % len(self.fields); self._render_dialog()
+        self.index = (self.index + 1) % len(self.fields)
+        self._render_dialog()
 
     def _cycle(self, amount: int) -> None:
         field = self.fields[self.index]
@@ -591,6 +602,7 @@ class FalconDashboard(App):
         sort_field: str = "Age", sort_direction: str = "desc",
         persist_hidden_panes: Optional[Callable[[Set[str]], None]] = None,
         persist_sort: Optional[Callable[[str, str], None]] = None,
+        clock: Optional[Callable[[], str]] = None,
     ):
         super().__init__()
         self.collector = collector
@@ -603,6 +615,7 @@ class FalconDashboard(App):
             self.state.sort_direction = "asc"
         self._persist_hidden_panes = persist_hidden_panes
         self._persist_sort = persist_sort
+        self._clock = clock or (lambda: datetime.now().strftime("%H:%M:%S"))
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
@@ -613,6 +626,7 @@ class FalconDashboard(App):
         self._stale = False
         self._spinner = 0
         self._result_queue = __import__("queue").Queue(maxsize=1)
+        self._last_terminal_size: Tuple[int, int] = (-1, -1)
 
     @property
     def selected(self) -> int:
@@ -643,12 +657,16 @@ class FalconDashboard(App):
         self.query_one("#jobs-pane", DashboardPane).border_title = " JOBS "
         self.query_one("#selected-pane", DashboardPane).border_title = " SELECTED JOB "
         self.query_one("#resources-pane", DashboardPane).border_title = " RESOURCE USAGE "
-        self.query_one("#events-pane", DashboardPane).border_title = " EVENTS — last 20 "
+        self.query_one("#events-pane", DashboardPane).border_title = " EVENTS "
         self.query_one("#jobs-pane", DashboardPane).focus()
         self._apply_layout()
         self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
+        # Textual delivers terminal Resize to the active Screen rather than
+        # reliably bubbling it to App in every supported version.  A cheap
+        # size watcher makes live resize deterministic across that range.
+        self.set_interval(0.1, self._check_terminal_size)
         self.set_interval(1.0, self._tick_clock)
         self._render_all()
 
@@ -658,6 +676,15 @@ class FalconDashboard(App):
             close()
 
     def on_resize(self, event: events.Resize) -> None:
+        self._last_terminal_size = (self.size.width, self.size.height)
+        self._apply_layout()
+        self._render_all()
+
+    def _check_terminal_size(self) -> None:
+        current = (self.size.width, self.size.height)
+        if current == self._last_terminal_size:
+            return
+        self._last_terminal_size = current
         self._apply_layout()
         self._render_all()
 
@@ -729,14 +756,20 @@ class FalconDashboard(App):
                 "failed": 2, "unknown": 2,
                 "succeeded": 3,
             }
-            key = lambda row: (status_order.get(row.status.lower(), 2), -_timestamp(row.created_at))
+            def status_key(row: JobUsage) -> Tuple[int, float]:
+                return (
+                    status_order.get(row.status.lower(), 2),
+                    -_timestamp(row.created_at),
+                )
+
+            key = status_key
             reverse = False
         else:
             reverse = self.state.sort_direction == "desc"
             key = {
                 "Name": lambda row: row.job.lower(),
-                "Age": lambda row: -_timestamp(row.created_at),
-            }.get(self.state.sort_field, lambda row: -_timestamp(row.created_at))
+                "Age": lambda row: _timestamp(row.created_at),
+            }.get(self.state.sort_field, lambda row: _timestamp(row.created_at))
         self.filtered_rows = sorted(result, key=key, reverse=reverse)
         if self.state.cursor_job_uid not in {row.uid for row in self.filtered_rows}:
             self.state.cursor_job_uid = self.filtered_rows[0].uid if self.filtered_rows else ""
@@ -754,9 +787,18 @@ class FalconDashboard(App):
                 continue
             history = self.histories.setdefault(row.uid, deque(maxlen=600))
             history.append(MetricPoint(time.time(), *values))
-        gpu_weight = sum(row.gpu_count for row in self.rows if row.gpu_util is not None)
+        gpu_weight = sum(
+            row.gpu_allocated_count
+            for row in self.rows
+            if row.gpu_util is not None
+        )
         gpu = (
-            sum((row.gpu_util or 0) * row.gpu_count for row in self.rows if row.gpu_util is not None) / gpu_weight
+            sum(
+                (row.gpu_util or 0) * row.gpu_allocated_count
+                for row in self.rows
+                if row.gpu_util is not None
+            )
+            / gpu_weight
             if gpu_weight else None
         )
         cpu = _percent(sum(row.cpu_used for row in self.rows), sum(row.cpu_requested for row in self.rows))
@@ -829,13 +871,13 @@ class FalconDashboard(App):
             focused = pane == self.state.focused_pane
             base = {
                 "jobs": "JOBS", "selected": "SELECTED JOB",
-                "resources": "RESOURCE USAGE", "events": "EVENTS — last 20",
+                "resources": "RESOURCE USAGE", "events": "EVENTS",
             }[pane]
             widget.border_title = f" {base}{' · focused' if focused else ''} "
 
     def _render_header(self) -> None:
         target = self.query_one("#falcon-header", Static)
-        clock = datetime.now().strftime("%H:%M:%S")
+        clock = self._clock()
         glyph = "◴◷◶◵"[self._spinner]
         status = f"[bold {RED}]STALE[/]" if self._stale else f"[{CYAN}]{glyph}[/]"
         width = max(30, self.size.width - 2)
@@ -945,7 +987,7 @@ class FalconDashboard(App):
         if width >= 90:
             table.add_column("NODE", width=12, no_wrap=True)
         if width >= 115:
-            table.add_column("GPU TYPE", width=13, no_wrap=True)
+            table.add_column("GPU REQUEST", width=13, no_wrap=True)
         if expanded:
             table.add_column("RESTARTS", width=8, justify="right")
             table.add_column("COMPLETIONS", width=11, justify="right")
@@ -1013,10 +1055,31 @@ class FalconDashboard(App):
                 ("Active pod state", row.active_pod_state), ("Active pod", row.active_pod or "—"),
                 ("Node", row.nodes), ("Age", row.age),
                 ("Created", row.created_at or "—"), ("Started", row.started_at or "—"),
-                ("GPU allocation", _gpu_display(row.gpu_type, row.gpu_count)),
+                (
+                    "GPU requested",
+                    _gpu_display(
+                        row.gpu_requested_type,
+                        row.gpu_requested_count,
+                    ),
+                ),
+                (
+                    "GPU allocated now",
+                    _gpu_display(
+                        row.gpu_allocated_type,
+                        row.gpu_allocated_count,
+                    ),
+                ),
                 ("CPU request", f"{_short_cpu(row.cpu_requested)} vCPU"),
                 ("RAM request", _short_memory(row.memory_requested_gib)),
-                ("Restarts", str(row.restarts)), ("Completions", row.completions or "—"),
+                ("Container restarts", str(row.container_restarts)),
+                ("Pod attempts", str(row.pod_attempts)),
+                ("Succeeded attempts", str(row.succeeded_attempts)),
+                ("Failed attempts", str(row.failed_attempts)),
+                (
+                    "Backoff limit",
+                    "—" if row.backoff_limit is None else str(row.backoff_limit),
+                ),
+                ("Completions", row.completions or "—"),
                 ("GPU EMA", "—" if row.gpu_ema is None else f"{row.gpu_ema:.1f}%"),
                 ("GPU 60s average", "—" if row.gpu_risk_average is None else f"{row.gpu_risk_average:.1f}%"),
                 ("Eviction risk", "YES" if row.at_risk else "No"),
@@ -1407,18 +1470,23 @@ class FalconDashboard(App):
         table.add_column("TIME", width=9, style=GRAY)
         table.add_column("TYPE", width=9)
         table.add_column("REASON", width=20)
-        if self.state.expanded_pane == "events":
-            table.add_column("OBJECT", width=24, style=GRAY)
-            table.add_column("COUNT", width=7, justify="right")
-        table.add_column("MESSAGE", ratio=4, overflow="fold" if self.state.expanded_pane == "events" else "ellipsis")
+        # One event must always consume exactly one terminal row.  Folding
+        # messages made logical offsets diverge from the physical viewport,
+        # which was the root cause of the old unreachable-last-event bug.
+        table.add_column("MESSAGE", ratio=4, no_wrap=True, overflow="ellipsis")
         for event in events_list[start:start + visible]:
             stamp = datetime.fromtimestamp(_timestamp(event.timestamp)).strftime("%H:%M:%S") if _timestamp(event.timestamp) else "—"
             color = _event_style(event)
             reason = f"{event.reason} ×{event.count}" if event.count > 1 else event.reason
             cells = [Text(stamp, style=GRAY), Text(event.event_type, style=color), Text(reason, style=color)]
-            if self.state.expanded_pane == "events":
-                cells.extend([Text(event.object_name, style=GRAY), Text(str(event.count), style=GRAY)])
-            cells.append(Text(event.message, style=WHITE, no_wrap=self.state.expanded_pane != "events", overflow="ellipsis"))
+            cells.append(
+                Text(
+                    event.message,
+                    style=WHITE,
+                    no_wrap=True,
+                    overflow="ellipsis",
+                )
+            )
             table.add_row(*cells)
         newer = len(events_list) - (start + visible)
         target.border_subtitle = f" {newer} newer events ↓ " if newer > 0 and not self.state.events_auto_follow else ""
@@ -1430,7 +1498,14 @@ class FalconDashboard(App):
             return
         marked = len(self.state.marked_job_uids)
         if self.state.focused_pane == "jobs":
-            value = "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   k/F9 Actions   c Clean   Enter Expand   Tab Next pane   / Search   r Refresh   q Quit"
+            value = (
+                "↑/↓ Jobs   Enter Expand   Tab Pane   / Search   "
+                "f Filter   r Refresh   q Quit"
+                if self.size.width < 160
+                else "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   "
+                "k/F9 Actions   c Clean   Enter Expand   Tab Next pane   "
+                "/ Search   r Refresh   q Quit"
+            )
             if marked:
                 value += f"      {marked} marked"
         elif self.state.focused_pane == "selected":
@@ -1540,11 +1615,13 @@ class FalconDashboard(App):
         self.state.expanded_pane = self.state.focused_pane
         self._apply_layout()
         self._render_all()
+        self.call_after_refresh(self._render_all)
 
     def action_toggle_expand(self) -> None:
         self.state.expanded_pane = None if self.state.expanded_pane else self.state.focused_pane
         self._apply_layout()
         self._render_all()
+        self.call_after_refresh(self._render_all)
 
     def action_escape(self) -> None:
         # Application bindings remain active while a ModalScreen is mounted in
@@ -1587,21 +1664,29 @@ class FalconDashboard(App):
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
             self._scroll_selected_command(-1)
             return
-        if self.state.focused_pane in {"jobs", "selected"}: self._move_cursor(-1)
-        elif self.state.focused_pane == "events": self._scroll_events(-1)
-        else: self._scroll_history(1)
+        if self.state.focused_pane in {"jobs", "selected"}:
+            self._move_cursor(-1)
+        elif self.state.focused_pane == "events":
+            self._scroll_events(-1)
+        else:
+            self._scroll_history(1)
 
     def action_down(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
             self._scroll_selected_command(1)
             return
-        if self.state.focused_pane in {"jobs", "selected"}: self._move_cursor(1)
-        elif self.state.focused_pane == "events": self._scroll_events(1)
-        else: self._scroll_history(-1)
+        if self.state.focused_pane in {"jobs", "selected"}:
+            self._move_cursor(1)
+        elif self.state.focused_pane == "events":
+            self._scroll_events(1)
+        else:
+            self._scroll_history(-1)
 
     def action_kill_or_up(self) -> None:
-        if self.state.focused_pane == "jobs": self.action_kill()
-        else: self.action_up()
+        if self.state.focused_pane == "jobs":
+            self.action_kill()
+        else:
+            self.action_up()
 
     def action_left(self) -> None:
         if self.state.focused_pane == "resources":
@@ -1614,10 +1699,16 @@ class FalconDashboard(App):
     def _scroll_events(self, amount: int) -> None:
         events_list = self._filtered_events()
         visible = self._visible_event_count()
-        self.state.events_auto_follow = False
-        self.state.events_scroll_offset = max(0, min(
-            max(0, len(events_list) - visible), self.state.events_scroll_offset + amount
-        ))
+        maximum = max(0, len(events_list) - visible)
+        if self.state.events_auto_follow:
+            self.state.events_scroll_offset = maximum
+        self.state.events_scroll_offset = max(
+            0,
+            min(maximum, self.state.events_scroll_offset + amount),
+        )
+        # Reaching the newest page is the natural way to resume follow mode.
+        # Scrolling anywhere above it freezes the viewport when events arrive.
+        self.state.events_auto_follow = self.state.events_scroll_offset >= maximum
         self._render_events()
 
     def _scroll_history(self, amount: int) -> None:
@@ -1675,9 +1766,12 @@ class FalconDashboard(App):
             self._render_resources()
 
     def action_history_left(self) -> None:
-        if self.state.focused_pane == "resources": self._scroll_history(1)
+        if self.state.focused_pane == "resources":
+            self._scroll_history(1)
+
     def action_history_right(self) -> None:
-        if self.state.focused_pane == "resources": self._scroll_history(-1)
+        if self.state.focused_pane == "resources":
+            self._scroll_history(-1)
 
     def action_cycle_resource_range(self) -> None:
         if self.state.focused_pane != "resources":
@@ -1713,9 +1807,12 @@ class FalconDashboard(App):
 
     def action_toggle_mark(self) -> None:
         row = self._selected_row()
-        if not row: return
-        if row.uid in self.state.marked_job_uids: self.state.marked_job_uids.remove(row.uid)
-        else: self.state.marked_job_uids.add(row.uid)
+        if not row:
+            return
+        if row.uid in self.state.marked_job_uids:
+            self.state.marked_job_uids.remove(row.uid)
+        else:
+            self.state.marked_job_uids.add(row.uid)
         self._filter_rows()
         self._render_all()
 
@@ -1746,9 +1843,12 @@ class FalconDashboard(App):
         control.focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id != "search-input": return
-        if "events" in event.input.placeholder.lower(): self.event_search = event.value.strip()
-        else: self.state.search_query = event.value.strip()
+        if event.input.id != "search-input":
+            return
+        if "events" in event.input.placeholder.lower():
+            self.event_search = event.value.strip()
+        else:
+            self.state.search_query = event.value.strip()
         event.input.display = False
         self.query_one("#controls").display = True
         self._filter_rows()
@@ -1789,7 +1889,8 @@ class FalconDashboard(App):
 
     def action_update_data(self) -> None:
         invalidate = getattr(self.collector, "invalidate", None)
-        if invalidate: invalidate()
+        if invalidate:
+            invalidate()
         self._request_update()
 
     def action_help(self) -> None:
@@ -1830,14 +1931,17 @@ class FalconDashboard(App):
     def action_kill(self) -> None:
         selected = self._selected_row()
         targets = [row for row in self.rows if row.uid in self.state.marked_job_uids]
-        if not targets and selected: targets = [selected]
-        if not targets: return
+        if not targets and selected:
+            targets = [selected]
+        if not targets:
+            return
         self.state.kill_dialog.update({"isOpen": True, "targets": [row.uid for row in targets]})
         self.push_screen(KillDialog(targets), self._job_action_confirmed)
 
     def _job_action_confirmed(self, result: Optional[Tuple[str, List[JobUsage]]]) -> None:
         self.state.kill_dialog["isOpen"] = False
-        if not result: return
+        if not result:
+            return
         action, rows = result
 
         def apply_action() -> None:
@@ -1872,7 +1976,8 @@ class FalconDashboard(App):
                         pass
                     continue
                 if action == "pod":
-                    if not row.active_pod: continue
+                    if not row.active_pod:
+                        continue
                     command = [
                         "kubectl", "delete", "pod", row.active_pod, "--wait=false",
                         "--namespace", self.collector.namespace,
@@ -1899,7 +2004,8 @@ class FalconDashboard(App):
                 else:
                     self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
                 invalidate = getattr(self.collector, "invalidate", None)
-                if invalidate: invalidate()
+                if invalidate:
+                    invalidate()
                 self._request_update()
             self.call_from_thread(finish)
 

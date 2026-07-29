@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .cluster import ClusterSnapshot, build_cluster_snapshot
 
-
 DEMO_NOW = 1_768_478_400.0
 DEMO_NOW_RFC3339 = "2026-01-15T12:00:00Z"
 
@@ -42,6 +41,7 @@ def _node(
     memory: str,
     gpu: int = 0,
     gpu_model: Optional[str] = None,
+    gpu_memory_mib: Optional[int] = None,
     ready: Optional[bool] = True,
     unschedulable: bool = False,
     taints: Optional[Sequence[Mapping[str, str]]] = None,
@@ -55,6 +55,8 @@ def _node(
     if gpu:
         resources["nvidia.com/gpu"] = str(gpu)
         labels["nvidia.com/gpu.product"] = gpu_model or "Unknown"
+        if gpu_memory_mib:
+            labels["nvidia.com/gpu.memory"] = str(gpu_memory_mib)
     conditions = []
     if ready is not None:
         conditions.append(
@@ -327,14 +329,29 @@ def _ordinary_pod(
 
 def demo_nodes() -> List[Dict[str, Any]]:
     return [
-        _node(name="node-a-h100", cpu="64", memory="480Gi", gpu=4, gpu_model="NVIDIA-H100-80GB-HBM3"),
-        _node(name="node-b-a6000", cpu="96", memory="720Gi", gpu=4, gpu_model="NVIDIA RTX A6000"),
+        _node(
+            name="node-a-h100",
+            cpu="64",
+            memory="480Gi",
+            gpu=4,
+            gpu_model="NVIDIA-H100-80GB-HBM3",
+            gpu_memory_mib=81559,
+        ),
+        _node(
+            name="node-b-a6000",
+            cpu="96",
+            memory="720Gi",
+            gpu=4,
+            gpu_model="NVIDIA RTX A6000",
+            gpu_memory_mib=49140,
+        ),
         _node(
             name="node-c-2080ti-cordoned",
             cpu="48",
             memory="240Gi",
             gpu=8,
             gpu_model="NVIDIA_GeForce_RTX_2080_Ti",
+            gpu_memory_mib=11264,
             unschedulable=True,
             taints=[
                 {"key": "maintenance", "value": "planned", "effect": "NoSchedule"}
@@ -710,4 +727,3 @@ class DemoCollector:
 
     def close(self) -> None:
         self.closed = True
-

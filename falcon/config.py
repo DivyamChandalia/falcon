@@ -17,26 +17,35 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import yaml
 
-
 CONFIG_VERSION = 1
 DEFAULT_DASHBOARD_EMA_ALPHA = 0.1
 LEGACY_DASHBOARD_EMA_ALPHAS = {0.02, 0.08, 0.25}
 
-# These defaults are deliberately portable.  Sites can set a private image,
-# scheduler, labels, and mounts during setup or by editing the YAML file.
+# Deployment defaults can be overridden during setup or in ``~/.falconrc``.
 INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
     "cluster": {
         "namespace": "default",
-        "kube_state_metrics_url": None,
+        # This is the same local kube-state-metrics endpoint used by the
+        # original resource command. It supplies cluster request headroom on
+        # installations where ordinary users cannot list Nodes.
+        "kube_state_metrics_url": "http://localhost:30080/metrics",
         "gpu_label": "gpu-type",
         "hostname_label": "kubernetes.io/hostname",
     },
     "runtime": {
-        "image": "nvidia/cuda:12.8.1-runtime-ubuntu24.04",
-        "image_pull_secrets": [],
+        "image": (
+            "registry.gitlab.com/hvlabs/teams/ai/container-images/base:"
+            "ubuntu24.04-cuda13.0.2-runtime-withtools-v1.0.0"
+        ),
+        "image_pull_secrets": ["hv-gitlab-registry"],
         "shell": "/bin/bash",
-        "scheduler": None,
+        "scheduler": "kai-scheduler",
+        "run_as_user": os.getuid(),
+        "run_as_group": os.getgid(),
+        "supplemental_groups": sorted(set(os.getgroups())),
         "mount_home": False,
+        "mount_working_dir": True,
+        "home": None,
         "volumes": [],
         "environment": {},
         "python_environment": "auto",
@@ -119,12 +128,15 @@ def effective_defaults() -> Dict[str, Any]:
     image = os.environ.get("FALCON_IMAGE")
     if image:
         config["runtime"]["image"] = image
+    config["runtime"]["home"] = str(Path.home())
     return config
 
 
-# Kept for callers and tests.  It is now safe in sparse/noninteractive
-# environments because effective_defaults never requires login variables.
-DEFAULT_CONFIG: Dict[str, Any] = effective_defaults()
+# Kept for callers and tests.  Importing Falcon must never launch kubectl:
+# discovery belongs to setup/load time, while this constant remains a stable
+# portable baseline suitable for help, completion, and isolated test runners.
+DEFAULT_CONFIG: Dict[str, Any] = _merge(INFRASTRUCTURE_DEFAULTS, USER_DEFAULTS)
+DEFAULT_CONFIG["cluster"]["namespace"] = namespace_from_logname()
 
 
 def config_path(path: Optional[str] = None) -> Path:
@@ -150,8 +162,10 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             key: copy.deepcopy(value) for key, value in raw["runtime"].items()
             if key in {
                 "image", "image_pull_secrets", "shell", "scheduler",
-                "mount_home", "volumes", "environment",
-                "python_environment",
+                "mount_home", "mount_working_dir", "home", "volumes", "environment",
+                "python_environment", "run_as_user", "run_as_group",
+                "supplemental_groups", "fs_group", "security_context",
+                "container_security_context",
             }
         }
     if isinstance(raw.get("dashboard"), dict):
@@ -187,6 +201,11 @@ def load_config(path: Optional[str] = None, require_exists: bool = False) -> Dic
     if not isinstance(raw, dict):
         raise ValueError(f"Falcon config must be a YAML mapping: {target}")
     config = _merge(_merge(INFRASTRUCTURE_DEFAULTS, USER_DEFAULTS), _user_config(raw))
+    # Older configs commonly persisted ``home: null``. Interactive debug
+    # shells need the invoking user's dotfiles, so resolve that portable value
+    # at load time without requiring users to rerun setup.
+    if not config["runtime"].get("home"):
+        config["runtime"]["home"] = str(Path.home())
     validate_config(config)
     return config
 
@@ -220,6 +239,24 @@ def validate_config(config: Dict[str, Any]) -> None:
         runtime.get("python_environment"), str
     ):
         raise ValueError("runtime.python_environment must be auto, none, or a path")
+    if runtime.get("home") is not None and not Path(str(runtime["home"])).is_absolute():
+        raise ValueError("runtime.home must be an absolute path or null")
+    for key in ("run_as_user", "run_as_group", "fs_group"):
+        value = runtime.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError(f"runtime.{key} must be a non-negative integer")
+    groups = runtime.get("supplemental_groups", [])
+    if not isinstance(groups, list) or any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in groups
+    ):
+        raise ValueError(
+            "runtime.supplemental_groups must be non-negative integers"
+        )
     percent = float(config.get("resources", {}).get("shared_memory_percent", 15))
     if not 0 < percent <= 100:
         raise ValueError(
@@ -396,6 +433,16 @@ def _remove_legacy_falcon_shell(content: str) -> str:
         "",
         content,
         flags=re.DOTALL,
+    )
+    # Pre-0.2 setup installed an eval on every shell startup.  The command no
+    # longer exists, and leaving it behind makes otherwise unrelated login
+    # shells print an argparse error.  Match both PATH and absolute launchers
+    # while leaving comments and every unrelated dotfile line untouched.
+    content = re.sub(
+        r"(?m)^[ \t]*[^#\n]*\bfalcon[ \t]+shell-init"
+        r"(?:[ \t]+(?:bash|zsh))?[^#\n]*\n?",
+        "",
+        content,
     )
     return content
 

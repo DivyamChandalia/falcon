@@ -211,3 +211,7 @@ __marimo__/
 thumbs.db
 logs/
 *.mp4
+
+# Reproducible review captures are generated on demand. The two README SVGs
+# and compact snapshot hash manifest remain tracked.
+artifacts/tui/*.svg

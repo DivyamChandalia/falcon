@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install Falcon and test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Compile
+        run: python -m compileall -q falcon tests
+      - name: Unit, CLI, TUI, and snapshot tests
+        env:
+          FALCON_NAMESPACE: default
+        run: python -m pytest
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check falcon tests scripts
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Clean install smoke test
+        run: |
+          python -m venv /tmp/falcon-wheel
+          /tmp/falcon-wheel/bin/pip install dist/*.whl
+          /tmp/falcon-wheel/bin/falcon --version
+          /tmp/falcon-wheel/bin/falcon --help
+          /tmp/falcon-wheel/bin/python -c "import importlib.util; assert importlib.util.find_spec('falcon'); assert importlib.util.find_spec('jet') is None"
+          test ! -e /tmp/falcon-wheel/bin/jet
+          /tmp/falcon-wheel/bin/python -c "from importlib.resources import files; assert files('falcon.skills').joinpath('falcon/SKILL.md').is_file()"

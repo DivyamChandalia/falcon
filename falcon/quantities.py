@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Callable, Optional, Tuple
 
 
@@ -29,6 +29,7 @@ _DECIMAL_FACTORS = {
     "E": Decimal(1000) ** 6,
 }
 _BINARY_POWERS = {"Ki": 1, "Mi": 2, "Gi": 3, "Ti": 4, "Pi": 5, "Ei": 6}
+_MIB = Decimal(1024) ** 2
 
 
 def parse_quantity(value: str) -> Decimal:
@@ -84,10 +85,11 @@ def parse_cpu(value: str) -> Decimal:
 def parse_memory_bytes(value: str) -> Decimal:
     """Parse a memory quantity into bytes."""
 
-    result = parse_quantity(request_part(value))
-    if result != result.to_integral_value():
-        raise QuantityError("memory quantity must resolve to a whole number of bytes")
-    return result
+    # Kubernetes accepts fractional binary quantities such as ``0.1Gi`` and
+    # rounds them to byte precision when the API server canonicalizes the
+    # manifest.  Keeping the Decimal here avoids rejecting a valid request
+    # merely because its binary expansion is not an integer.
+    return parse_quantity(request_part(value))
 
 
 def parse_memory_gib(value: str) -> float:
@@ -144,14 +146,39 @@ def format_cpu(value: Decimal | float | int) -> str:
 
 
 def format_memory_gib(value: Decimal | float | int) -> str:
-    """Floor GiB to one decimal place and append the Kubernetes ``Gi`` suffix."""
+    """Floor GiB to an integral MiB quantity valid for Kubernetes memory."""
 
     amount = Decimal(str(value))
     if amount <= 0:
         raise QuantityError("memory allocation must be positive")
-    floored = (amount * 10).to_integral_value(rounding=ROUND_FLOOR) / 10
-    floored = max(floored, Decimal("0.1"))
-    return f"{_decimal_text(floored)}Gi"
+    mebibytes = (amount * 1024).to_integral_value(rounding=ROUND_FLOOR)
+    return _format_integral_mebibytes(max(mebibytes, Decimal(1)))
+
+
+def normalize_memory(value: str) -> str:
+    """Return a byte-integral Kubernetes memory quantity.
+
+    User-provided fractional binary quantities are rounded up to the nearest
+    MiB so the normalized request is never smaller than requested. Values
+    below one MiB retain byte precision.
+    """
+
+    amount = parse_memory_bytes(value)
+    if amount <= 0:
+        raise QuantityError("memory allocation must be positive")
+    if amount >= _MIB:
+        mebibytes = (amount / _MIB).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+        return _format_integral_mebibytes(mebibytes)
+    return str(int(amount.to_integral_value(rounding=ROUND_CEILING)))
+
+
+def _format_integral_mebibytes(mebibytes: Decimal) -> str:
+    value = int(mebibytes)
+    if value % 1024 == 0:
+        return f"{value // 1024}Gi"
+    return f"{value}Mi"
 
 
 def _decimal_text(value: Decimal) -> str:

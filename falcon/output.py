@@ -9,7 +9,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
-
 SCHEMA_VERSION = "falcon/v1"
 
 

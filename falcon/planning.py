@@ -1,24 +1,25 @@
-"""Cluster-aware resource planning with no dependency on Jet."""
+"""Cluster-aware Falcon resource planning."""
 
 from __future__ import annotations
 
 import re
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable, List, Optional, Tuple
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Iterable, Optional, Tuple
 
 from .models import ComputeRequest, GPURequest, JobRequest, NodeResources, ResourcePlan
 from .quantities import (
     QuantityError,
     format_cpu,
     format_memory_gib,
+    normalize_memory,
     parse_cpu,
     parse_memory_bytes,
     parse_memory_gib,
     split_pair,
 )
 
-
 DEFAULT_SHARED_MEMORY_PERCENT = Decimal("15")
+AUTO_MEMORY_BUFFER_GIB = 1.0
 
 
 def canonical_gpu(product: str) -> str:
@@ -48,7 +49,10 @@ def plan_cpu_resources(
     if not memory:
         raise ValueError("CPU-only jobs require an explicit memory request")
     cpu_request, _ = split_pair(cpu, parse_cpu, normalize_limit=True)
-    memory_request, _ = split_pair(memory, parse_memory_bytes, normalize_limit=True)
+    memory_request, _ = split_pair(
+        memory, parse_memory_bytes, normalize_limit=True
+    )
+    memory_request = normalize_memory(memory_request)
     _require_positive(cpu_request, parse_cpu, "CPU")
     _require_positive(memory_request, parse_memory_bytes, "memory")
     resolved_shm = calculate_shared_memory(
@@ -131,6 +135,8 @@ def plan_resources(
     requested_memory = _normalized_override(
         memory_override, parse_memory_bytes, "memory"
     )
+    if requested_memory is not None:
+        requested_memory = normalize_memory(requested_memory)
     requested_cpu_value = float(parse_cpu(requested_cpu)) if requested_cpu else None
     requested_memory_value = (
         parse_memory_gib(requested_memory) if requested_memory else None
@@ -141,7 +147,7 @@ def plan_resources(
         share = gpu.count / sizing_node.gpu_total
         cpu_request = requested_cpu or format_cpu(sizing_node.cpu_total * share * 0.95)
         memory_request = requested_memory or format_memory_gib(
-            sizing_node.memory_total_gib * share * 0.95
+            _buffered_auto_memory(sizing_node.memory_total_gib * share * 0.95)
         )
     else:
         override_feasible = [
@@ -167,16 +173,17 @@ def plan_resources(
                 else sizing_node.cpu_total * share,
             )
         )
-        memory_request = requested_memory or format_memory_gib(
-            max(
-                0.1,
-                min(
-                    sizing_node.memory_total_gib * share,
-                    sizing_node.memory_free_gib,
-                )
-                if gpu_candidates
-                else sizing_node.memory_total_gib * share,
+        automatic_memory = max(
+            0.1,
+            min(
+                sizing_node.memory_total_gib * share,
+                sizing_node.memory_free_gib,
             )
+            if gpu_candidates
+            else sizing_node.memory_total_gib * share,
+        )
+        memory_request = requested_memory or format_memory_gib(
+            _buffered_auto_memory(automatic_memory)
         )
 
     requested_cpu_value = float(parse_cpu(cpu_request))
@@ -273,7 +280,7 @@ def calculate_shared_memory(
             raise ValueError("shared memory size must be positive")
         if shared_bytes > memory_bytes:
             raise ValueError("shared memory size cannot exceed the container memory request")
-        return explicit.strip()
+        return normalize_memory(explicit.strip())
 
     percentage = Decimal(str(percent))
     if not percentage.is_finite() or percentage <= 0 or percentage > 100:
@@ -281,8 +288,7 @@ def calculate_shared_memory(
     gib = memory_bytes / (Decimal(1024) ** 3)
     size = (gib * percentage / 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
     size = max(size, Decimal("0.1"))
-    rendered = format(size, "f").rstrip("0").rstrip(".")
-    return f"{rendered}Gi"
+    return normalize_memory(f"{size}Gi")
 
 
 def _normalized_override(
@@ -304,6 +310,12 @@ def _require_positive(value: str, parser, label: str) -> None:
         raise
     if parsed <= 0:
         raise ValueError(f"{label} request must be positive")
+
+
+def _buffered_auto_memory(memory_gib: float) -> float:
+    """Reserve one GiB outside Falcon's automatic container memory request."""
+
+    return max(0.1, memory_gib - AUTO_MEMORY_BUFFER_GIB)
 
 
 def _proportional_capacity_score(gpu_count: int):

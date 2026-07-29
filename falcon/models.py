@@ -12,10 +12,9 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .quantities import parse_cpu, parse_memory_bytes
-
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -142,6 +141,8 @@ class RuntimeEnvironment:
         requested_kind: Optional[EnvironmentKind]
         if kind is None:
             requested_kind = None
+        elif isinstance(kind, EnvironmentKind):
+            requested_kind = kind
         else:
             try:
                 requested_kind = EnvironmentKind(str(kind).lower())
@@ -269,6 +270,7 @@ class NodeResources:
     gpu_used: int = 0
     gpu_product: str = ""
     unschedulable: bool = False
+    scheduling_info_available: bool = True
 
     @property
     def cpu_free(self) -> float:

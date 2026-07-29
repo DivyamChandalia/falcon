@@ -9,11 +9,11 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 from .models import EnvironmentKind, JobRequest, JobSpecification, ResourcePlan
 from .planning import canonical_gpu
 
-
 DEFAULT_CONTAINER_PATH = (
     "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:"
     "/usr/sbin:/usr/bin:/sbin:/bin"
 )
+DEFAULT_DEBUG_DURATION_SECONDS = 6 * 60 * 60
 
 
 def build_job_specification(
@@ -35,7 +35,7 @@ def build_job_manifest(
     plan: ResourcePlan,
     config: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Generate a ``batch/v1`` Job without shell commands or Jet.
+    """Generate a ``batch/v1`` Job directly without shell command assembly.
 
     This function performs no API calls and reads no process-global state. Any
     host-specific values (identity, paths, environment expansion) must already
@@ -50,6 +50,7 @@ def build_job_manifest(
     image = request.image or _optional_string(runtime.get("image"))
     if not image:
         raise ValueError("container image is required")
+    interactive_debug = not request.command
 
     labels = dict(_string_mapping(runtime.get("labels", {}), "runtime.labels"))
     labels.update(request.labels)
@@ -84,11 +85,45 @@ def build_job_manifest(
     volumes, mounts = _configured_volumes(runtime.get("volumes", ()))
 
     home_path = _optional_string(runtime.get("home"))
-    if runtime.get("mount_home") and not home_path and mounts:
-        # Falcon's generated configuration lists the user's home first.
-        home_path = mounts[0]["mountPath"]
+    if (
+        (runtime.get("mount_home") or interactive_debug)
+        and home_path
+        and not _mount_covers(mounts, home_path)
+    ):
+        _add_volume(
+            volumes,
+            mounts,
+            name="falcon-home",
+            volume={
+                "hostPath": {
+                    "path": home_path,
+                    "type": "Directory",
+                }
+            },
+            mount_path=home_path,
+            read_only=False,
+        )
     if home_path:
         environment.setdefault("HOME", home_path)
+
+    if (
+        request.working_dir
+        and runtime.get("mount_working_dir", True)
+        and not _mount_covers(mounts, request.working_dir)
+    ):
+        _add_volume(
+            volumes,
+            mounts,
+            name="falcon-working-directory",
+            volume={
+                "hostPath": {
+                    "path": request.working_dir,
+                    "type": "Directory",
+                }
+            },
+            mount_path=request.working_dir,
+            read_only=False,
+        )
 
     if request.environment is not None:
         _add_environment_mounts(volumes, mounts, request.environment)
@@ -134,7 +169,7 @@ def build_job_manifest(
 
     pod_security, container_security = _security_context(runtime)
     command = list(request.command)
-    if not command:
+    if interactive_debug:
         debug_command = runtime.get("debug_command", ("sleep", "infinity"))
         if (
             isinstance(debug_command, (str, bytes))
@@ -216,6 +251,12 @@ def build_job_manifest(
         spec,
         "activeDeadlineSeconds",
     )
+    if interactive_debug:
+        spec["backoffLimit"] = 0
+        spec.setdefault(
+            "activeDeadlineSeconds",
+            DEFAULT_DEBUG_DURATION_SECONDS,
+        )
 
     metadata: Dict[str, Any] = {
         "name": request.name,
@@ -343,6 +384,17 @@ def _add_volume(
     mounts.append(mount_item)
 
 
+def _mount_covers(mounts: Iterable[Mapping[str, Any]], path: str) -> bool:
+    target = Path(path)
+    for mount in mounts:
+        try:
+            target.relative_to(Path(str(mount["mountPath"])))
+            return True
+        except (KeyError, ValueError):
+            continue
+    return False
+
+
 def _volume_name(name: str) -> str:
     normalized = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
     normalized = re.sub(r"-+", "-", normalized)[:63].rstrip("-")
@@ -363,6 +415,7 @@ def _security_context(runtime: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[
     container: Dict[str, Any] = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
+        "runAsNonRoot": True,
     }
     identity_keys = {
         "run_as_user": "runAsUser",
@@ -374,6 +427,9 @@ def _security_context(runtime: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[
         if config_key in runtime:
             pod[manifest_key] = runtime[config_key]
     pod.update(configured_pod)
+    for key in ("runAsUser", "runAsGroup"):
+        if key in pod:
+            container[key] = pod[key]
     container.update(configured_container)
     return pod, container
 

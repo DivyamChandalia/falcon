@@ -1,121 +1,70 @@
-"""Translate a Falcon preset into a Jet invocation."""
+"""Native Falcon submission helpers."""
 
 from __future__ import annotations
 
 import os
-import random
 import re
-import shlex
-import subprocess
-import sys
+import secrets
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
-from .commands import attach
-from .config import expanded
-from .resources import ResourcePlan, canonical_gpu, parse_memory_gib
+from .kubernetes import KubernetesClient
+from .manifest import build_job_specification
+from .models import (
+    JobRequest,
+    JobSpecification,
+    ResourcePlan,
+    RuntimeEnvironment,
+    SubmittedJob,
+)
 
 
 def job_name(command: Sequence[str]) -> str:
-    parent = re.sub(r"[^a-z0-9]+", "-", Path.cwd().name.lower()).strip("-")[:20] or "falcon"
-    useful = next((Path(part).stem for part in command if not part.startswith("-") and part not in {"python", "python3"}), "debug")
-    useful = re.sub(r"[^a-z0-9]+", "-", useful.lower()).strip("-")[:20] or "cmd"
-    return f"{parent}-{useful}-{random.randint(1000, 9999)}"[:63].rstrip("-")
-
-
-def jet_executable() -> List[str]:
-    # Use the Jet package installed beside Falcon. A random older `jet` script
-    # earlier on PATH could otherwise bypass fixes and features in this fork.
-    return [sys.executable, "-m", "jet"]
-
-
-def build_jet_command(
-    config: Dict[str, Any],
-    plan: ResourcePlan,
-    command: Sequence[str],
-    name: Optional[str] = None,
-    async_mode: bool = False,
-    dry_run: bool = False,
-    shm_size: Optional[str] = None,
-    shm_percent: Optional[float] = None,
-    pin_node: bool = False,
-    extra_jet_args: Optional[Sequence[str]] = None,
-) -> List[str]:
-    runtime = config["runtime"]
-    cluster = config["cluster"]
-    preset = config["presets"].get(plan.preset, {})
-    percent = float(
-        shm_percent
-        if shm_percent is not None
-        else preset.get("shared_memory_percent", config.get("resources", {}).get("shared_memory_percent", 15))
+    parent = re.sub(
+        r"[^a-z0-9]+", "-", Path.cwd().name.lower()
+    ).strip("-")[:20] or "falcon"
+    useful = next(
+        (
+            Path(part).stem
+            for part in command
+            if not part.startswith("-") and part not in {"python", "python3"}
+        ),
+        "debug",
     )
-    if not 0 < percent <= 100:
-        raise ValueError("shared-memory percentage must be between 0 and 100")
-    calculated_shm = max(0.1, round(parse_memory_gib(plan.memory) * percent / 100, 1))
-    calculated_shm_text = f"{int(calculated_shm) if calculated_shm.is_integer() else calculated_shm}Gi"
-    launch_type = "job" if command else "debug"
-    result = jet_executable() + ["launch", launch_type, name or job_name(command)]
-    if cluster.get("namespace"):
-        result += ["--namespace", str(cluster["namespace"])]
-    result += ["--image", runtime["image"]]
-    for secret in runtime.get("image_pull_secrets", []):
-        result += ["--image-pull-secrets", secret]
-    if runtime.get("shell"):
-        result += ["--shell", runtime["shell"]]
-    if runtime.get("scheduler"):
-        result += ["--scheduler", runtime["scheduler"]]
-    if runtime.get("mount_home"):
-        result.append("--mount-home")
-    for volume in runtime.get("volumes", []):
-        result += ["--volume", expanded(str(volume))]
-    for key, value in runtime.get("environment", {}).items():
-        if key == "FALCON_DEBUG_PROMPT":
-            continue
-        result += ["--env", f"{key}={expanded(str(value))}"]
-    if not command:
-        debug_resource = "cpu" if plan.gpu_count == 0 else f"{canonical_gpu(plan.gpu_type)}x{plan.gpu_count}"
-        result += ["--env", f"FALCON_DEBUG_PROMPT={debug_resource}"]
-    python_env = os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_PREFIX")
-    if python_env:
-        result += ["--pyenv", python_env]
-    result += [
-        "--working-dir", str(Path.cwd()),
-        "--cpu", plan.cpu,
-        "--memory", plan.memory,
-        "--shm-size", shm_size or calculated_shm_text,
-        "--job-labels", "falcon.dev/managed=true",
-    ]
-    if plan.gpu_count:
-        result += [
-            "--gpu", str(plan.gpu_count),
-            "--gpu-type", plan.gpu_type,
-            "--job-labels", f"falcon.dev/gpu-type={plan.gpu_type}",
-        ]
-    backoff_limit = config.get("job", {}).get("backoff_limit")
-    if backoff_limit is not None:
-        result += ["--backoff-limit", str(int(backoff_limit))]
-    if pin_node and plan.node:
-        result += ["--node-selector", f"{cluster.get('hostname_label', 'kubernetes.io/hostname')}={plan.node}"]
-    if command:
-        result += ["--command", shlex.join(list(command))]
-    if dry_run:
-        result.append("--dry-run")
-    result += list(extra_jet_args or [])
-    return result
+    useful = re.sub(r"[^a-z0-9]+", "-", useful.lower()).strip("-")[:20] or "cmd"
+    return f"{parent}-{useful}-{secrets.token_hex(2)}"[:63].rstrip("-")
 
 
-def launch(command: List[str], cleanup_name: Optional[str], cleanup: bool, namespace: Optional[str] = None) -> int:
-    try:
-        try:
-            result = subprocess.run(command).returncode
-            if result != 0 or not cleanup or not cleanup_name:
-                return result
-            return attach(namespace or "default", cleanup_name)
-        except KeyboardInterrupt:
-            return 130
-    finally:
-        if cleanup and cleanup_name:
-            delete = jet_executable() + ["delete", cleanup_name]
-            if namespace:
-                delete += ["-n", namespace]
-            subprocess.run(delete, check=False)
+def resolve_environment(
+    selection: Optional[str],
+    config: Mapping[str, object],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[RuntimeEnvironment]:
+    runtime = config.get("runtime", {})
+    configured = (
+        runtime.get("python_environment", "auto")
+        if isinstance(runtime, Mapping)
+        else "auto"
+    )
+    value = selection if selection is not None else configured
+    if value is None or str(value).strip().lower() in {"none", "off", "-"}:
+        return None
+    if str(value).strip().lower() == "auto":
+        return RuntimeEnvironment.from_current(os.environ if environ is None else environ)
+    return RuntimeEnvironment.from_path(str(value))
+
+
+def build_specification(
+    request: JobRequest,
+    plan: ResourcePlan,
+    config: Mapping[str, object],
+) -> JobSpecification:
+    return build_job_specification(request, plan, config)
+
+
+def submit(
+    specification: JobSpecification,
+    client: KubernetesClient,
+) -> SubmittedJob:
+    return client.create_job(specification.manifest)

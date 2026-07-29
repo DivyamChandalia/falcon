@@ -19,8 +19,8 @@ import math
 import re
 import threading
 import time
-from dataclasses import dataclass, field, replace
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from dataclasses import dataclass, replace
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import (
     Any,
     Callable,
@@ -33,7 +33,6 @@ from typing import (
     Sequence,
     Tuple,
 )
-
 
 TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
 ACTIVE_POD_PHASES = frozenset({"Pending", "Running", "Unknown", ""})
@@ -56,6 +55,49 @@ GPU_RESOURCE_KEYS = frozenset(
         "intel.com/gpu",
     }
 )
+SYSTEM_NAMESPACES = frozenset(
+    {
+        "cert-manager",
+        "coder",
+        "gpu-operator",
+        "ingress-nginx",
+        "kai-scheduler",
+        "keda",
+        "kube-node-lease",
+        "kube-public",
+        "kube-system",
+        "kyverno",
+        "monitoring",
+        "nvidia-gpu-operator",
+        "gpu-evictor",
+        "user-validator",
+    }
+)
+
+
+def is_system_namespace(namespace: str) -> bool:
+    """Return whether a namespace contains cluster infrastructure workloads."""
+
+    normalized = namespace.strip().lower()
+    return normalized in SYSTEM_NAMESPACES or normalized.startswith("openshift-")
+
+
+def is_system_consumer(consumer: "WorkloadConsumer") -> bool:
+    """Hide infrastructure Pods without removing their resource requests."""
+
+    return (
+        is_system_namespace(consumer.namespace)
+        or consumer.workload_kind.lower() == "node"
+    )
+
+
+def natural_name_key(value: str) -> Tuple[Tuple[int, Any], ...]:
+    """Sort embedded numbers numerically (``node9`` before ``node10``)."""
+
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in re.split(r"(\d+)", value)
+    )
 
 
 class InventoryClient(Protocol):
@@ -261,6 +303,7 @@ class NodeSnapshot:
     allocatable: ResourceVector
     requested: ResourceVector
     consumers: Tuple[WorkloadConsumer, ...]
+    gpu_memory_bytes_per_device: Optional[int] = None
     created_at: Optional[str] = None
 
     @property
@@ -281,7 +324,21 @@ class NodeSnapshot:
 
     @property
     def workload_count(self) -> int:
-        return len(self.consumers)
+        return len(self.visible_consumers)
+
+    @property
+    def visible_consumers(self) -> Tuple[WorkloadConsumer, ...]:
+        """User workloads shown by resource inspection and Pod counts.
+
+        System Pod requests remain part of ``requested`` because the scheduler
+        cannot allocate those resources to another workload.
+        """
+
+        return tuple(
+            consumer
+            for consumer in self.consumers
+            if not is_system_consumer(consumer)
+        )
 
 
 @dataclass(frozen=True)
@@ -324,15 +381,27 @@ class ClusterSnapshot:
 
     @property
     def capacity(self) -> ResourceVector:
-        return _sum_vectors(node.capacity for node in self.nodes)
+        return _sum_vectors(
+            node.capacity
+            for node in self.nodes
+            if node.schedulable and node.ready is True
+        )
 
     @property
     def allocatable(self) -> ResourceVector:
-        return _sum_vectors(node.allocatable for node in self.nodes)
+        return _sum_vectors(
+            node.allocatable
+            for node in self.nodes
+            if node.schedulable and node.ready is True
+        )
 
     @property
     def requested(self) -> ResourceVector:
-        return _sum_vectors(node.requested for node in self.nodes)
+        return _sum_vectors(
+            node.requested
+            for node in self.nodes
+            if node.schedulable and node.ready is True
+        )
 
     @property
     def request_headroom(self) -> ResourceVector:
@@ -343,7 +412,7 @@ class ClusterSnapshot:
         return sum(
             consumer.status == "Running"
             for node in self.nodes
-            for consumer in node.consumers
+            for consumer in node.visible_consumers
         )
 
     @property
@@ -353,17 +422,18 @@ class ClusterSnapshot:
         bound_pending = sum(
             consumer.status == "Pending"
             for node in self.nodes
-            for consumer in node.consumers
+            for consumer in node.visible_consumers
         )
         active_pods = {
             pod
             for job in self.jobs
+            if not is_system_namespace(job.namespace)
             for pod in job.attempts.active_pods
         }
         bound_active = {
             consumer.pod_name
             for node in self.nodes
-            for consumer in node.consumers
+            for consumer in node.visible_consumers
             if consumer.status in ACTIVE_POD_PHASES
         }
         return bound_pending + len(active_pods - bound_active)
@@ -380,6 +450,8 @@ class ClusterSnapshot:
     def gpu_availability(self) -> Mapping[str, GPUAvailability]:
         grouped: Dict[str, List[int]] = {}
         for node in self.nodes:
+            if not node.schedulable or node.ready is not True:
+                continue
             if not (node.capacity.gpu_count or node.allocatable.gpu_count):
                 continue
             model = node.gpu_model or "Unknown"
@@ -482,6 +554,35 @@ def parse_memory_quantity(value: Any) -> int:
     return int(result.to_integral_value(rounding=ROUND_CEILING))
 
 
+def gpu_memory_bytes_from_labels(labels: Mapping[str, Any]) -> Optional[int]:
+    """Read NVIDIA's per-device memory label.
+
+    GPU Feature Discovery publishes ``nvidia.com/gpu.memory`` as MiB.  Some
+    inventories retain an explicit Kubernetes quantity instead, so both forms
+    are accepted.  Invalid optional metadata is treated as unavailable rather
+    than making the whole resource view fail.
+    """
+
+    raw = labels.get("nvidia.com/gpu.memory")
+    if raw is None or not str(raw).strip():
+        return None
+    value = str(raw).strip()
+    try:
+        if re.fullmatch(r"\d+(?:\.\d+)?", value):
+            mib = Decimal(value)
+            if mib <= 0:
+                return None
+            return int(
+                (mib * (Decimal(1024) ** 2)).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+        parsed = parse_memory_quantity(value)
+        return parsed if parsed > 0 else None
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def normalize_gpu_model(value: Any) -> Optional[str]:
     """Return a compact, stable display name without inventing a GPU model."""
 
@@ -499,7 +600,7 @@ def normalize_gpu_model(value: Any) -> Optional[str]:
         ("a6000", "A6000"),
         ("l40s", "L40S"),
         ("l40", "L40"),
-        ("2080", "RTX 2080 Ti"),
+        ("2080", "2080Ti"),
     )
     for token, display in known:
         if token in lowered:
@@ -1049,6 +1150,7 @@ def build_cluster_snapshot(
                         ),
                     )
                 ),
+                gpu_memory_bytes_per_device=gpu_memory_bytes_from_labels(labels),
                 created_at=metadata.get("creationTimestamp"),
             )
         )
@@ -1064,7 +1166,7 @@ def build_cluster_snapshot(
         )
     )
     return ClusterSnapshot(
-        nodes=tuple(sorted(snapshots, key=lambda node: node.name)),
+        nodes=tuple(sorted(snapshots, key=lambda node: natural_name_key(node.name))),
         jobs=job_snapshots,
         collected_at=float(collected_at),
         stale=stale,
@@ -1200,4 +1302,3 @@ class ClusterCollector:
             close = getattr(self.client, "close", None)
             if callable(close):
                 close()
-

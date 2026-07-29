@@ -12,14 +12,13 @@ from importlib import resources
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
-
 SKILL_NAME = "falcon"
-SKILL_BUNDLE_VERSION = 1
+SKILL_BUNDLE_VERSION = 4
 METADATA_FILE = ".falcon-skill.json"
 SUPPORTED_AGENTS: Tuple[str, ...] = ("codex", "claude", "opencode")
 
 _RESOURCE_PACKAGE = "falcon.skills"
-_BUNDLE_FILES = ("SKILL.md", "reference.md")
+_BUNDLE_FILES = ("SKILL.md",)
 _AGENT_PATHS = {
     "codex": Path(".agents/skills") / SKILL_NAME,
     "claude": Path(".claude/skills") / SKILL_NAME,

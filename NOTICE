@@ -1,0 +1,7 @@
+Falcon
+Copyright 2026 Falcon contributors
+
+This product includes code derived from Jet Kubernetes, originally licensed
+under the Apache License, Version 2.0. The independently maintained Falcon
+implementation retains that license and attribution while no longer bundling
+or installing Jet itself.

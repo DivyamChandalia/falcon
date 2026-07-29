@@ -1,3 +1,3 @@
-"""Falcon's opinionated ML job workflow built on top of Jet."""
+"""Falcon: Kubernetes batch Jobs that feel like local commands."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

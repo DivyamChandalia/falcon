@@ -1,0 +1,7 @@
+include LICENSE
+include NOTICE
+include README.md
+recursive-include assets *.svg
+recursive-include docs *.md
+recursive-include scripts *.py
+recursive-include tests *.py *.json
