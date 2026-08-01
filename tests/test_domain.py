@@ -172,8 +172,31 @@ class ManifestTests(unittest.TestCase):
         manifest = build_job_manifest(request, plan, DEFAULT_CONFIG)
         pod = manifest["spec"]["template"]["spec"]
         resources = pod["containers"][0]["resources"]
+        environment = {
+            item["name"]: item["value"]
+            for item in pod["containers"][0].get("env", [])
+        }
         self.assertNotIn("nodeSelector", pod)
         self.assertNotIn("nvidia.com/gpu", resources["requests"])
+        self.assertEqual(environment["USER"], DEFAULT_CONFIG["runtime"]["environment"]["USER"])
+        self.assertEqual(environment["CONDA_AUTO_ACTIVATE_BASE"], "false")
+
+    def test_explicit_environment_overrides_identity_defaults(self) -> None:
+        request = JobRequest(
+            name="identity-job",
+            namespace="research",
+            command=("python", "-c", "pass"),
+            env={"USER": "pipeline", "CONDA_AUTO_ACTIVATE_BASE": "true"},
+        )
+        manifest = build_job_manifest(
+            request, plan_cpu_resources("1", "1Gi"), DEFAULT_CONFIG
+        )
+        environment = {
+            item["name"]: item["value"]
+            for item in manifest["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(environment["USER"], "pipeline")
+        self.assertEqual(environment["CONDA_AUTO_ACTIVATE_BASE"], "true")
 
     def test_gpu_job_has_request_limit_and_selector(self) -> None:
         gpu = GPURequest("h100", 2)

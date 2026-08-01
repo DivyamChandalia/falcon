@@ -47,7 +47,13 @@ INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
         "mount_working_dir": True,
         "home": None,
         "volumes": [],
-        "environment": {},
+        # Keep the identity/runtime flags that the original Falcon launcher
+        # supplied to every container. Workloads commonly use ``$USER`` for
+        # cache paths and Conda must not auto-activate a different prefix.
+        "environment": {
+            "USER": os.environ.get("USER") or os.environ.get("LOGNAME") or "user",
+            "CONDA_AUTO_ACTIVATE_BASE": "false",
+        },
         "python_environment": "auto",
     },
 }
