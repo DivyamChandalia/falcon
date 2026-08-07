@@ -16,6 +16,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.widgets import Static
 
 from .cluster import ClusterSnapshot, NodeSnapshot, natural_name_key
@@ -36,9 +37,12 @@ from .theme import (
 
 
 def _short_cpu(value: float) -> str:
+    """Format CPU as decimal cores consistently across the resource view."""
+
+    value = max(0.0, float(value))
     if value < 1:
-        return f"{value * 1000:.0f}m"
-    return f"{value:.1f}".rstrip("0").rstrip("-").rstrip(".")
+        return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+    return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def _short_memory(value: int) -> str:
@@ -67,7 +71,11 @@ def _gpu_headroom_color(headroom: int, allocatable: int) -> str:
     remaining = max(0, headroom)
     if remaining == 0:
         return RED
-    if remaining == 1:
+    # A single remaining GPU is not equally risky on every node: 1/2 and
+    # 1/4 are cautionary, while 1/8 is already critical availability.
+    if remaining * 4 < allocatable:
+        return RED
+    if remaining == 1 or remaining * 2 < allocatable:
         return YELLOW
     return GREEN
 
@@ -95,22 +103,36 @@ class ResourcesViewState:
     expanded: bool = False
     selected_consumer: int = 0
     consumer_scroll: int = 0
+    active_pane: str = "nodes"
 
 
 class ResourcesPane(Static):
     can_focus = True
 
+    def on_focus(self) -> None:
+        pane = self.id.replace("-pane", "") if self.id else "nodes"
+        callback = getattr(self.app, "pane_focused", None)
+        if callback:
+            callback(pane)
+
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.prevent_default()
         event.stop()
-        self.app.action_down()
+        if self.id == "node-pane":
+            self.app.scroll_consumers(1)
+        else:
+            self.app.action_down()
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         event.prevent_default()
         event.stop()
-        self.app.action_up()
+        if self.id == "node-pane":
+            self.app.scroll_consumers(-1)
+        else:
+            self.app.action_up()
 
     def on_click(self, event: events.Click) -> None:
+        self.focus()
         if self.id != "nodes-pane":
             return
         callback = getattr(self.app, "node_clicked", None)
@@ -122,7 +144,7 @@ CSS = f"""
 Screen {{ background: {BACKGROUND}; color: {WHITE}; overflow: hidden; }}
 Static {{ background: {BACKGROUND}; }}
 #resources-header {{ height: 1; padding: 0 1; color: {WHITE}; }}
-#cluster-overview {{ height: 3; border-bottom: solid {BORDER}; padding: 0 1; }}
+#cluster-overview {{ height: 2; border-bottom: solid {BORDER}; padding: 0 1; }}
 #resource-controls {{ height: 1; padding: 0 1; color: {GRAY}; }}
 ResourcesPane {{
     border: solid {BORDER};
@@ -140,6 +162,14 @@ ResourcesPane:focus {{ border: solid {CYAN}; }}
 
 class FalconResourcesApp(App[None]):
     """Keyboard-first realtime view of schedulable request headroom."""
+
+    # The fixed sections surrounding the two resource panes are one header,
+    # two overview rows, one controls row, and one footer row.  The node
+    # table needs its top spacer, header, separator, and two pane borders. The
+    # trailing Rich spacer can be clipped without hiding a data row.
+    _FIXED_LAYOUT_HEIGHT = 5
+    _NODE_TABLE_OVERHEAD = 5
+    _DETAIL_MIN_HEIGHT = 5
 
     TITLE = "Falcon Resources"
     ENABLE_COMMAND_PALETTE = False
@@ -164,7 +194,7 @@ class FalconResourcesApp(App[None]):
         self,
         collector,
         *,
-        refresh_seconds: float = 2.0,
+        refresh_seconds: float = 1.0,
         node_filter: Optional[str] = None,
         gpu_filter: Optional[str] = None,
         clock: Optional[Callable[[ClusterSnapshot], str]] = None,
@@ -181,6 +211,9 @@ class FalconResourcesApp(App[None]):
         self._refreshing = False
         self._results: "queue.Queue[ClusterSnapshot]" = queue.Queue(maxsize=1)
         self._last_terminal_size = (-1, -1)
+        self._spinner = 0
+        self._detail_auto_hidden = False
+        self._layout_node_names: tuple[str, ...] = ()
 
     def compose(self) -> ComposeResult:
         yield Static(id="resources-header")
@@ -192,14 +225,14 @@ class FalconResourcesApp(App[None]):
         yield Static(id="resources-footer")
 
     def on_mount(self) -> None:
-        self.query_one("#nodes-pane", ResourcesPane).border_title = " NODES "
-        self.query_one("#node-pane", ResourcesPane).border_title = " SELECTED NODE "
+        self._set_titles()
         self.query_one("#nodes-pane", ResourcesPane).focus()
-        self._apply_layout()
+        self._apply_layout(recompute_detail=True)
         self._request_update(force=True)
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.1, self._drain_results)
         self.set_interval(0.1, self._check_terminal_size)
+        self.set_interval(1.0, self._tick_clock)
         self._render_all()
 
     def on_unmount(self) -> None:
@@ -209,18 +242,40 @@ class FalconResourcesApp(App[None]):
 
     def on_resize(self, event: events.Resize) -> None:
         self._last_terminal_size = (self.size.width, self.size.height)
-        self._apply_layout()
-        self._ensure_visible()
-        self._render_all()
+        try:
+            self._apply_layout(recompute_detail=True)
+            self._ensure_visible()
+            self._render_all()
+        except NoMatches:
+            # Resize events can arrive as Textual is tearing down the screen.
+            return
 
     def _check_terminal_size(self) -> None:
         current = (self.size.width, self.size.height)
         if current == self._last_terminal_size:
             return
         self._last_terminal_size = current
-        self._apply_layout()
-        self._ensure_visible()
-        self._render_all()
+        try:
+            self._apply_layout(recompute_detail=True)
+            self._ensure_visible()
+            self._render_all()
+        except NoMatches:
+            # The polling timer may tick after the default screen unmounts.
+            return
+
+    def _tick_clock(self) -> None:
+        self._spinner = (self._spinner + 1) % 4
+        try:
+            self._render_header()
+        except Exception:
+            # A timer may race with Textual tearing down the default screen.
+            return
+
+    def pane_focused(self, pane: str) -> None:
+        if pane not in {"nodes", "node"}:
+            return
+        self.state.active_pane = pane
+        self._set_titles()
 
     @staticmethod
     def _snapshot_clock(snapshot: ClusterSnapshot) -> str:
@@ -260,6 +315,19 @@ class FalconResourcesApp(App[None]):
         except queue.Empty:
             return
         self._refreshing = False
+        previous_node_name = self.state.selected_node
+        previous_node = self._selected()
+        previous_consumers = previous_node.visible_consumers if previous_node else ()
+        previous_selected_key = (
+            self._consumer_identity(previous_consumers[self.state.selected_consumer])
+            if previous_consumers and 0 <= self.state.selected_consumer < len(previous_consumers)
+            else None
+        )
+        previous_anchor_key = (
+            self._consumer_identity(previous_consumers[self.state.consumer_scroll])
+            if previous_consumers and 0 <= self.state.consumer_scroll < len(previous_consumers)
+            else None
+        )
         self.snapshot = snapshot
         nodes = sorted(snapshot.nodes, key=lambda node: natural_name_key(node.name))
         if self.node_filter:
@@ -269,19 +337,51 @@ class FalconResourcesApp(App[None]):
                 node for node in nodes
                 if self.gpu_filter in (node.gpu_model or "").lower()
             ]
+        previous_names = self._layout_node_names
         self.nodes = nodes
+        current_names = tuple(node.name for node in nodes)
         names = {node.name for node in nodes}
         if self.state.selected_node not in names:
             self.state.selected_node = nodes[0].name if nodes else ""
             self.state.selected_consumer = 0
             self.state.consumer_scroll = 0
-        self._ensure_visible()
-        self._render_all()
+        elif self.state.selected_node == previous_node_name:
+            refreshed_node = self._selected()
+            refreshed_consumers = refreshed_node.visible_consumers if refreshed_node else ()
+            if previous_selected_key is not None:
+                for index, consumer in enumerate(refreshed_consumers):
+                    if self._consumer_identity(consumer) == previous_selected_key:
+                        self.state.selected_consumer = index
+                        break
+            if previous_anchor_key is not None:
+                for index, consumer in enumerate(refreshed_consumers):
+                    if self._consumer_identity(consumer) == previous_anchor_key:
+                        self.state.consumer_scroll = index
+                        break
+        try:
+            self._apply_layout(
+                recompute_detail=current_names != previous_names,
+            )
+            self._ensure_visible()
+            self._render_all()
+        except NoMatches:
+            return
 
     def _selected(self) -> Optional[NodeSnapshot]:
         return next(
             (node for node in self.nodes if node.name == self.state.selected_node),
             None,
+        )
+
+    @staticmethod
+    def _consumer_identity(consumer) -> tuple[str, ...]:
+        """Return a stable workload identity across telemetry refreshes."""
+
+        return (
+            consumer.namespace,
+            consumer.workload_kind,
+            consumer.workload_name,
+            consumer.pod_name,
         )
 
     def _selected_index(self) -> int:
@@ -291,7 +391,21 @@ class FalconResourcesApp(App[None]):
         return 0
 
     def _visible_nodes(self) -> int:
-        return max(1, self.query_one("#nodes-pane").content_size.height - 1)
+        # ``box.SIMPLE_HEAD`` contributes a blank top row, the header, and its
+        # separator before the data rows. The trailing spacer is allowed to
+        # clip so the last node still fits in the fixed inventory height.
+        pane = self.query_one("#nodes-pane")
+        # Use the configured cell height when available. During the first
+        # refresh Textual may not have committed the new region yet, while
+        # the inline numeric height is already authoritative.
+        if pane.styles.height.is_cells:
+            return max(1, int(pane.styles.height.value) - self._NODE_TABLE_OVERHEAD)
+        return max(1, pane.content_size.height - 3)
+
+    def _node_inventory_height(self) -> int:
+        """Return the outer height needed to show every node row."""
+
+        return max(self._NODE_TABLE_OVERHEAD, len(self.nodes) + self._NODE_TABLE_OVERHEAD)
 
     def _visible_consumers(self) -> int:
         pane = self.query_one("#node-pane")
@@ -332,16 +446,17 @@ class FalconResourcesApp(App[None]):
             max(0, len(consumers) - 1),
         )
         visible = self._visible_consumers()
-        if self.state.selected_consumer < self.state.consumer_scroll:
-            self.state.consumer_scroll = self.state.selected_consumer
-        elif self.state.selected_consumer >= self.state.consumer_scroll + visible:
-            self.state.consumer_scroll = self.state.selected_consumer - visible + 1
+        if self.state.expanded:
+            if self.state.selected_consumer < self.state.consumer_scroll:
+                self.state.consumer_scroll = self.state.selected_consumer
+            elif self.state.selected_consumer >= self.state.consumer_scroll + visible:
+                self.state.consumer_scroll = self.state.selected_consumer - visible + 1
         self.state.consumer_scroll = min(
             max(0, len(consumers) - visible),
             max(0, self.state.consumer_scroll),
         )
 
-    def _apply_layout(self) -> None:
+    def _apply_layout(self, *, recompute_detail: bool = False) -> None:
         if not self.is_mounted:
             return
         small = self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT
@@ -362,6 +477,8 @@ class FalconResourcesApp(App[None]):
             return
         resize.display = False
         if self.state.expanded:
+            self._detail_auto_hidden = False
+            self._layout_node_names = tuple(node.name for node in self.nodes)
             for identifier in ("cluster-overview", "resource-controls", "nodes-pane"):
                 self.query_one(f"#{identifier}").display = False
             detail = self.query_one("#node-pane")
@@ -370,87 +487,81 @@ class FalconResourcesApp(App[None]):
             detail.border_title = " NODE INSPECTOR "
             detail.focus()
         else:
-            for identifier in ids:
+            for identifier in ("cluster-overview", "resource-controls", "nodes-pane"):
                 self.query_one(f"#{identifier}").display = True
-            self.query_one("#nodes-pane").styles.height = "1fr"
-            self.query_one("#node-pane").styles.height = 7 if self.size.height < 28 else 9
-            self.query_one("#node-pane").border_title = " SELECTED NODE "
-            self.query_one("#nodes-pane").focus()
+            nodes_pane = self.query_one("#nodes-pane", ResourcesPane)
+            detail = self.query_one("#node-pane", ResourcesPane)
+            detail.border_title = " SELECTED NODE "
+
+            # Give the node inventory a stable height that includes every
+            # row, then let the selected-node pane consume the remainder.
+            # This makes the detail pane shrink continuously and disappear
+            # only when it reaches its minimum useful height.  Recompute only
+            # after a resize or actual inventory change; telemetry redraws
+            # must not toggle the layout.
+            if recompute_detail:
+                available = max(0, self.size.height - self._FIXED_LAYOUT_HEIGHT)
+                required = self._node_inventory_height()
+                self._detail_auto_hidden = (
+                    available - required < self._DETAIL_MIN_HEIGHT
+                )
+                self._layout_node_names = tuple(node.name for node in self.nodes)
+            available = max(0, self.size.height - self._FIXED_LAYOUT_HEIGHT)
+            required = self._node_inventory_height()
+            if self._detail_auto_hidden:
+                nodes_height = available
+                detail.display = False
+            else:
+                nodes_height = required
+                detail.display = True
+            nodes_pane.styles.height = max(1, nodes_height)
+            detail.styles.height = max(
+                self._DETAIL_MIN_HEIGHT,
+                available - nodes_height,
+            )
+            nodes_pane.focus()
 
     def _render_header(self) -> None:
         width = max(30, self.size.width - 2)
-        left = Text("Falcon Resources", style=f"bold {CYAN}")
-        status = "STALE" if self.snapshot.stale else "LIVE"
-        status_color = RED if self.snapshot.stale else GREEN
-        right = Text(
-            f"{self.clock(self.snapshot)}  {status}",
-            style=f"bold {status_color}",
+        clock = self.clock(self.snapshot)
+        glyph = "◴◷◶◵"[self._spinner]
+        status = (
+            f"[bold {RED}]STALE[/]"
+            if self.snapshot.stale
+            else f"[{CYAN}]{glyph}[/]"
         )
-        left.append(" " * max(1, width - len(left.plain) - len(right.plain)))
-        left.append_text(right)
-        self.query_one("#resources-header", Static).update(left)
+        left = f"[bold {CYAN}]Falcon Resources[/]"
+        right = f"[{GRAY}]{clock}[/]  {status}"
+        gap = max(1, width - len("Falcon Resources") - len(clock) - 4)
+        self.query_one("#resources-header", Static).update(
+            left + " " * gap + right
+        )
+
+    def _set_titles(self) -> None:
+        titles = {
+            "nodes": ("nodes-pane", "NODES"),
+            "node": ("node-pane", "SELECTED NODE"),
+        }
+        for pane, (identifier, base) in titles.items():
+            self.query_one(f"#{identifier}", ResourcesPane).border_title = (
+                f" {base}{' · focused' if pane == self.state.active_pane else ''} "
+            )
 
     def _render_overview(self) -> None:
         snapshot = self.snapshot
         headroom = snapshot.request_headroom
-        text = Text()
-        if self.size.width < 100:
-            text.append(
-                f"{snapshot.schedulable_nodes}/{snapshot.total_nodes} NODES  ",
-                style=f"bold {GREEN if snapshot.schedulable_nodes else YELLOW}",
-            )
-            text.append(
-                f"{snapshot.running_jobs} RUN  {snapshot.pending_jobs} PEND  ",
-                style=WHITE,
-            )
-            text.append(
-                f"CPU {headroom.cpu_cores:.1f}/"
-                f"{snapshot.allocatable.cpu_cores:.1f}\n",
-                style=_resource_headroom_color(
-                    headroom.cpu_cores,
-                    snapshot.allocatable.cpu_cores,
-                ),
-            )
-            text.append("GPU ", style=GRAY)
-            if snapshot.gpu_availability:
-                for index, availability in enumerate(
-                    snapshot.gpu_availability.values()
-                ):
-                    if index:
-                        text.append(" ")
-                    text.append(
-                        f"{availability.model} "
-                        f"{availability.request_headroom}/"
-                        f"{availability.allocatable}",
-                        style="bold "
-                        + _gpu_headroom_color(
-                            availability.request_headroom,
-                            availability.allocatable,
-                        ),
-                    )
-            else:
-                text.append("-", style=MUTED)
-            text.append(
-                f"  MEM {_short_memory(headroom.memory_bytes)}/"
-                f"{_short_memory(snapshot.allocatable.memory_bytes)}",
-                style=_resource_headroom_color(
-                    headroom.memory_bytes,
-                    snapshot.allocatable.memory_bytes,
-                ),
-            )
-            self.query_one("#cluster-overview", Static).update(text)
-            return
+        text = Text(no_wrap=True, overflow="ellipsis")
         text.append(
             f"{snapshot.schedulable_nodes}/{snapshot.total_nodes} NODES  ",
             style=f"bold {GREEN if snapshot.schedulable_nodes else YELLOW}",
         )
         text.append(
-            f"{snapshot.running_jobs} RUNNING  {snapshot.pending_jobs} PENDING  ",
+            f"{snapshot.running_jobs} {'RUNNING' if self.size.width >= 100 else 'RUN'}  ",
             style=WHITE,
         )
         text.append(
-            f"CPU {headroom.cpu_cores:.1f}/"
-            f"{snapshot.allocatable.cpu_cores:.1f}  ",
+            f"CPU {_short_cpu(headroom.cpu_cores)}/"
+            f"{_short_cpu(snapshot.allocatable.cpu_cores)}  ",
             style=_resource_headroom_color(
                 headroom.cpu_cores,
                 snapshot.allocatable.cpu_cores,
@@ -464,13 +575,12 @@ class FalconResourcesApp(App[None]):
                 snapshot.allocatable.memory_bytes,
             ),
         )
-        text.append("\n")
+        gpu = Text("GPU  ", style=GRAY)
         if snapshot.gpu_availability:
-            text.append("GPU  ", style=GRAY)
             for index, availability in enumerate(snapshot.gpu_availability.values()):
                 if index:
-                    text.append("   ")
-                text.append(
+                    gpu.append("   ")
+                gpu.append(
                     f"{availability.model} "
                     f"{availability.request_headroom}/{availability.allocatable}",
                     style="bold "
@@ -480,7 +590,17 @@ class FalconResourcesApp(App[None]):
                     ),
                 )
         else:
-            text.append("No GPU allocatable resources reported", style=MUTED)
+            gpu.append("-", style=MUTED)
+        available_width = max(1, self.size.width - 2)
+        if len(text.plain) + len(gpu.plain) + 2 <= available_width:
+            text.append(" " * max(2, available_width - len(text.plain) - len(gpu.plain)))
+            text.append_text(gpu)
+        else:
+            # Keep the overview a single row even when several long GPU model
+            # names cannot fit. Rich's no-wrap ellipsis then clips only the
+            # overflowing tail instead of moving CPU/memory to another row.
+            text.append("  ")
+            text.append_text(gpu)
         self.query_one("#cluster-overview", Static).update(text)
 
     def _render_controls(self) -> None:
@@ -510,7 +630,7 @@ class FalconResourcesApp(App[None]):
             return
         width = self.size.width
         table = Table(
-            box=None,
+            box=box.SIMPLE_HEAD,
             expand=True,
             padding=(0, 1),
             collapse_padding=True,
@@ -713,9 +833,16 @@ class FalconResourcesApp(App[None]):
             content.add_column()
             content.add_row(line)
             content.add_row(self._consumer_table(node, expanded=False))
-            target.border_subtitle = (
-                " Enter inspect " if node.visible_consumers else ""
-            )
+            if node.visible_consumers:
+                visible = self._visible_consumers()
+                start = self.state.consumer_scroll + 1
+                end = min(len(node.visible_consumers), start + visible - 1)
+                target.border_subtitle = (
+                    f" consumers {start}-{end}/{len(node.visible_consumers)} · "
+                    "Enter inspect "
+                )
+            else:
+                target.border_subtitle = ""
             target.update(content)
             return
         sched, sched_color = _schedulable(node)
@@ -890,6 +1017,7 @@ class FalconResourcesApp(App[None]):
     def _render_all(self) -> None:
         if not self.is_mounted:
             return
+        self._set_titles()
         self._render_header()
         self._render_overview()
         self._render_controls()
@@ -900,7 +1028,13 @@ class FalconResourcesApp(App[None]):
     def node_clicked(self, offset) -> None:
         if self.state.expanded or not self.nodes or offset is None or offset.y <= 0:
             return
-        index = self.state.node_scroll + offset.y - 1
+        # Rich's SIMPLE_HEAD box renders a blank top line, header, and header
+        # separator before the first data row.  Ignore those non-row lines;
+        # ``offset`` is relative to the pane content (not its border).
+        row = offset.y - 3
+        if row < 0:
+            return
+        index = self.state.node_scroll + row
         if index < len(self.nodes):
             self.state.selected_node = self.nodes[index].name
             self.state.selected_consumer = 0
@@ -932,6 +1066,23 @@ class FalconResourcesApp(App[None]):
 
     def action_down(self) -> None:
         self._move(1)
+
+    def scroll_consumers(self, amount: int) -> None:
+        """Scroll the workload list under the mouse without changing nodes."""
+
+        node = self._selected()
+        if node is None or not node.visible_consumers:
+            return
+        if self.state.expanded:
+            self._move(amount)
+            return
+        visible = self._visible_consumers()
+        maximum = max(0, len(node.visible_consumers) - visible)
+        self.state.consumer_scroll = max(
+            0,
+            min(maximum, self.state.consumer_scroll + amount),
+        )
+        self._render_node()
 
     def action_page_up(self) -> None:
         self._move(
@@ -966,14 +1117,14 @@ class FalconResourcesApp(App[None]):
         if self._selected() is None:
             return
         self.state.expanded = True
-        self._apply_layout()
+        self._apply_layout(recompute_detail=True)
         self.call_after_refresh(self._render_all)
 
     def action_collapse(self) -> None:
         if not self.state.expanded:
             return
         self.state.expanded = False
-        self._apply_layout()
+        self._apply_layout(recompute_detail=True)
         self.call_after_refresh(self._render_all)
 
     def action_refresh_data(self) -> None:

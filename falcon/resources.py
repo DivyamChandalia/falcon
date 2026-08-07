@@ -37,9 +37,34 @@ _METRIC = re.compile(
     r"(?:\s+\d+)?$"
 )
 
+_RESOURCE_METRIC_NAMES = frozenset(
+    {
+        "kube_node_status_allocatable",
+        "kube_node_status_capacity",
+        "kube_node_status_condition",
+        "kube_node_spec_unschedulable",
+        "kube_node_spec_taint",
+        "kube_node_labels",
+        "kube_pod_status_phase",
+        "kube_pod_container_resource_requests",
+        "kube_pod_info",
+        "kube_pod_owner",
+        "kube_replicaset_owner",
+        "kube_job_owner",
+        "kube_pod_created",
+        "kube_job_info",
+        "kube_job_status_active",
+        "kube_job_status_succeeded",
+        "kube_job_status_failed",
+        "kube_job_created",
+    }
+)
+
 
 def parse_prometheus_metrics(
     text: str,
+    *,
+    metric_names: Optional[set[str]] = None,
 ) -> Dict[str, List[Tuple[Dict[str, str], float]]]:
     """Parse the kube-state-metrics subset of Prometheus exposition text.
 
@@ -53,6 +78,8 @@ def parse_prometheus_metrics(
             continue
         match = _METRIC.match(line)
         if not match:
+            continue
+        if metric_names is not None and match.group("name") not in metric_names:
             continue
         try:
             value = float(match.group("value"))
@@ -103,7 +130,13 @@ def _parse_labels(source: str) -> Dict[str, str]:
 
 
 def nodes_from_metrics(text: str) -> List[NodeResources]:
-    metrics = parse_prometheus_metrics(text)
+    metrics = parse_prometheus_metrics(text, metric_names=_RESOURCE_METRIC_NAMES)
+    return _nodes_from_metric_map(metrics)
+
+
+def _nodes_from_metric_map(
+    metrics: Dict[str, List[Tuple[Dict[str, str], float]]],
+) -> List[NodeResources]:
     scheduling_metrics = bool(
         metrics.get("kube_node_spec_unschedulable")
         or metrics.get("kube_node_spec_taint")
@@ -238,9 +271,9 @@ def cluster_snapshot_from_metrics(
     node inspector.  It never guesses a person from a namespace or Pod name.
     """
 
-    metrics = parse_prometheus_metrics(text)
+    metrics = parse_prometheus_metrics(text, metric_names=_RESOURCE_METRIC_NAMES)
     resource_nodes = {
-        node.name: node for node in nodes_from_metrics(text)
+        node.name: node for node in _nodes_from_metric_map(metrics)
     }
     capacities: DefaultDict[str, Dict[str, float]] = defaultdict(
         lambda: {"cpu": 0.0, "memory": 0.0, "gpu": 0.0}

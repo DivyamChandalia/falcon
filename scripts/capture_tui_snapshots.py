@@ -107,6 +107,8 @@ async def resources_capture(
         await pilot.pause(0.5)
         for action in actions:
             await pilot.press(*str(action).split())
+        app._spinner = 0
+        app._render_header()
         value = app.export_screenshot(
             title=f"Falcon resources · {name}", simplify=True
         )
@@ -152,7 +154,7 @@ async def capture() -> None:
         ("dashboard-expanded-selected", "mixed", (120, 30), ("4", "enter")),
         ("dashboard-expanded-resources", "mixed", (140, 32), ("2", "enter")),
         ("dashboard-expanded-events", "mixed", (120, 30), ("3", "enter")),
-        ("dashboard-events-middle", "mixed", (80, 22), ("3", "home", "pagedown")),
+        ("dashboard-events-middle", "mixed", (80, 30), ("3", "home", "pagedown")),
         ("dashboard-search", "mixed", (100, 24), (search_long,)),
         ("dashboard-filters", "mixed", (100, 24), (active_filter,)),
         ("dashboard-filter-dialog", "mixed", (100, 24), (filter_dialog,)),
@@ -182,6 +184,17 @@ async def capture() -> None:
         )
         results[key] = value
 
+    # Keep the two README visuals on the same deterministic 140×32 canvas so
+    # their typography, gutters, and section borders can be compared directly.
+    dashboard_asset, dashboard_digest = await dashboard_capture(
+        "dashboard-asset", state="mixed", size=(140, 32)
+    )
+    resources_asset, resources_digest = await resources_capture(
+        "resources-asset", state="mixed", size=(140, 32)
+    )
+    results[dashboard_asset] = dashboard_digest
+    results[resources_asset] = resources_digest
+
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     manifest = {
         "format": 1,
@@ -196,7 +209,11 @@ async def capture() -> None:
 
     ASSETS.mkdir(parents=True, exist_ok=True)
     (ASSETS / "falcon-dashboard.svg").write_text(
-        (ARTIFACTS / "dashboard-default.svg").read_text(encoding="utf-8"),
+        (ARTIFACTS / "dashboard-asset.svg").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (ASSETS / "falcon-resources.svg").write_text(
+        (ARTIFACTS / "resources-asset.svg").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     print(

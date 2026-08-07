@@ -171,18 +171,6 @@ typeset -ga _falcon_top_level_options=({top_level_options})
 typeset -ga _falcon_presets=({presets})
 typeset -ga _falcon_counted_presets=({counted_presets})
 typeset -ga _falcon_launch_options=({launch_options})
-typeset -ga _falcon_job_cache=()
-typeset -gi _falcon_job_cache_time=-2
-zmodload zsh/datetime 2>/dev/null
-_falcon_refresh_jobs() {{
-  local now=${{EPOCHSECONDS:-$SECONDS}}
-  if (( now - _falcon_job_cache_time >= 2 )); then
-    local -a raw
-    raw=("${{(@f)$(command kubectl get jobs.batch -n {namespace} -o name 2>/dev/null)}}")
-    _falcon_job_cache=("${{raw[@]#job.batch/}}")
-    _falcon_job_cache_time=$now
-  fi
-}}
 _falcon_native() {{
   local subject="${{words[2]}}"
   local current="${{words[CURRENT]}}"
@@ -213,8 +201,8 @@ _falcon_native() {{
       fi
     done
   elif (( CURRENT == 3 )) && [[ "$subject" == get || "$subject" == logs || "$subject" == events || "$subject" == kill || "$subject" == attach || "$subject" == top || "$subject" == metrics ]]; then
-    _falcon_refresh_jobs
-    values=("${{_falcon_job_cache[@]}}")
+    values=("${{(@f)$(command kubectl get jobs.batch -n {namespace} -o name 2>/dev/null)}}")
+    values=("${{values[@]#job.batch/}}")
   elif [[ "$subject" == -c || "$subject" == --cpu || "$subject" == -m || "$subject" == --memory || "$subject" == --gpu || "$subject" == --gpus || "$subject" == -n ]]; then
     values=("${{_falcon_launch_options[@]}}")
   else
@@ -239,18 +227,6 @@ _falcon_commands=({commands})
 _falcon_top_level_options=({top_level_options})
 _falcon_counted_presets=({counted_presets})
 _falcon_launch_options=({launch_options})
-_falcon_job_cache=()
-_falcon_job_cache_time=-2
-_falcon_refresh_jobs() {{
-  local now=$SECONDS value
-  if (( now - _falcon_job_cache_time >= 2 )); then
-    _falcon_job_cache=()
-    while IFS= read -r value; do
-      [[ -n "$value" ]] && _falcon_job_cache+=("${{value#job.batch/}}")
-    done < <(command kubectl get jobs.batch -n {namespace} -o name 2>/dev/null)
-    _falcon_job_cache_time=$now
-  fi
-}}
 _falcon_native() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}" subject="${{COMP_WORDS[1]}}"
   local -a values=()
@@ -274,8 +250,11 @@ _falcon_native() {{
       done
     fi
   elif [[ $COMP_CWORD -eq 2 ]] && [[ "$subject" =~ ^(get|logs|events|kill|attach|top|metrics)$ ]]; then
-    _falcon_refresh_jobs
-    values=("${{_falcon_job_cache[@]}}")
+    values=()
+    local value
+    while IFS= read -r value; do
+      [[ -n "$value" ]] && values+=("${{value#job.batch/}}")
+    done < <(command kubectl get jobs.batch -n {namespace} -o name 2>/dev/null)
   elif [[ "$subject" =~ ^(-c|--cpu|-m|--memory|--gpu|--gpus|-n)$ ]]; then
     values=("${{_falcon_launch_options[@]}}")
   elif [[ "$subject" =~ ^({bash_preset_pattern})(x[1-9][0-9]*)?$ ]]; then

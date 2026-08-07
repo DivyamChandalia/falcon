@@ -8,6 +8,7 @@ from falcon.models import NodeResources
 from falcon.resources import (
     MetricsClusterCollector,
     cluster_snapshot_from_metrics,
+    parse_prometheus_metrics,
 )
 
 GIB = 1024**3
@@ -73,6 +74,12 @@ kube_job_created{{namespace="team-a",job_name="train"}} 1699999900
 
 
 class MetricsResourceTests(unittest.TestCase):
+    def test_cluster_snapshot_parses_metrics_once(self) -> None:
+        with patch("falcon.resources.parse_prometheus_metrics", wraps=parse_prometheus_metrics) as parser:
+            snapshot = cluster_snapshot_from_metrics(METRICS)
+        self.assertTrue(snapshot.nodes)
+        parser.assert_called_once()
+
     def test_old_resource_semantics_are_available_without_node_rbac(self) -> None:
         snapshot = cluster_snapshot_from_metrics(METRICS, collected_at=12.0)
         nodes = {node.name: node for node in snapshot.nodes}

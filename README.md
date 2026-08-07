@@ -59,8 +59,8 @@ Open a new shell after setup, or load completion immediately:
 eval "$(falcon completion zsh)"   # use bash for Bash
 ```
 
-Completion is cached briefly, so completing Job names does not query
-Kubernetes on every keypress.
+Job-name completion queries Kubernetes directly so newly created Jobs appear
+without waiting for a local cache to expire.
 
 ## Run a Job
 
@@ -74,6 +74,8 @@ falcon -c 8 -m 32Gi -- python preprocess.py
 
 Falcon turns the command after `--` into a Kubernetes Job, applies resource
 requests, mounts the selected environment, creates it directly, and returns.
+Before creation, Falcon prints the resolved namespace, image, command, and
+resource request so the exact launch is visible immediately.
 Add `-f`/`--follow` to stay attached to its logs; Ctrl+C then kills that Job.
 Add `--dry-run` to inspect the manifest without creating the Job:
 

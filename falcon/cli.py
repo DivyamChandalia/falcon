@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 import time
 from dataclasses import replace
@@ -455,6 +456,47 @@ def _planning_nodes(
     ]
 
 
+def _print_submission_summary(
+    request: JobRequest,
+    plan,
+    specification,
+    *,
+    stream,
+) -> None:
+    """Show the resolved request immediately before the Kubernetes create."""
+
+    container = (
+        specification.manifest.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [{}])[0]
+    )
+    resources = container.get("resources", {}).get("requests", {})
+    gpu = next(
+        (
+            f"{key}={value}"
+            for key, value in resources.items()
+            if key.endswith("/gpu")
+        ),
+        "gpu=-",
+    )
+    command = shlex.join(request.command) if request.command else "<interactive shell>"
+    image = container.get("image") or request.image or "-"
+    extras = []
+    if plan.compute.shared_memory:
+        extras.append(f"shm={plan.compute.shared_memory}")
+    if request.environment is not None:
+        extras.append(f"environment={request.environment.path}")
+    suffix = f" · {' · '.join(extras)}" if extras else ""
+    print(
+        f"Submitting Job request · {request.name} · namespace={request.namespace} · "
+        f"image={image} · {gpu} · cpu={resources.get('cpu', plan.compute.cpu)} · "
+        f"memory={resources.get('memory', plan.compute.memory)}{suffix} · "
+        f"command={command}",
+        file=stream,
+    )
+
+
 def _submit_command(
     args: argparse.Namespace,
     config: Mapping[str, Any],
@@ -538,6 +580,12 @@ def _submit_command(
         else:
             print(yaml.safe_dump(specification.manifest, sort_keys=False), end="")
         return 0
+    _print_submission_summary(
+        request,
+        plan,
+        specification,
+        stream=sys.stderr if args.output == "json" else sys.stdout,
+    )
     client = KubernetesClient(namespace)
     result = submit(specification, client)
     remember_job(result.name)

@@ -24,6 +24,11 @@ Launches are detached by default. `-f`/`--follow` stays attached to the new
 Job's logs; pressing Ctrl+C in that mode kills the Job Falcon just created.
 `--follow` cannot be combined with JSON launch output.
 
+Before a Job is created, human launches print a compact resolved request
+summary (namespace, image, command, and CPU/RAM/GPU/shared-memory values).
+With `--output json`, the same summary is sent to stderr so stdout remains
+valid JSON.
+
 When `COMMAND` is omitted, Falcon creates a bounded debug Job, waits for its
 Pod, opens the invoking shell (`zsh` or `bash`) in the launch directory, and
 prefixes its prompt with the preset, such as `(2080ti)` or `(2080tix2)`.

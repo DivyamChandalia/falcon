@@ -24,6 +24,7 @@ from falcon.resources_ui import (
     ResourcesPane,
     _gpu_headroom_color,
     _resource_headroom_color,
+    _short_cpu,
 )
 from falcon.theme import GREEN, MUTED, RED, YELLOW
 
@@ -60,9 +61,20 @@ def _golden_manifest():
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_events_keyboard_scroll_and_follow_lifecycle(self) -> None:
+    async def test_short_terminal_temporarily_hides_events(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            self.assertIn("events", app._responsive_hidden_panes)
+            self.assertNotIn("events", app._visible_panes())
+            await pilot.resize_terminal(80, 30)
+            await pilot.pause()
+            self.assertNotIn("events", app._responsive_hidden_panes)
+            self.assertIn("events", app._visible_panes())
+
+    async def test_events_keyboard_scroll_and_follow_lifecycle(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("3")
             self.assertEqual(app.state.focused_pane, "events")
@@ -83,7 +95,7 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_events_do_not_yank_a_manually_scrolled_view(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
-        async with app.run_test(size=(80, 22)) as pilot:
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("3", "home", "pagedown")
             before = app.state.events_scroll_offset
@@ -100,9 +112,51 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("end")
             self.assertTrue(app.state.events_auto_follow)
 
+    async def test_mouse_click_selects_the_job_row_under_the_pointer(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(0.5)
+            expected = app.filtered_rows[1].uid
+            clicked = await pilot.click("#jobs-pane", offset=(5, 5))
+            self.assertTrue(clicked)
+            self.assertEqual(app.state.cursor_job_uid, expected)
+
+    async def test_clicking_any_dashboard_pane_marks_it_active(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            for pane in ("selected", "resources", "events", "jobs"):
+                clicked = await pilot.click(f"#{pane}-pane", offset=(2, 2))
+                self.assertTrue(clicked)
+                self.assertEqual(app.state.focused_pane, pane)
+                self.assertIn("focused", app.query_one(f"#{pane}-pane").border_title)
+
+    async def test_refresh_preserves_the_selected_pane(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("4", "enter")
+            selected_uid = app.state.cursor_job_uid
+            self.assertEqual(app.state.focused_pane, "selected")
+            self.assertEqual(app.state.expanded_pane, "selected")
+            app._result_queue.put_nowait(
+                (
+                    app.rows,
+                    app.job_events,
+                    selected_uid,
+                    None,
+                    app.state.last_successful_refresh,
+                    app.state.gpu_availability,
+                )
+            )
+            app._drain_results()
+            self.assertEqual(app.state.cursor_job_uid, selected_uid)
+            self.assertEqual(app.state.focused_pane, "selected")
+            self.assertEqual(app.state.expanded_pane, "selected")
+
     async def test_expanded_events_reach_oldest_and_newest(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
-        async with app.run_test(size=(80, 22)) as pilot:
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("3", "enter", "home")
             self.assertEqual(app.state.expanded_pane, "events")
@@ -133,7 +187,7 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_event_search_clamps_scroll_and_remains_reachable(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
-        async with app.run_test(size=(80, 22)) as pilot:
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("3", "home")
             app.event_search = "BackOff"
@@ -157,7 +211,7 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             def stop(self):
                 pass
 
-        async with app.run_test(size=(80, 22)) as pilot:
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("3", "home")
             pane = app.query_one("#events-pane", DashboardPane)
@@ -278,12 +332,18 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def test_cpu_values_use_decimal_cores(self) -> None:
+        self.assertEqual(_short_cpu(0.095), "0.095")
+        self.assertEqual(_short_cpu(0.5), "0.5")
+        self.assertEqual(_short_cpu(96), "96")
+
     def test_gpu_headroom_colors_show_last_gpu_and_exhaustion(self) -> None:
         self.assertEqual(_gpu_headroom_color(15, 20), GREEN)
         self.assertEqual(_gpu_headroom_color(2, 4), GREEN)
         self.assertEqual(_gpu_headroom_color(1, 4), YELLOW)
         self.assertEqual(_gpu_headroom_color(0, 4), RED)
         self.assertEqual(_gpu_headroom_color(1, 2), YELLOW)
+        self.assertEqual(_gpu_headroom_color(1, 8), RED)
         self.assertEqual(_gpu_headroom_color(0, 2), RED)
         self.assertEqual(_gpu_headroom_color(4, 4), GREEN)
         self.assertEqual(_gpu_headroom_color(0, 0), MUTED)
@@ -296,6 +356,22 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_resource_headroom_color(20, 100), RED)
         self.assertEqual(_resource_headroom_color(0, 100), RED)
         self.assertEqual(_resource_headroom_color(1, 0), MUTED)
+
+    async def test_resource_header_and_overview_use_dashboard_style(self) -> None:
+        app = FalconResourcesApp(
+            DemoCollector("mixed"),
+            refresh_seconds=999,
+            clock=lambda snapshot: "12:00:00",
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            header = app.query_one("#resources-header").render()
+            overview = app.query_one("#cluster-overview").render()
+            self.assertIn("Falcon Resources", header.plain)
+            self.assertIn("12:00:00  ◴", header.plain)
+            self.assertNotIn("\n", overview.plain)
+            self.assertLess(overview.plain.index("CPU"), overview.plain.index("MEM"))
+            self.assertLess(overview.plain.index("MEM"), overview.plain.index("GPU"))
 
     async def test_node_expansion_reconciles_consumers_at_narrow_size(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -354,11 +430,209 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("home")
             self.assertEqual(app.state.selected_node, app.nodes[0].name)
 
+    async def test_resource_bottom_panel_hides_when_nodes_would_overflow(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        nodes = tuple(
+            replace(snapshot.nodes[0], name=f"node-a-h100-{index:02d}")
+            for index in range(30)
+        )
+
+        class Collector:
+            def collect(self, force=False):
+                return replace(snapshot, nodes=nodes)
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            self.assertTrue(app._detail_auto_hidden)
+            self.assertFalse(app.query_one("#node-pane").display)
+            for _ in range(4):
+                app._results.put_nowait(replace(snapshot, nodes=nodes))
+                app._drain_results()
+                await pilot.press("down")
+                self.assertTrue(app._detail_auto_hidden)
+                self.assertFalse(app.query_one("#node-pane").display)
+            await pilot.resize_terminal(200, 50)
+            await pilot.pause()
+            self.assertFalse(app._detail_auto_hidden)
+            self.assertTrue(app.query_one("#node-pane").display)
+
+    async def test_resource_boundary_resize_never_hides_one_node_under_detail(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        node = snapshot.nodes[0]
+        nodes = tuple(replace(node, name=f"node-{index:02d}") for index in range(10))
+        snapshot = replace(snapshot, nodes=nodes)
+
+        class Collector:
+            def collect(self, force=False):
+                return snapshot
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(140, 27)) as pilot:
+            await pilot.pause(0.5)
+            self.assertFalse(app._detail_auto_hidden)
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 15)
+            self.assertEqual(app.query_one("#node-pane").region.height, 7)
+            await pilot.resize_terminal(140, 24)
+            await pilot.pause()
+            self.assertTrue(app._detail_auto_hidden)
+            self.assertFalse(app.query_one("#node-pane").display)
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 19)
+
+    async def test_resource_node_pane_stays_fixed_while_detail_pane_grows(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            self.assertEqual(
+                app.query_one("#nodes-pane").region.height,
+                len(app.nodes) + app._NODE_TABLE_OVERHEAD,
+            )
+            self.assertEqual(
+                app.query_one("#node-pane").region.height,
+                32 - app._FIXED_LAYOUT_HEIGHT - app.query_one("#nodes-pane").region.height,
+            )
+            await pilot.resize_terminal(140, 24)
+            await pilot.pause()
+            self.assertEqual(
+                app.query_one("#nodes-pane").region.height,
+                len(app.nodes) + app._NODE_TABLE_OVERHEAD,
+            )
+            self.assertTrue(app.query_one("#node-pane").display)
+
+    async def test_resource_bottom_panel_wheel_scrolls_consumers(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        node = snapshot.nodes[0]
+        base = node.visible_consumers[0]
+        consumers = tuple(
+            replace(base, pod_name=f"consumer-{index:02d}", workload_name=f"workload-{index:02d}")
+            for index in range(24)
+        )
+        snapshot = replace(snapshot, nodes=(replace(node, consumers=consumers), *snapshot.nodes[1:]))
+
+        class Collector:
+            def collect(self, force=False):
+                return snapshot
+
+            def close(self):
+                pass
+
+        class Wheel:
+            def prevent_default(self):
+                pass
+
+            def stop(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            selected = app.state.selected_node
+            pane = app.query_one("#node-pane", ResourcesPane)
+            pane.on_mouse_scroll_down(Wheel())
+            self.assertEqual(app.state.selected_node, selected)
+            self.assertEqual(app.state.consumer_scroll, 1)
+
+    async def test_resource_refresh_preserves_bottom_panel_scroll(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        node = snapshot.nodes[0]
+        base = node.visible_consumers[0]
+        consumers = tuple(
+            replace(
+                base,
+                pod_name=f"consumer-{index:02d}",
+                workload_name=f"workload-{index:02d}",
+            )
+            for index in range(20)
+        )
+        snapshot = replace(
+            snapshot,
+            nodes=(replace(node, consumers=consumers), *snapshot.nodes[1:]),
+        )
+
+        class Collector:
+            def collect(self, force=False):
+                return snapshot
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            for _ in range(4):
+                app.scroll_consumers(1)
+            self.assertEqual(app.state.consumer_scroll, 4)
+            app._results.put_nowait(snapshot)
+            app._drain_results()
+            await pilot.pause()
+            self.assertEqual(app.state.consumer_scroll, 4)
+
+    async def test_resource_refresh_preserves_consumer_anchor_when_order_changes(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        node = snapshot.nodes[0]
+        base = node.visible_consumers[0]
+        consumers = tuple(
+            replace(
+                base,
+                pod_name=f"consumer-{index:02d}",
+                workload_name=f"workload-{index:02d}",
+            )
+            for index in range(20)
+        )
+        initial = replace(
+            snapshot,
+            nodes=(replace(node, consumers=consumers), *snapshot.nodes[1:]),
+        )
+        reordered_consumers = consumers[:4] + (consumers[5], consumers[4]) + consumers[6:]
+        reordered = replace(
+            initial,
+            nodes=(replace(initial.nodes[0], consumers=reordered_consumers), *initial.nodes[1:]),
+        )
+
+        class Collector:
+            def collect(self, force=False):
+                return initial
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            for _ in range(4):
+                app.scroll_consumers(1)
+            anchor = app._selected().visible_consumers[app.state.consumer_scroll].pod_name
+            app._results.put_nowait(reordered)
+            app._drain_results()
+            self.assertEqual(
+                app._selected().visible_consumers[app.state.consumer_scroll].pod_name,
+                anchor,
+            )
+
+    async def test_resource_refresh_preserves_selected_node(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            app.state.selected_node = app.nodes[-1].name
+            app._render_all()
+            selected = app.state.selected_node
+            app._results.put_nowait(app.snapshot)
+            app._drain_results()
+            self.assertEqual(app.state.selected_node, selected)
+
     async def test_mouse_selection_and_enter_preserve_the_selected_node(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
-            clicked = await pilot.click("#nodes-pane", offset=(5, 3))
+            # The first data row follows SIMPLE_HEAD's blank top line,
+            # header, and separator.  Click the second visible row.
+            clicked = await pilot.click("#nodes-pane", offset=(5, 5))
             self.assertTrue(clicked)
             selected = app.state.selected_node
             self.assertEqual(selected, "node-b-a6000")
@@ -366,6 +640,23 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(app.state.expanded)
             self.assertEqual(app.state.selected_node, selected)
+
+    async def test_resource_bottom_pane_is_active_until_refresh_returns_focus_to_nodes(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            clicked = await pilot.click("#node-pane", offset=(2, 2))
+            self.assertTrue(clicked)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIn("focused", app.query_one("#node-pane").border_title)
+            self.assertNotIn("focused", app.query_one("#nodes-pane").border_title)
+
+            app._results.put_nowait(app.snapshot)
+            app._drain_results()
+            await pilot.pause()
+            self.assertEqual(app.state.active_pane, "nodes")
+            self.assertIn("focused", app.query_one("#nodes-pane").border_title)
+            self.assertNotIn("focused", app.query_one("#node-pane").border_title)
 
     async def test_expanded_consumers_stay_inside_the_visible_pane(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
@@ -489,7 +780,7 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             (
                 "dashboard-events-middle",
                 "mixed",
-                (80, 22),
+                (80, 30),
                 ("3", "home", "pagedown"),
             ),
             ("dashboard-search", "mixed", (100, 24), (search_long,)),
@@ -551,6 +842,8 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.5)
                 for action in actions:
                     await pilot.press(*action.split())
+                app._spinner = 0
+                app._render_header()
                 svg = app.export_screenshot(
                     title=f"Falcon resources · {name}", simplify=True
                 )
@@ -559,7 +852,7 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_content_never_leaks_markup_or_tracebacks(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
-        async with app.run_test(size=(80, 22)) as pilot:
+        async with app.run_test(size=(80, 30)) as pilot:
             await pilot.pause(0.5)
             app.state.search_query = "extraordinarily"
             app._filter_rows()

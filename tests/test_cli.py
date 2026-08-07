@@ -150,6 +150,13 @@ class ParserTests(CliHarness):
         self.assertIn("2080tix*", zsh_completion)
         self.assertIn('compstate[list]="${compstate[list]} rows"', zsh_completion)
 
+    def test_job_completion_queries_without_a_local_cache(self) -> None:
+        for shell in ("bash", "zsh"):
+            script = shell_script(shell, config=DEFAULT_CONFIG)
+            self.assertNotIn("_falcon_job_cache", script)
+            self.assertNotIn("_falcon_refresh_jobs", script)
+            self.assertIn("kubectl get jobs.batch", script)
+
     def test_legacy_shell_init_keeps_completion_registered_after_upgrade(self) -> None:
         for shell in ("bash", "zsh"):
             executable = shutil.which(shell)
@@ -207,6 +214,55 @@ class ParserTests(CliHarness):
 
 
 class SubmissionCliTests(CliHarness):
+    def test_submission_prints_resolved_request_before_create(self) -> None:
+        from falcon.models import NodeResources, SubmittedJob
+
+        node = NodeResources("gpu-a", 64, 0, 480, 0, 4, 0, "H100")
+        client = unittest.mock.Mock()
+        submitted = SubmittedJob("request-summary", "default", created=True)
+        with patch("falcon.cli._planning_nodes", return_value=[node]), patch(
+            "falcon.cli.KubernetesClient", return_value=client
+        ), patch("falcon.cli.submit", return_value=submitted), patch(
+            "falcon.cli.remember_job"
+        ):
+            code, stdout, stderr = self.invoke(
+                "h100",
+                "--namespace", "default",
+                "--environment", "none",
+                "--name", "request-summary",
+                "--",
+                "python", "train.py",
+            )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("Submitting Job request · request-summary", stdout)
+        self.assertIn("namespace=default", stdout)
+        self.assertIn("nvidia.com/gpu=1", stdout)
+        self.assertIn("cpu=16", stdout)
+        self.assertIn("command=python train.py", stdout)
+
+    def test_json_submission_keeps_stdout_structured_and_logs_summary_to_stderr(self) -> None:
+        from falcon.models import NodeResources, SubmittedJob
+
+        node = NodeResources("gpu-a", 64, 0, 480, 0, 4, 0, "H100")
+        client = unittest.mock.Mock()
+        submitted = SubmittedJob("json-summary", "default", created=True)
+        with patch("falcon.cli._planning_nodes", return_value=[node]), patch(
+            "falcon.cli.KubernetesClient", return_value=client
+        ), patch("falcon.cli.submit", return_value=submitted), patch(
+            "falcon.cli.remember_job"
+        ):
+            code, stdout, stderr = self.invoke(
+                "h100",
+                "--output", "json",
+                "--environment", "none",
+                "--name", "json-summary",
+                "--",
+                "python", "train.py",
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["kind"], "SubmittedJob")
+        self.assertIn("Submitting Job request · json-summary", stderr)
+
     def test_cpu_dry_run_yaml(self) -> None:
         code, stdout, stderr = self.invoke(
             "--cpu", "2", "--memory", "4Gi",

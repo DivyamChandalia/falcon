@@ -23,6 +23,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
@@ -37,6 +38,7 @@ from .dashboard import (
     _timestamp,
 )
 from .theme import (
+    BACKGROUND,
     BORDER,
     CYAN,
     CYAN_2,
@@ -548,17 +550,17 @@ class PaneVisibilityDialog(ModalScreen[Optional[Set[str]]]):
 
 
 CSS = f"""
-Screen {{ background: #000000; color: {WHITE}; overflow: hidden; }}
-Static, Input, Container {{ background: #000000; }}
+Screen {{ background: {BACKGROUND}; color: {WHITE}; overflow: hidden; }}
+Static, Input, Container {{ background: {BACKGROUND}; }}
 #falcon-header {{ height: 1; color: {WHITE}; padding: 0 1; }}
-#summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; }}
+#summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; padding: 0 1; }}
 #controls {{ height: 1; color: {GRAY}; padding: 0 1; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
-DashboardPane {{ border: solid {BORDER}; background: #000000; color: {WHITE}; padding: 0 1; }}
+DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
 #jobs-pane {{ height: 1fr; min-height: 7; }}
 #selected-pane {{ height: 3; min-height: 3; }}
-#resources-pane {{ height: 6; min-height: 4; }}
+#resources-pane {{ height: 6; min-height: 6; }}
 #events-pane {{ height: 7; min-height: 3; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #falcon-footer {{ height: 1; color: {GRAY}; padding: 0 1; }}
@@ -627,6 +629,7 @@ class FalconDashboard(App):
         self._spinner = 0
         self._result_queue = __import__("queue").Queue(maxsize=1)
         self._last_terminal_size: Tuple[int, int] = (-1, -1)
+        self._responsive_hidden_panes: Set[str] = set()
 
     @property
     def selected(self) -> int:
@@ -702,13 +705,24 @@ class FalconDashboard(App):
         self._set_titles()
 
     def pane_clicked(self, pane_id: str, event: events.Click) -> None:
-        if pane_id == "jobs-pane" and self.filtered_rows:
-            index = self.state.jobs_scroll_offset + max(0, event.y - 2)
-            if index < len(self.filtered_rows):
-                self.selected = index
-                if getattr(event, "ctrl", False):
-                    self.action_toggle_mark()
-                self._selection_changed()
+        if pane_id != "jobs-pane" or not self.filtered_rows or self.state.expanded_pane:
+            return
+        pane = self.query_one("#jobs-pane", DashboardPane)
+        offset = event.get_content_offset(pane)
+        if offset is None:
+            return
+        # Rich's SIMPLE_HEAD box renders a blank top line, header, and header
+        # separator before the first Job row.  Mouse coordinates are relative
+        # to the pane content, so ignore those non-row lines.
+        row = offset.y - 3
+        if row < 0:
+            return
+        index = self.state.jobs_scroll_offset + row
+        if index < len(self.filtered_rows):
+            self.selected = index
+            if getattr(event, "ctrl", False):
+                self.action_toggle_mark()
+            self._selection_changed()
 
     def scroll_focused(self, amount: int, pane_id: Optional[str] = None) -> None:
         pane = (pane_id or self.state.focused_pane).replace("-pane", "")
@@ -863,7 +877,12 @@ class FalconDashboard(App):
             self._stale = True
             if error:
                 self.notify(f"API error: {error} · retrying…", severity="error")
-        self._render_all()
+        try:
+            self._render_all()
+        except NoMatches:
+            # The collector thread may deliver its final result while the
+            # Textual screen is being torn down.
+            return
 
     def _set_titles(self) -> None:
         for pane in ("jobs", "selected", "resources", "events"):
@@ -946,11 +965,16 @@ class FalconDashboard(App):
         self.query_one("#controls", Static).update(text + " " * gap + f"[{GRAY}]{count}[/]")
 
     def _visible_job_count(self) -> int:
-        widget = self.query_one("#jobs-pane", DashboardPane)
-        # DashboardPane.size is already its usable content area. The border is
-        # outside it, so the Jobs table consumes only one content line for its
-        # header and every remaining line can hold a Job.
-        return max(1, widget.content_size.height - 1)
+        try:
+            widget = self.query_one("#jobs-pane", DashboardPane)
+        except NoMatches:
+            # A refresh worker can finish while Textual is tearing down the
+            # test/app screen. Keep filtering state updates safe during that
+            # short lifecycle window.
+            return 4
+        # SIMPLE_HEAD contributes a blank top line, header, and separator.
+        # Its trailing spacer may be clipped, so retain every Job data row.
+        return max(1, widget.content_size.height - 3)
 
     def _ensure_cursor_visible(self) -> None:
         count = self._visible_job_count() if self.is_mounted else 4
@@ -979,7 +1003,13 @@ class FalconDashboard(App):
             return
         width = self.size.width
         expanded = self.state.expanded_pane == "jobs"
-        table = Table(box=None, expand=True, padding=(0, 1), show_header=True, header_style=f"bold {CYAN_2}")
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            padding=(0, 1),
+            show_header=True,
+            header_style=f"bold {CYAN_2}",
+        )
         table.add_column("MARK", width=5, no_wrap=True)
         table.add_column("NAME", ratio=3, no_wrap=True, overflow="ellipsis")
         table.add_column("STATUS", width=16, no_wrap=True)
@@ -1553,10 +1583,32 @@ class FalconDashboard(App):
             )
             return
         resize.display = False
+        # Keep the resource-usage pane at a readable fixed height. At the
+        # smallest supported heights, Events is the least disruptive pane to
+        # hide temporarily; persisted pane preferences remain unchanged.
+        self._responsive_hidden_panes = (
+            {"events"}
+            if self.size.height < 28 and "events" not in self.state.hidden_panes
+            else set()
+        )
         visible_panes = self._visible_panes()
+        if (
+            self.state.expanded_pane
+            and self.state.expanded_pane in self._responsive_hidden_panes
+        ):
+            # An already-expanded pane remains usable while resizing; the
+            # responsive hide applies to the compact multi-pane layout.
+            visible_panes = [*visible_panes, self.state.expanded_pane]
         if self.state.focused_pane not in visible_panes:
-            self.state.focused_pane = "jobs"
-        if self.state.expanded_pane and self.state.expanded_pane not in visible_panes:
+            # Keep focus state across a transient responsive hide so restoring
+            # the terminal does not unexpectedly move the user to Jobs.
+            if self.state.focused_pane not in self._responsive_hidden_panes:
+                self.state.focused_pane = "jobs"
+        if (
+            self.state.expanded_pane
+            and self.state.expanded_pane not in visible_panes
+            and self.state.expanded_pane not in self._responsive_hidden_panes
+        ):
             self.state.expanded_pane = None
         if self.state.expanded_pane:
             active = self.state.expanded_pane + "-pane"
@@ -1570,12 +1622,16 @@ class FalconDashboard(App):
         self.query_one("#jobs-pane").styles.height = "1fr"
         self.query_one("#summary").styles.height = 2
         self.query_one("#selected-pane").styles.height = 3
-        emergency_fit = self.size.height < 28
-        self.query_one("#resources-pane").styles.height = 4 if emergency_fit else 6
-        self.query_one("#events-pane").styles.height = 3 if emergency_fit else 7
+        self.query_one("#resources-pane").styles.height = 6
+        self.query_one("#events-pane").styles.height = 7
 
     def _visible_panes(self) -> List[str]:
-        return [pane for pane in ("jobs", "selected", "resources", "events") if pane not in self.state.hidden_panes]
+        hidden = self.state.hidden_panes | self._responsive_hidden_panes
+        return [
+            pane
+            for pane in ("jobs", "selected", "resources", "events")
+            if pane not in hidden
+        ]
 
     def _focus(self, pane: str) -> None:
         if pane not in self._visible_panes():
