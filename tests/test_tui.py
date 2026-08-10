@@ -732,7 +732,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             rendered = app.export_screenshot(simplify=True)
             self.assertIn("VRAM&#160;ALLOCATION&#160;BY&#160;NAMESPACE", rendered)
 
-    async def test_gpu_panels_expand_from_mouse_and_escape_restores_them(self) -> None:
+    async def test_gpu_panel_click_selects_and_enter_expands(self) -> None:
         app = FalconResourcesApp(
             DemoCollector("mixed"),
             refresh_seconds=999,
@@ -741,18 +741,30 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
             await pilot.click("#gpu-overview-pane", offset=(5, 2))
+            self.assertEqual(app.state.selected_panels["gpu-overview"], "summary")
+            self.assertEqual(app.state.expanded_panels["gpu-overview"], "")
+            await pilot.press("enter")
             self.assertEqual(app.state.expanded_panels["gpu-overview"], "summary")
             await pilot.press("escape")
             self.assertEqual(app.state.expanded_panels["gpu-overview"], "")
 
             await pilot.press("right")
             await pilot.click("#gpu-allocations-pane", offset=(5, 2))
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "history")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
+            await pilot.press("enter")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "history")
             await pilot.press("escape")
             await pilot.click("#gpu-allocations-pane", offset=(5, 14))
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "pie")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
+            await pilot.press("enter")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pie")
             await pilot.press("escape")
             await pilot.click("#gpu-allocations-pane", offset=(95, 14))
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "pods")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
+            await pilot.press("enter")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pods")
             await pilot.press("escape")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")

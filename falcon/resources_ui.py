@@ -156,6 +156,12 @@ class ResourcesViewState:
             "gpu-allocations": "",
         }
     )
+    selected_panels: dict[str, str] = field(
+        default_factory=lambda: {
+            "gpu-overview": "summary",
+            "gpu-allocations": "history",
+        }
+    )
     focused_panes: dict[str, str] = field(
         default_factory=lambda: {
             "nodes": "nodes",
@@ -208,7 +214,7 @@ class ResourcesPane(Static):
         self._activate()
         self.app.set_focus(self, scroll_visible=False)
         if self.id == "gpu-overview-pane" or self.id == "gpu-allocations-pane":
-            callback = getattr(self.app, "gpu_panel_clicked", None)
+            callback = getattr(self.app, "gpu_panel_selected", None)
             if callback:
                 callback(
                     self.id.replace("-pane", ""),
@@ -425,10 +431,14 @@ class FalconResourcesApp(App[None]):
                 self._switch_view(view)
                 return
 
-    def gpu_panel_clicked(self, view: str, offset) -> None:
-        """Expand the Rich panel under a mouse click."""
+    def gpu_panel_selected(self, view: str, offset) -> None:
+        """Select the Rich sub-pane under a mouse click.
 
-        if view not in self.state.expanded_panels or offset is None:
+        Mouse interaction follows the rest of the Resources screen: clicking
+        changes focus/selection only. ``Enter`` performs the expansion.
+        """
+
+        if view not in self.state.selected_panels or offset is None:
             return
         x, y = max(0, int(offset.x)), max(0, int(offset.y))
         panel = ""
@@ -455,8 +465,7 @@ class FalconResourcesApp(App[None]):
                     ),
                 )
                 panel = "pie" if x < namespace_width else "pods"
-        current = self.state.expanded_panels[view]
-        self.state.expanded_panels[view] = "" if current == panel else panel
+        self.state.selected_panels[view] = panel
         self._render_all()
 
     def _switch_view(self, view: str) -> None:
@@ -1084,7 +1093,7 @@ class FalconResourcesApp(App[None]):
         summary_height = 3 if self.size.width < 120 else 5
         if expanded:
             if expanded == "summary":
-                target.border_subtitle = " click panel to restore · Esc restore "
+                target.border_subtitle = " Enter expand selected · Esc restore "
                 target.update(
                     Panel(
                         self._gpu_summary(width=width, height=max(5, height - 2)),
@@ -1118,7 +1127,7 @@ class FalconResourcesApp(App[None]):
                 if expanded == "free"
                 else " GPU REQUEST PRESSURE PER NODE "
             )
-            target.border_subtitle = " click panel to restore · Esc restore "
+            target.border_subtitle = " Enter expand selected · Esc restore "
             target.update(
                 Panel(
                     lines,
@@ -1308,7 +1317,7 @@ class FalconResourcesApp(App[None]):
         expanded = self.state.expanded_panels["gpu-allocations"]
         if expanded:
             height = max(8, target.content_size.height)
-            target.border_subtitle = " click panel to restore · Esc restore "
+            target.border_subtitle = " Enter expand selected · Esc restore "
             if expanded == "history":
                 history_key = ("expanded", tuple(self.history), width, height)
                 if (
@@ -1882,14 +1891,14 @@ class FalconResourcesApp(App[None]):
         if self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT:
             value = "q Quit   r Retry"
         elif self.state.view == "gpu-overview" and self.state.expanded_panels["gpu-overview"]:
-            value = "Esc restore panel   ←/→ Views   ↑/↓ Scroll   r Refresh   q Quit"
+            value = "Enter expand selected   Esc restore   ←/→ Views   ↑/↓ Scroll   r Refresh   q Quit"
         elif self.state.view == "gpu-overview":
-            value = "←/→ Views   ↑/↓ Scroll nodes   PgUp/PgDn Page   r Refresh   q Quit"
+            value = "←/→ Views   ↑/↓ Scroll nodes   Enter Expand selected   r Refresh   q Quit"
         elif self.state.view == "gpu-allocations":
             expanded_panel = self.state.expanded_panels["gpu-allocations"]
             value = (
                 "Esc restore panels   " if expanded_panel else ""
-            ) + "←/→ Views   ↑/↓ Scroll Pods   v GPU/VRAM allocation pie   r Refresh   q Quit"
+            ) + "←/→ Views   ↑/↓ Scroll Pods   Enter Expand selected   v GPU/VRAM allocation pie   r Refresh   q Quit"
         elif self.state.expanded:
             value = "←/→ Views   ↑/↓ Consumers   PgUp/PgDn Page   Esc Nodes   r Refresh   q Quit"
         elif self.size.width < 100:
@@ -2045,6 +2054,12 @@ class FalconResourcesApp(App[None]):
         self._render_all()
 
     def action_expand(self) -> None:
+        if self.state.view in self.state.expanded_panels:
+            selected = self.state.selected_panels[self.state.view]
+            if selected:
+                self.state.expanded_panels[self.state.view] = selected
+                self._render_all()
+            return
         if self.state.view != "nodes" or self._selected() is None:
             return
         self.state.expanded = True
