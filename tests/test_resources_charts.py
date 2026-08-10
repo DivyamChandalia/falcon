@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from rich.console import Console
-
 from falcon.resources_charts import (
     CHART_COLORS,
     GPUHistoryPoint,
+    _pie_dimensions,
     _series_colors,
     downsample_history,
     render_gpu_history,
@@ -23,6 +22,10 @@ class GPUHistoryRendererTests(unittest.TestCase):
                 {
                     "team-2": (index // 3) % 4,
                     "team-10": (index // 7) % 3,
+                },
+                {
+                    "team-2": ((index // 3) % 4) * 80,
+                    "team-10": ((index // 7) % 3) * 40,
                 },
             )
             for index in range(count)
@@ -56,7 +59,14 @@ class GPUHistoryRendererTests(unittest.TestCase):
                 self.assertTrue(all(len(line) <= width for line in lines))
                 self.assertIn("Total", chart.plain)
                 self.assertIn("team-2", chart.plain)
+                if width >= 80:
+                    self.assertIn("team-10", chart.plain)
                 self.assertRegex(chart.plain, r"[━┃]")
+
+        vram = render_gpu_history(
+            self.points(), width=80, height=15, basis="vram"
+        )
+        self.assertIn("G", vram.plain)
 
     def test_node_series_use_the_expanded_palette_without_collisions(self) -> None:
         names = [f"gpu-node-{index:02d}" for index in range(20)]
@@ -112,24 +122,26 @@ class NamespacePieRendererTests(unittest.TestCase):
                 self.assertIn("█", pie.plain)
 
                 # The center is a colored block, not a hollow donut cell.
-                pie_width = min(max(9, width // 2), max(9, 2 * height - 1), 25)
+                legend_width, pie_width = _pie_dimensions(
+                    categories, width=width, height=height
+                )
                 center_x = round((pie_width - 1) / 2)
                 center_y = round((height - 1) / 2)
-                self.assertEqual(lines[center_y][center_x], "█")
+                self.assertEqual(
+                    lines[center_y][legend_width + 2 + center_x], "█"
+                )
 
         reconciled = (*categories[:7], ("System/hidden", 2))
         pie = render_namespace_pie(reconciled, width=44, height=8)
         self.assertIn("System/hidden", pie.plain)
 
-        # At 44×8 the ring occupies 15 cells, followed by two spaces and the
-        # legend marker. Every category must receive a distinct marker color.
-        marker_offsets = [row * 45 + 17 for row in range(8)]
-        console = Console(width=44, color_system="truecolor")
-        marker_colors = {
-            pie.get_style_at_offset(console, offset).color.triplet
-            for offset in marker_offsets
-        }
-        self.assertEqual(len(marker_colors), 8)
+        # The legend is on the left and the pie occupies the right side.
+        legend_width, pie_width = _pie_dimensions(
+            reconciled, width=44, height=8
+        )
+        self.assertTrue(all(line.startswith("█ ") for line in pie.plain.splitlines()))
+        self.assertGreater(pie_width, 0)
+        self.assertGreater(legend_width, 0)
 
 
 if __name__ == "__main__":

@@ -81,20 +81,23 @@ def _seed_resources_history(app: FalconResourcesApp) -> None:
             if consumer.requested.gpu_count > 0
         }
     )
-    app.history = [
-        GPUHistoryPoint.from_mapping(
-            DEMO_NOW - (15 - index) * 5 * 60,
-            {
+    app.history = []
+    for index in range(16):
+        values = {
                 namespace: min(
                     8,
                     (index // (namespace_index + 2) + namespace_index)
                     % 9,
                 )
                 for namespace_index, namespace in enumerate(namespaces)
-            },
+            }
+        app.history.append(
+            GPUHistoryPoint.from_mapping(
+                DEMO_NOW - (15 - index) * 5 * 60,
+                values,
+                {namespace: value * 80 for namespace, value in values.items()},
+            )
         )
-        for index in range(16)
-    ]
     app._render_all()
 
 
@@ -730,7 +733,9 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("v")
             self.assertEqual(app.state.namespace_basis, "vram")
             rendered = app.export_screenshot(simplify=True)
-            self.assertIn("VRAM&#160;ALLOCATION&#160;BY&#160;NAMESPACE", rendered)
+            self.assertIn("ALLOCATION&#160;BY&#160;NAMESPACE", rendered)
+            self.assertIn("VRAM&#160;percentages", rendered)
+            self.assertEqual(rendered.count("NAMESPACE&#160;LEGEND"), 1)
 
     async def test_gpu_panel_click_selects_and_enter_expands(self) -> None:
         app = FalconResourcesApp(

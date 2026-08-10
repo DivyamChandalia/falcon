@@ -156,20 +156,23 @@ def seed_resources_history(app: FalconResourcesApp) -> None:
             if consumer.requested.gpu_count > 0
         }
     )
-    app.history = [
-        GPUHistoryPoint.from_mapping(
-            DEMO_NOW - (15 - index) * 5 * 60,
-            {
+    app.history = []
+    for index in range(16):
+        values = {
                 namespace: min(
                     8,
                     (index // (namespace_index + 2) + namespace_index)
                     % 9,
                 )
                 for namespace_index, namespace in enumerate(namespaces)
-            },
+            }
+        app.history.append(
+            GPUHistoryPoint.from_mapping(
+                DEMO_NOW - (15 - index) * 5 * 60,
+                values,
+                {namespace: value * 80 for namespace, value in values.items()},
+            )
         )
-        for index in range(16)
-    ]
     app._render_all()
 
 

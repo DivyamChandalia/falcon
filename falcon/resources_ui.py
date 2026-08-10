@@ -33,6 +33,8 @@ from .resources_charts import (
     HISTORY_LIMIT,
     HISTORY_SECONDS,
     GPUHistoryPoint,
+    allocation_colors,
+    render_allocation_legend,
     render_gpu_history,
     render_namespace_pie,
 )
@@ -451,20 +453,28 @@ class FalconResourcesApp(App[None]):
                 panel = "free"
             else:
                 panel = "pressure"
-        else:
+        elif view == "gpu-allocations":
             history_height, _ = self._allocation_layout()
             if y < history_height:
                 panel = "history"
             else:
                 pane = self.query_one("#gpu-allocations-pane")
+                legend_width = self._allocation_legend_width(
+                    pane.content_size.width
+                )
+                chart_width = max(
+                    18,
+                    pane.content_size.width - legend_width - 2,
+                )
                 namespace_width = max(
                     22,
-                    round(
-                        pane.content_size.width
-                        * (0.42 if self.size.width >= 120 else 0.38)
-                    ),
+                    round(chart_width * (0.42 if self.size.width >= 120 else 0.38)),
                 )
-                panel = "pie" if x < namespace_width else "pods"
+                panel = (
+                    "pie"
+                    if x < legend_width + namespace_width
+                    else "pods"
+                )
         self.state.selected_panels[view] = panel
         self._render_all()
 
@@ -630,11 +640,16 @@ class FalconResourcesApp(App[None]):
 
         if telemetry.stale or not telemetry.sampled_pods:
             return
-        identity = (telemetry.collected_at, telemetry.effective_gpus_by_namespace)
+        identity = (
+            telemetry.collected_at,
+            telemetry.effective_gpus_by_namespace,
+            telemetry.vram_gib_by_namespace,
+        )
         if identity == self._last_allocation_history_key:
             return
         self._last_allocation_history_key = identity
         values = dict(telemetry.effective_gpus_by_namespace)
+        vram_values = dict(telemetry.vram_gib_by_namespace)
         if not values:
             return
         timestamp = float(telemetry.collected_at)
@@ -643,7 +658,9 @@ class FalconResourcesApp(App[None]):
         # Test and adapter collectors may use monotonic cache timestamps.
         if timestamp < 946_684_800:  # 2000-01-01 UTC
             timestamp = float(self.history_clock())
-        self.history.append(GPUHistoryPoint.from_mapping(timestamp, values))
+        self.history.append(
+            GPUHistoryPoint.from_mapping(timestamp, values, vram_values)
+        )
         self.history.sort(key=lambda point: point.timestamp)
         newest = self.history[-1].timestamp
         cutoff = newest - HISTORY_SECONDS
@@ -1047,6 +1064,8 @@ class FalconResourcesApp(App[None]):
     def _gpu_summary(self, *, width: int, height: int):
         allocatable, requested, free, pressure = _gpu_totals(self._gpu_nodes())
         color = _gpu_headroom_color(free, allocatable)
+        selected = self.state.selected_panels.get("gpu-overview") == "summary"
+        summary_border = CYAN if selected else BORDER
         if self.size.width < 120:
             line = Text(justify="center")
             values = (
@@ -1060,7 +1079,12 @@ class FalconResourcesApp(App[None]):
                     line.append("   ", style=BORDER)
                 line.append(f"{label} ", style=GRAY)
                 line.append(value, style=f"bold {value_color}")
-            return Panel(line, box=box.SQUARE, border_style=BORDER, height=height)
+            return Panel(
+                line,
+                box=box.SQUARE,
+                border_style=summary_border,
+                height=height,
+            )
 
         cards = Table.grid(expand=True, padding=(0, 1))
         for _ in range(4):
@@ -1077,7 +1101,7 @@ class FalconResourcesApp(App[None]):
                     Align.center(Text(value, style=f"bold {value_color}"), vertical="middle"),
                     title=Text(f" {label} ", style=f"bold {GRAY}"),
                     box=box.SQUARE,
-                    border_style=BORDER,
+                    border_style=summary_border,
                     height=height,
                 )
                 for label, value, value_color in card_values
@@ -1164,19 +1188,29 @@ class FalconResourcesApp(App[None]):
         bars = Table.grid(expand=True, padding=(0, 1))
         bars.add_column(ratio=1)
         bars.add_column(ratio=1)
+        free_border = (
+            CYAN
+            if self.state.selected_panels.get("gpu-overview") == "free"
+            else BORDER
+        )
+        pressure_border = (
+            CYAN
+            if self.state.selected_panels.get("gpu-overview") == "pressure"
+            else BORDER
+        )
         bars.add_row(
             Panel(
                 free_lines,
                 title=Text(" FREE GPUS PER NODE ", style=f"bold {CYAN_2}"),
                 box=box.SQUARE,
-                border_style=BORDER,
+                border_style=free_border,
                 height=bars_height,
             ),
             Panel(
                 pressure_lines,
                 title=Text(" GPU REQUEST PRESSURE PER NODE ", style=f"bold {CYAN_2}"),
                 box=box.SQUARE,
-                border_style=BORDER,
+                border_style=pressure_border,
                 height=bars_height,
             ),
         )
@@ -1311,15 +1345,72 @@ class FalconResourcesApp(App[None]):
             table.add_row(Text("No active GPU-requesting Pods", style=MUTED))
         return table
 
+    @staticmethod
+    def _allocation_legend_width(width: int) -> int:
+        """Reserve one readable shared legend column for both charts."""
+
+        return min(40, max(20, round(max(1, width) * 0.28)))
+
+    @staticmethod
+    def _allocation_colors(categories: Sequence[tuple[str, float]]) -> dict[str, str]:
+        return allocation_colors(name for name, _ in categories)
+
+    def _allocation_chart_with_legend(
+        self,
+        chart: Text,
+        categories: Sequence[tuple[str, float]],
+        *,
+        basis: str,
+        width: int,
+        height: int,
+        colors: Mapping[str, str],
+    ) -> Table:
+        legend_width = self._allocation_legend_width(width)
+        legend = render_allocation_legend(
+            categories,
+            width=legend_width,
+            height=max(1, height - 2),
+            unit="G" if basis == "vram" else "",
+            colors=colors,
+        )
+        legend_panel = Panel(
+            legend,
+            title=Text(" NAMESPACE LEGEND ", style=f"bold {CYAN_2}"),
+            subtitle=Text(
+                " VRAM % " if basis == "vram" else " GPU COUNT % ",
+                style=GRAY,
+            ),
+            box=box.SQUARE,
+            border_style=BORDER,
+            height=height,
+        )
+        content = Table.grid(expand=True, padding=(0, 1))
+        content.add_column(width=legend_width)
+        content.add_column(ratio=1)
+        content.add_row(legend_panel, chart)
+        return content
+
     def _render_gpu_allocations(self) -> None:
         target = self.query_one("#gpu-allocations-pane", ResourcesPane)
         width = max(20, target.content_size.width)
         expanded = self.state.expanded_panels["gpu-allocations"]
+        basis = self.state.namespace_basis
+        categories = self._namespace_categories()
+        colors = self._allocation_colors(categories)
+        legend_width = self._allocation_legend_width(width)
+        chart_width = max(18, width - legend_width - 2)
         if expanded:
             height = max(8, target.content_size.height)
             target.border_subtitle = " Enter expand selected · Esc restore "
             if expanded == "history":
-                history_key = ("expanded", tuple(self.history), width, height)
+                history_key = (
+                    "expanded",
+                    tuple(self.history),
+                    categories,
+                    basis,
+                    width,
+                    height,
+                )
                 if (
                     history_key != self._history_cache_key
                     or self._history_cache is None
@@ -1327,15 +1418,30 @@ class FalconResourcesApp(App[None]):
                     self._history_cache_key = history_key
                     self._history_cache = render_gpu_history(
                         self.history,
-                        width=max(18, width - 4),
+                        width=chart_width,
                         height=max(5, height - 2),
+                        basis=basis,
+                        categories=categories,
+                        colors=colors,
+                        show_legend=False,
                     )
+                content = self._allocation_chart_with_legend(
+                    self._history_cache,
+                    categories,
+                    basis=basis,
+                    width=width,
+                    height=height,
+                    colors=colors,
+                )
                 target.update(
                     Panel(
-                        self._history_cache,
-                        title=Text(
-                            " GPU ALLOCATION HISTORY · namespace · since launch ",
-                            style=f"bold {CYAN_2}",
+                        content,
+                        title=Text(" ALLOCATION HISTORY ", style=f"bold {CYAN_2}"),
+                        subtitle=Text(
+                            " VRAM percentages · since launch "
+                            if basis == "vram"
+                            else " GPU count percentages · since launch ",
+                            style=GRAY,
                         ),
                         box=box.SQUARE,
                         border_style=BORDER,
@@ -1357,28 +1463,35 @@ class FalconResourcesApp(App[None]):
                     )
                 )
                 return
-            categories = self._namespace_categories()
-            basis = self.state.namespace_basis
             unit = "G" if basis == "vram" else ""
-            pie_key = ("expanded", categories, basis, width, height)
+            pie_key = ("expanded", categories, basis, chart_width, height)
             if pie_key != self._pie_cache_key or self._pie_cache is None:
                 self._pie_cache_key = pie_key
                 self._pie_cache = render_namespace_pie(
                     categories,
-                    width=max(16, width - 4),
+                    width=chart_width,
                     height=max(5, height - 2),
                     unit=unit,
                     empty_label=self._allocation_empty_label(basis),
+                    colors=colors,
+                    show_legend=False,
                 )
-            title = (
-                " VRAM ALLOCATION BY NAMESPACE "
-                if basis == "vram"
-                else " GPU COUNT ALLOCATION BY NAMESPACE "
+            content = self._allocation_chart_with_legend(
+                self._pie_cache,
+                categories,
+                basis=basis,
+                width=width,
+                height=height,
+                colors=colors,
             )
             target.update(
                 Panel(
-                    self._pie_cache,
-                    title=Text(title, style=f"bold {CYAN_2}"),
+                    content,
+                    title=Text(" ALLOCATION BY NAMESPACE ", style=f"bold {CYAN_2}"),
+                    subtitle=Text(
+                        " VRAM percentages " if basis == "vram" else " GPU count percentages ",
+                        style=GRAY,
+                    ),
                     box=box.SQUARE,
                     border_style=BORDER,
                     height=height,
@@ -1386,28 +1499,46 @@ class FalconResourcesApp(App[None]):
             )
             return
         history_height, bottom_height = self._allocation_layout()
-        history_key = (tuple(self.history), width, history_height)
+        history_key = (
+            tuple(self.history),
+            categories,
+            basis,
+            chart_width,
+            history_height,
+        )
         if history_key != self._history_cache_key or self._history_cache is None:
             self._history_cache_key = history_key
             self._history_cache = render_gpu_history(
                 self.history,
-                width=max(18, width - 4),
+                width=chart_width,
                 height=max(5, history_height - 2),
+                basis=basis,
+                categories=categories,
+                colors=colors,
+                show_legend=False,
             )
         history_panel = Panel(
             self._history_cache,
-            title=Text(
-                " GPU ALLOCATION HISTORY · namespace · since launch (up to 24h) ",
-                style=f"bold {CYAN_2}",
+            title=Text(" ALLOCATION HISTORY ", style=f"bold {CYAN_2}"),
+            subtitle=Text(
+                " VRAM percentages · since launch (up to 24h) "
+                if basis == "vram"
+                else " GPU count percentages · since launch (up to 24h) ",
+                style=GRAY,
             ),
             box=box.SQUARE,
-            border_style=BORDER,
+            border_style=(
+                CYAN
+                if self.state.selected_panels.get("gpu-allocations") == "history"
+                else BORDER
+            ),
             height=history_height,
         )
 
-        categories = self._namespace_categories()
-        namespace_width = max(22, round(width * (0.42 if width >= 120 else 0.38)))
-        basis = self.state.namespace_basis
+        namespace_width = max(
+            22,
+            round(chart_width * (0.42 if width >= 120 else 0.38)),
+        )
         unit = "G" if basis == "vram" else ""
         empty_label = self._allocation_empty_label(basis)
         pie_key = (
@@ -1425,6 +1556,8 @@ class FalconResourcesApp(App[None]):
                 height=max(5, bottom_height - 2),
                 unit=unit,
                 empty_label=empty_label,
+                colors=colors,
+                show_legend=False,
             )
         bottom = Table.grid(expand=True, padding=(0, 1))
         bottom.add_column(width=namespace_width)
@@ -1439,31 +1572,30 @@ class FalconResourcesApp(App[None]):
             Panel(
                 self._pie_cache,
                 title=Text(
-                    (
-                        (
-                            " NAMESPACE VRAM ALLOC · v GPU count "
-                            if basis == "vram"
-                            else " NAMESPACE GPU ALLOC · v VRAM "
-                        )
-                        if self.size.width < 100
-                        else (
-                            " VRAM ALLOCATION BY NAMESPACE · v GPU count "
-                            if basis == "vram"
-                            else " GPU COUNT ALLOCATION BY NAMESPACE · v VRAM "
-                        )
-                    ),
+                    " ALLOCATION BY NAMESPACE ",
                     style=f"bold {CYAN_2}",
                 ),
                 subtitle=Text(
                     (
-                        f" {self.gpu_telemetry.target_pods} Pods accounted "
-                        if self.gpu_telemetry.target_pods
-                        else " No GPU allocations "
+                        (
+                            " VRAM percentages · "
+                            if basis == "vram"
+                            else " GPU count percentages · "
+                        )
+                        + (
+                            f"{self.gpu_telemetry.target_pods} Pods accounted "
+                            if self.gpu_telemetry.target_pods
+                            else "No GPU allocations "
+                        )
                     ),
                     style=RED if self.gpu_telemetry.stale else GRAY,
                 ),
                 box=box.SQUARE,
-                border_style=BORDER,
+                border_style=(
+                    CYAN
+                    if self.state.selected_panels.get("gpu-allocations") == "pie"
+                    else BORDER
+                ),
                 height=bottom_height,
             ),
             Panel(
@@ -1475,14 +1607,40 @@ class FalconResourcesApp(App[None]):
                     else Text(f" {visible_requests} requested ", style=GRAY)
                 ),
                 box=box.SQUARE,
-                border_style=BORDER,
+                border_style=(
+                    CYAN
+                    if self.state.selected_panels.get("gpu-allocations") == "pods"
+                    else BORDER
+                ),
                 height=bottom_height,
             ),
         )
         content = Table.grid(expand=True)
-        content.add_column()
-        content.add_row(history_panel)
-        content.add_row(bottom)
+        right = Table.grid(expand=True)
+        right.add_column()
+        right.add_row(history_panel)
+        right.add_row(bottom)
+        legend = render_allocation_legend(
+            categories,
+            width=legend_width,
+            height=max(1, history_height + bottom_height - 2),
+            unit=unit,
+            colors=colors,
+        )
+        legend_panel = Panel(
+            legend,
+            title=Text(" NAMESPACE LEGEND ", style=f"bold {CYAN_2}"),
+            subtitle=Text(
+                " VRAM % " if basis == "vram" else " GPU COUNT % ",
+                style=GRAY,
+            ),
+            box=box.SQUARE,
+            border_style=BORDER,
+            height=history_height + bottom_height,
+        )
+        content.add_column(width=legend_width)
+        content.add_column(ratio=1)
+        content.add_row(legend_panel, right)
         start = self.state.allocation_scroll
         visible = self._allocation_visible_rows()
         end = min(len(consumers), start + visible)
