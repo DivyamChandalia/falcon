@@ -109,11 +109,25 @@ class ResourcesViewState:
 class ResourcesPane(Static):
     can_focus = True
 
-    def on_focus(self) -> None:
+    def _activate(self) -> None:
         pane = self.id.replace("-pane", "") if self.id else "nodes"
         callback = getattr(self.app, "pane_focused", None)
         if callback:
             callback(pane)
+
+    def on_focus(self, event: events.Focus) -> None:
+        # Textual posts focus messages to individual widget queues. A restore
+        # event for the pane used before terminal blur can therefore arrive
+        # after mouse-down has already focused another pane. Ignore it once it
+        # is no longer the screen's real focus.
+        if self.screen.focused is not self:
+            return
+        self._activate()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Activate on the first forwarded mouse event, rather than waiting for
+        # mouse-up to synthesize a Click after terminal focus-in.
+        self._activate()
 
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.prevent_default()
@@ -132,7 +146,8 @@ class ResourcesPane(Static):
             self.app.action_up()
 
     def on_click(self, event: events.Click) -> None:
-        self.focus()
+        self._activate()
+        self.app.set_focus(self, scroll_visible=False)
         if self.id != "nodes-pane":
             return
         callback = getattr(self.app, "node_clicked", None)
@@ -226,7 +241,10 @@ class FalconResourcesApp(App[None]):
 
     def on_mount(self) -> None:
         self._set_titles()
-        self.query_one("#nodes-pane", ResourcesPane).focus()
+        self.set_focus(
+            self.query_one("#nodes-pane", ResourcesPane),
+            scroll_visible=False,
+        )
         self._apply_layout(recompute_detail=True)
         self._request_update(force=True)
         self.set_interval(self.refresh_seconds, self._request_update)
@@ -276,6 +294,17 @@ class FalconResourcesApp(App[None]):
             return
         self.state.active_pane = pane
         self._set_titles()
+
+    def watch_app_focus(self, focused: bool) -> None:
+        """Remove pane emphasis while the terminal window is inactive."""
+
+        if not self.is_mounted:
+            return
+        try:
+            self._set_titles()
+            self._render_nodes()
+        except NoMatches:
+            return
 
     @staticmethod
     def _snapshot_clock(snapshot: ClusterSnapshot) -> str:
@@ -485,7 +514,8 @@ class FalconResourcesApp(App[None]):
             detail.display = True
             detail.styles.height = "1fr"
             detail.border_title = " NODE INSPECTOR "
-            detail.focus()
+            if self.app_focus and self.focused is not detail:
+                self.set_focus(detail, scroll_visible=False)
         else:
             for identifier in ("cluster-overview", "resource-controls", "nodes-pane"):
                 self.query_one(f"#{identifier}").display = True
@@ -519,7 +549,20 @@ class FalconResourcesApp(App[None]):
                 self._DETAIL_MIN_HEIGHT,
                 available - nodes_height,
             )
-            nodes_pane.focus()
+            # Telemetry refreshes run this layout path every second. Preserve
+            # the pane the user clicked instead of unconditionally returning
+            # focus to the node inventory. If the detail pane has to be
+            # hidden, the node inventory is the only valid focus target.
+            if self.state.active_pane == "node" and detail.display:
+                focus_target = detail
+            else:
+                self.state.active_pane = "nodes"
+                focus_target = nodes_pane
+            if self.app_focus and self.focused is not focus_target:
+                # Never leave a refresh-owned focus change queued behind a
+                # later mouse event. The click must be the last operation and
+                # therefore the winner.
+                self.set_focus(focus_target, scroll_visible=False)
 
     def _render_header(self) -> None:
         width = max(30, self.size.width - 2)
@@ -544,7 +587,7 @@ class FalconResourcesApp(App[None]):
         }
         for pane, (identifier, base) in titles.items():
             self.query_one(f"#{identifier}", ResourcesPane).border_title = (
-                f" {base}{' · focused' if pane == self.state.active_pane else ''} "
+                f" {base}{' · focused' if self.app_focus and pane == self.state.active_pane else ''} "
             )
 
     def _render_overview(self) -> None:
@@ -557,25 +600,29 @@ class FalconResourcesApp(App[None]):
         )
         text.append(
             f"{snapshot.running_jobs} {'RUNNING' if self.size.width >= 100 else 'RUN'}  ",
-            style=WHITE,
+            style=f"bold {GREEN}",
         )
+        cpu_color = _resource_headroom_color(
+            headroom.cpu_cores,
+            snapshot.allocatable.cpu_cores,
+        )
+        memory_color = _resource_headroom_color(
+            headroom.memory_bytes,
+            snapshot.allocatable.memory_bytes,
+        )
+        text.append("CPU ", style=f"bold {GRAY}")
         text.append(
-            f"CPU {_short_cpu(headroom.cpu_cores)}/"
+            f"{_short_cpu(headroom.cpu_cores)}/"
             f"{_short_cpu(snapshot.allocatable.cpu_cores)}  ",
-            style=_resource_headroom_color(
-                headroom.cpu_cores,
-                snapshot.allocatable.cpu_cores,
-            ),
+            style=f"bold {cpu_color}",
         )
+        text.append("MEM ", style=f"bold {GRAY}")
         text.append(
-            f"MEM {_short_memory(headroom.memory_bytes)}/"
+            f"{_short_memory(headroom.memory_bytes)}/"
             f"{_short_memory(snapshot.allocatable.memory_bytes)}",
-            style=_resource_headroom_color(
-                headroom.memory_bytes,
-                snapshot.allocatable.memory_bytes,
-            ),
+            style=f"bold {memory_color}",
         )
-        gpu = Text("GPU  ", style=GRAY)
+        gpu = Text("GPU  ", style=f"bold {GRAY}")
         if snapshot.gpu_availability:
             for index, availability in enumerate(snapshot.gpu_availability.values()):
                 if index:
@@ -590,7 +637,7 @@ class FalconResourcesApp(App[None]):
                     ),
                 )
         else:
-            gpu.append("-", style=MUTED)
+            gpu.append("-", style=f"bold {MUTED}")
         available_width = max(1, self.size.width - 2)
         if len(text.plain) + len(gpu.plain) + 2 <= available_width:
             text.append(" " * max(2, available_width - len(text.plain) - len(gpu.plain)))
@@ -653,11 +700,20 @@ class FalconResourcesApp(App[None]):
         start = self.state.node_scroll
         for node in self.nodes[start : start + count]:
             selected = node.name == self.state.selected_node
+            selection_active = (
+                selected
+                and self.app_focus
+                and self.state.active_pane == "nodes"
+            )
             sched, sched_color = _schedulable(node)
             cells = [
                 Text(
                     f"{'>' if selected else ' '} {node.name}",
-                    style=f"bold {CYAN}" if selected else WHITE,
+                    style=(
+                        f"bold {CYAN}"
+                        if selection_active
+                        else (f"bold {WHITE}" if selected else WHITE)
+                    ),
                     no_wrap=True,
                     overflow="ellipsis",
                 ),

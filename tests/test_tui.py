@@ -8,6 +8,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from textual import events
+
 # Golden rendering is intentionally truecolor and independent of the parent
 # test runner's NO_COLOR setting.
 os.environ.pop("NO_COLOR", None)
@@ -26,7 +28,7 @@ from falcon.resources_ui import (
     _resource_headroom_color,
     _short_cpu,
 )
-from falcon.theme import GREEN, MUTED, RED, YELLOW
+from falcon.theme import GRAY, GREEN, MUTED, RED, YELLOW
 
 DIMENSIONS = (
     (60, 18),
@@ -61,6 +63,94 @@ def _golden_manifest():
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_job_history_changes_the_rendered_gpu_value(self) -> None:
+        collector = DemoUsageCollector("mixed")
+        app = FalconDashboard(collector, refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            row = next(
+                item
+                for item in app.rows
+                if item.status == "Running" and item.gpu_metrics_available
+            )
+            app.histories[row.uid].clear()
+            gpu_capacity = row.gpu_allocated_count or row.gpu_count
+            cpu_capacity = row.cpu_allocated or row.cpu_requested
+            ram_capacity = row.memory_allocated_gib or row.memory_requested_gib
+
+            def usage_sample(percent: float):
+                fraction = percent / 100
+                return replace(
+                    row,
+                    gpu_util=percent,
+                    gpu_memory_used_gib=row.gpu_memory_total_gib * fraction,
+                    cpu_used=cpu_capacity * fraction,
+                    memory_used_gib=ram_capacity * fraction,
+                )
+
+            samples = (
+                usage_sample(10.0),
+                usage_sample(80.0),
+                replace(
+                    usage_sample(80.0),
+                    status="Succeeded",
+                    gpu_memory_used_gib=0.0,
+                    gpu_memory_total_gib=0.0,
+                    cpu_used=0.0,
+                    cpu_allocated=0.0,
+                    memory_used_gib=0.0,
+                    memory_allocated_gib=0.0,
+                    gpu_allocated_count=0,
+                ),
+            )
+            for sample in samples:
+                app.rows = [sample]
+                app._record_history()
+
+            completed = samples[-1]
+            app.rows = [completed]
+            app.filtered_rows = [completed]
+            app.state.cursor_job_uid = completed.uid
+            app.state.focused_pane = "resources"
+            app.state.resource_scroll_offset = 0
+            app._render_all()
+
+            history = list(app.histories[row.uid])
+            self.assertEqual([point.gpu for point in history], [10.0, 80.0])
+            latest_absolutes = [
+                metric["absolute"]
+                for metric in app._resource_metrics(completed, app._history_slice(row.uid))
+            ]
+            self.assertEqual(
+                latest_absolutes,
+                [
+                    app._absolute_metric(80.0, gpu_capacity, "GPU"),
+                    app._absolute_metric(80.0, row.gpu_memory_total_gib, "GiB"),
+                    app._absolute_metric(80.0, cpu_capacity, "vCPU"),
+                    app._absolute_metric(80.0, ram_capacity, "GiB"),
+                ],
+            )
+            self.assertIn("80%", app.export_screenshot(simplify=True))
+            app.action_history_left()
+            self.assertEqual(app._history_slice(row.uid)[-1].gpu, 10.0)
+            earlier_absolutes = [
+                metric["absolute"]
+                for metric in app._resource_metrics(completed, app._history_slice(row.uid))
+            ]
+            self.assertEqual(
+                earlier_absolutes,
+                [
+                    app._absolute_metric(10.0, gpu_capacity, "GPU"),
+                    app._absolute_metric(10.0, row.gpu_memory_total_gib, "GiB"),
+                    app._absolute_metric(10.0, cpu_capacity, "vCPU"),
+                    app._absolute_metric(10.0, ram_capacity, "GiB"),
+                ],
+            )
+            self.assertNotEqual(earlier_absolutes, latest_absolutes)
+            earlier = app.export_screenshot(simplify=True)
+            self.assertIn("10%", earlier)
+            self.assertNotIn("80%", earlier)
+
     async def test_short_terminal_temporarily_hides_events(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(80, 22)) as pilot:
@@ -130,6 +220,80 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(clicked)
                 self.assertEqual(app.state.focused_pane, pane)
                 self.assertIn("focused", app.query_one(f"#{pane}-pane").border_title)
+
+    async def test_dashboard_refresh_keeps_highlight_off_while_app_is_blurred(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.click("#resources-pane", offset=(2, 2))
+            self.assertEqual(app.state.focused_pane, "resources")
+
+            app.app_focus = False
+            await pilot.pause()
+            self.assertIsNone(app.focused)
+            self.assertNotIn(
+                "focused", app.query_one("#resources-pane").border_title
+            )
+
+            app._result_queue.put_nowait(
+                (
+                    app.rows,
+                    app.job_events,
+                    app.state.cursor_job_uid,
+                    None,
+                    app.state.last_successful_refresh,
+                    app.state.gpu_availability,
+                )
+            )
+            app._drain_results()
+            await pilot.pause()
+            self.assertIsNone(app.focused)
+            self.assertNotIn(
+                "focused", app.query_one("#resources-pane").border_title
+            )
+
+            app.app_focus = True
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#resources-pane"))
+            self.assertIn("focused", app.query_one("#resources-pane").border_title)
+
+    async def test_dashboard_focus_in_keeps_the_pane_clicked_while_blurred(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            app.app_focus = False
+            await pilot.pause()
+
+            resources = app.query_one("#resources-pane", DashboardPane)
+            clicked = await pilot.click("#resources-pane", offset=(2, 2))
+            self.assertTrue(clicked)
+            self.assertEqual(app.state.focused_pane, "resources")
+            self.assertIs(app.focused, resources)
+
+            # Pilot injects already-forwarded mouse events, so explicitly send
+            # the terminal focus-in that follows the activation click.
+            app.app_focus = True
+            await pilot.pause()
+            self.assertTrue(app.app_focus)
+            self.assertEqual(app.state.focused_pane, "resources")
+            self.assertIs(app.focused, resources)
+            self.assertIn("focused", resources.border_title)
+
+    async def test_dashboard_stale_restored_focus_cannot_overwrite_mouse_down(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            jobs = app.query_one("#jobs-pane", DashboardPane)
+            resources = app.query_one("#resources-pane", DashboardPane)
+
+            # This is the real terminal-focus race: Textual has queued a Focus
+            # for the old pane, but mouse-down has already focused a new pane.
+            app.set_focus(resources, scroll_visible=False)
+            resources.on_mouse_down(object())
+            jobs.on_focus(events.Focus(from_app_focus=True))
+
+            self.assertEqual(app.state.focused_pane, "resources")
+            self.assertIs(app.focused, resources)
 
     async def test_refresh_preserves_the_selected_pane(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
@@ -372,6 +536,13 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("\n", overview.plain)
             self.assertLess(overview.plain.index("CPU"), overview.plain.index("MEM"))
             self.assertLess(overview.plain.index("MEM"), overview.plain.index("GPU"))
+            running_style = overview.get_style_at_offset(overview.plain.index("RUN"))
+            self.assertTrue(running_style.bold)
+            self.assertEqual(running_style.foreground.hex6, GREEN)
+            for label in ("CPU", "MEM", "GPU"):
+                label_style = overview.get_style_at_offset(overview.plain.index(label))
+                self.assertTrue(label_style.bold)
+                self.assertEqual(label_style.foreground.hex6, GRAY)
 
     async def test_node_expansion_reconciles_consumers_at_narrow_size(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -479,11 +650,15 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app._detail_auto_hidden)
             self.assertEqual(app.query_one("#nodes-pane").region.height, 15)
             self.assertEqual(app.query_one("#node-pane").region.height, 7)
+            await pilot.click("#node-pane", offset=(2, 2))
+            self.assertEqual(app.state.active_pane, "node")
             await pilot.resize_terminal(140, 24)
             await pilot.pause()
             self.assertTrue(app._detail_auto_hidden)
             self.assertFalse(app.query_one("#node-pane").display)
             self.assertEqual(app.query_one("#nodes-pane").region.height, 19)
+            self.assertEqual(app.state.active_pane, "nodes")
+            self.assertIs(app.focused, app.query_one("#nodes-pane"))
 
     async def test_resource_node_pane_stays_fixed_while_detail_pane_grows(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -641,7 +816,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.state.expanded)
             self.assertEqual(app.state.selected_node, selected)
 
-    async def test_resource_bottom_pane_is_active_until_refresh_returns_focus_to_nodes(self) -> None:
+    async def test_resource_refresh_preserves_the_active_bottom_pane(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
@@ -654,9 +829,102 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             app._results.put_nowait(app.snapshot)
             app._drain_results()
             await pilot.pause()
-            self.assertEqual(app.state.active_pane, "nodes")
-            self.assertIn("focused", app.query_one("#nodes-pane").border_title)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, app.query_one("#node-pane"))
+            self.assertIn("focused", app.query_one("#node-pane").border_title)
+            self.assertNotIn("focused", app.query_one("#nodes-pane").border_title)
+
+    async def test_resource_single_click_wins_a_same_frame_refresh(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            detail = app.query_one("#node-pane", ResourcesPane)
+            detail.on_click(object())
+            self.assertEqual(app.state.active_pane, "node")
+
+            app._results.put_nowait(app.snapshot)
+            app._drain_results()
+            await pilot.pause()
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, detail)
+            self.assertIn("focused", detail.border_title)
+
+    async def test_resource_click_wins_a_focus_change_started_by_refresh(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            detail = app.query_one("#node-pane", ResourcesPane)
+
+            # Put screen focus and view state temporarily out of sync so the
+            # layout refresh has to restore the old state-owned pane. That
+            # restoration must finish synchronously before the later click.
+            app.set_focus(detail, scroll_visible=False)
+            app.state.active_pane = "nodes"
+            app._apply_layout(recompute_detail=False)
+            app.set_focus(detail, scroll_visible=False)
+            detail.on_mouse_down(object())
+            await pilot.pause()
+
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, detail)
+
+    async def test_resource_refresh_keeps_highlight_off_while_app_is_blurred(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.click("#node-pane", offset=(2, 2))
+            self.assertEqual(app.state.active_pane, "node")
+
+            app.app_focus = False
+            await pilot.pause()
+            self.assertIsNone(app.focused)
             self.assertNotIn("focused", app.query_one("#node-pane").border_title)
+
+            app._results.put_nowait(app.snapshot)
+            app._drain_results()
+            await pilot.pause()
+            self.assertIsNone(app.focused)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertNotIn("focused", app.query_one("#node-pane").border_title)
+
+            app.app_focus = True
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#node-pane"))
+            self.assertIn("focused", app.query_one("#node-pane").border_title)
+
+    async def test_resource_focus_in_keeps_the_pane_clicked_while_blurred(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            app.app_focus = False
+            await pilot.pause()
+
+            detail = app.query_one("#node-pane", ResourcesPane)
+            clicked = await pilot.click("#node-pane", offset=(2, 2))
+            self.assertTrue(clicked)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, detail)
+
+            app.app_focus = True
+            await pilot.pause()
+            self.assertTrue(app.app_focus)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, detail)
+            self.assertIn("focused", detail.border_title)
+
+    async def test_resource_stale_restored_focus_cannot_overwrite_mouse_down(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            nodes = app.query_one("#nodes-pane", ResourcesPane)
+            detail = app.query_one("#node-pane", ResourcesPane)
+
+            app.set_focus(detail, scroll_visible=False)
+            detail.on_mouse_down(object())
+            nodes.on_focus(events.Focus(from_app_focus=True))
+
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, detail)
 
     async def test_expanded_consumers_stay_inside_the_visible_pane(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")

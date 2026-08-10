@@ -128,6 +128,13 @@ class MetricPoint:
     vram: Optional[float]
     cpu: Optional[float]
     ram: Optional[float]
+    # Retain the denominator used for each percentage. Live Job fields drop
+    # to zero when a Pod exits, but history must continue to show the absolute
+    # value that belonged to the selected sample.
+    gpu_capacity: float = 0.0
+    vram_capacity: float = 0.0
+    cpu_capacity: float = 0.0
+    ram_capacity: float = 0.0
 
 
 def _truncate(value: str, width: int) -> str:
@@ -247,14 +254,30 @@ def _event_style(event: JobEvent) -> str:
 class DashboardPane(Static):
     can_focus = True
 
-    def on_focus(self) -> None:
+    def _activate(self) -> None:
         pane = self.id.replace("-pane", "") if self.id else "jobs"
         callback = getattr(self.app, "pane_focused", None)
         if callback:
             callback(pane)
 
+    def on_focus(self, event: events.Focus) -> None:
+        # Focus messages are queued per widget. When a terminal regains focus,
+        # Textual may have already queued a Focus for the previously active
+        # pane before the mouse-down focuses the pane under the pointer. Do not
+        # let that now-stale message overwrite the pane chosen by the click.
+        if self.screen.focused is not self:
+            return
+        self._activate()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Mouse-down is the first event terminals send when a click brings the
+        # app back into focus. Record it before any queued focus-restoration
+        # messages can run.
+        self._activate()
+
     def on_click(self, event: events.Click) -> None:
-        self.focus()
+        self._activate()
+        self.app.set_focus(self, scroll_visible=False)
         callback = getattr(self.app, "pane_clicked", None)
         if callback:
             callback(self.id or "", event)
@@ -661,7 +684,10 @@ class FalconDashboard(App):
         self.query_one("#selected-pane", DashboardPane).border_title = " SELECTED JOB "
         self.query_one("#resources-pane", DashboardPane).border_title = " RESOURCE USAGE "
         self.query_one("#events-pane", DashboardPane).border_title = " EVENTS "
-        self.query_one("#jobs-pane", DashboardPane).focus()
+        self.set_focus(
+            self.query_one("#jobs-pane", DashboardPane),
+            scroll_visible=False,
+        )
         self._apply_layout()
         self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
@@ -703,6 +729,17 @@ class FalconDashboard(App):
         self.state.focused_pane = pane
         self._render_footer()
         self._set_titles()
+
+    def watch_app_focus(self, focused: bool) -> None:
+        """Keep visual focus in sync with terminal-window focus."""
+
+        if not self.is_mounted:
+            return
+        try:
+            self._set_titles()
+            self._render_jobs()
+        except NoMatches:
+            return
 
     def pane_clicked(self, pane_id: str, event: events.Click) -> None:
         if pane_id != "jobs-pane" or not self.filtered_rows or self.state.expanded_pane:
@@ -800,7 +837,27 @@ class FalconDashboard(App):
             if not any(value is not None for value in values):
                 continue
             history = self.histories.setdefault(row.uid, deque(maxlen=600))
-            history.append(MetricPoint(time.time(), *values))
+            # Completed Jobs have no new live telemetry. Some metrics backends
+            # retain their last GPU sample, which previously caused that same
+            # value to be appended every second until it filled the history.
+            # Freeze an existing series at its final live sample so moving the
+            # history cursor immediately reveals the preceding value.
+            if row.status in {"Succeeded", "Failed"} and history:
+                continue
+            history.append(
+                MetricPoint(
+                    time.time(),
+                    *values,
+                    gpu_capacity=float(
+                        row.gpu_allocated_count or row.gpu_count
+                    ),
+                    vram_capacity=row.gpu_memory_total_gib,
+                    cpu_capacity=row.cpu_allocated or row.cpu_requested,
+                    ram_capacity=(
+                        row.memory_allocated_gib or row.memory_requested_gib
+                    ),
+                )
+            )
         gpu_weight = sum(
             row.gpu_allocated_count
             for row in self.rows
@@ -887,7 +944,7 @@ class FalconDashboard(App):
     def _set_titles(self) -> None:
         for pane in ("jobs", "selected", "resources", "events"):
             widget = self.query_one(f"#{pane}-pane", DashboardPane)
-            focused = pane == self.state.focused_pane
+            focused = self.app_focus and pane == self.state.focused_pane
             base = {
                 "jobs": "JOBS", "selected": "SELECTED JOB",
                 "resources": "RESOURCE USAGE", "events": "EVENTS",
@@ -1024,7 +1081,7 @@ class FalconDashboard(App):
         table.add_column("AGE", width=7, justify="right")
         count = self._visible_job_count()
         start = self.state.jobs_scroll_offset
-        jobs_focused = self.state.focused_pane == "jobs"
+        jobs_focused = self.app_focus and self.state.focused_pane == "jobs"
         for index, row in enumerate(self.filtered_rows[start:start + count], start=start):
             selected = row.uid == self.state.cursor_job_uid
             marked = row.uid in self.state.marked_job_uids
@@ -1195,34 +1252,46 @@ class FalconDashboard(App):
 
     def _resource_metrics(self, row: JobUsage, points: List[MetricPoint]) -> List[Dict]:
         last = points[-1]
+        gpu_capacity = last.gpu_capacity or float(row.gpu_count)
+        vram_capacity = last.vram_capacity or row.gpu_memory_total_gib
+        cpu_capacity = last.cpu_capacity or row.cpu_allocated or row.cpu_requested
+        ram_capacity = (
+            last.ram_capacity
+            or row.memory_allocated_gib
+            or row.memory_requested_gib
+        )
         return [
             {
                 "label": "GPU", "values": [point.gpu for point in points],
-                "current": last.gpu, "capacity": float(row.gpu_count), "unit": "GPU",
+                "current": last.gpu, "capacity": gpu_capacity, "unit": "GPU",
                 "sample_period": 1,
-                "absolute": "—" if row.gpu_count == 0 or last.gpu is None else
-                    f"{(last.gpu or 0) * row.gpu_count / 100:.2f} / {row.gpu_count:.2f} GPU",
+                "absolute": self._absolute_metric(
+                    last.gpu, gpu_capacity, "GPU"
+                ),
             },
             {
                 "label": "VRAM", "values": [point.vram for point in points],
-                "current": last.vram, "capacity": row.gpu_memory_total_gib, "unit": "GiB",
+                "current": last.vram, "capacity": vram_capacity, "unit": "GiB",
                 "sample_period": 1,
-                "absolute": "—" if last.vram is None else
-                    f"{_short_memory(row.gpu_memory_used_gib)} / {_short_memory(row.gpu_memory_total_gib)}",
+                "absolute": self._absolute_metric(
+                    last.vram, vram_capacity, "GiB"
+                ),
             },
             {
                 "label": "CPU", "values": [point.cpu for point in points],
-                "current": last.cpu, "capacity": row.cpu_requested, "unit": "vCPU",
+                "current": last.cpu, "capacity": cpu_capacity, "unit": "vCPU",
                 "sample_period": int(KUBERNETES_USAGE_SECONDS),
-                "absolute": "—" if last.cpu is None else
-                    f"{_short_cpu(row.cpu_used)} / {_short_cpu(row.cpu_requested)} vCPU",
+                "absolute": self._absolute_metric(
+                    last.cpu, cpu_capacity, "vCPU"
+                ),
             },
             {
                 "label": "RAM", "values": [point.ram for point in points],
-                "current": last.ram, "capacity": row.memory_requested_gib, "unit": "GiB",
+                "current": last.ram, "capacity": ram_capacity, "unit": "GiB",
                 "sample_period": int(KUBERNETES_USAGE_SECONDS),
-                "absolute": "—" if last.ram is None else
-                    f"{_short_memory(row.memory_used_gib)} / {_short_memory(row.memory_requested_gib)}",
+                "absolute": self._absolute_metric(
+                    last.ram, ram_capacity, "GiB"
+                ),
             },
         ]
 
@@ -1451,15 +1520,15 @@ class FalconDashboard(App):
         if self.state.expanded_pane == "resources":
             self._render_expanded_resources(target, row, points)
             return
+        metrics = self._resource_metrics(row, points)
         cells = [
-            self._metric_cell("GPU", last.gpu, [p.gpu for p in points],
-                              "—" if row.gpu_count == 0 else f"{(last.gpu or 0) * row.gpu_count / 100:.2f} / {row.gpu_count:.2f} GPU"),
-            self._metric_cell("VRAM", last.vram, [p.vram for p in points],
-                              f"{_short_memory(row.gpu_memory_used_gib)} / {_short_memory(row.gpu_memory_total_gib)}"),
-            self._metric_cell("CPU", last.cpu, [p.cpu for p in points],
-                              f"{_short_cpu(row.cpu_used)} / {_short_cpu(row.cpu_requested)} vCPU"),
-            self._metric_cell("RAM", last.ram, [p.ram for p in points],
-                              f"{_short_memory(row.memory_used_gib)} / {_short_memory(row.memory_requested_gib)}"),
+            self._metric_cell(
+                metric["label"],
+                metric["current"],
+                metric["values"],
+                metric["absolute"],
+            )
+            for metric in metrics
         ]
         table = Table(box=None, expand=True, padding=(0, 1), show_header=False)
         columns = 2 if self.size.width < 90 else 4
@@ -1638,7 +1707,10 @@ class FalconDashboard(App):
             self.notify(f"{pane.title()} pane is hidden · press v to configure panes")
             return
         self.state.focused_pane = pane
-        self.query_one(f"#{pane}-pane", DashboardPane).focus()
+        self.set_focus(
+            self.query_one(f"#{pane}-pane", DashboardPane),
+            scroll_visible=False,
+        )
         self._set_titles()
         self._render_footer()
 

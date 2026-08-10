@@ -42,14 +42,14 @@
     "dashboard-search": "d77b90dddbee33f85b705c26103ae7eb3ba9af17b1e3e75470071ddd02402eb1",
     "dashboard-selected-job": "4bfe8edd57feeac7e1ac8791a2c967b04b343b2e3d3ba65aca1d7a096b181888",
     "dashboard-stale": "cb68a3dcfe52349bc02cdd62842ef8ec069d656eecac088fb6ce572c1d6cf48f",
-    "resources-140x32": "f39f5640a97c064fcba715687e94cf0dd19dd309f952aa48b6d7931dddaeb5de",
-    "resources-200x50": "8a0b7518b18f877fdccb0a8cea14db5df2f426be782e412d49608a5b81e1ded5",
-    "resources-80x22": "59a77e75f578f3dc817d7850b07f506e1f1ad0a2c7963219dd9e4d0b39833c82",
-    "resources-asset": "fec142a0b785e4817ee114ebaeeca4680a5163c90fa0b7f5e598962b8df7795f",
-    "resources-no-jobs": "0f407dbf3e4a597fa67d190817348e591d7f2ffc552f5c5effb37d620fc70dd9",
+    "resources-140x32": "dcca49a099aa1e611372aaac0c18ce29c119fdc5f43f7d97ef42e964398d9d21",
+    "resources-200x50": "a3d86bf2c60399736d1bb6ed0c8b1a63a4d041c67a9974f06b0f2720c9f35736",
+    "resources-80x22": "28e7338fff9cf9341c4a4326c4f68ae66ec363e86ebd91beb7cd4dc25e9ca45d",
+    "resources-asset": "89f734b84fba21eaf2fb81776353f36646e794dd8a4b9203d538bc88103fdfbd",
+    "resources-no-jobs": "f6577693d78ae14ff63714f0898daf9d6c6e9096286f1746dee0b1375484af99",
     "resources-node-expanded-140x40": "422edb355d0219c32c76b02588f71cb0d6e0dfaceeab1a5ae64b65ca7e768c27",
     "resources-node-expanded-80x22": "2bbeda34871a0dc8281155f2f02db6da92217424909056aaceb979e523ae7529",
-    "resources-stale": "df0911c7dd09e87de44452415e135330ff4b9989417dec4016de4926f5dedd7d"
+    "resources-stale": "1186d2ae09f24c84846bc6a39e99d7b22d47f865ba6ef1bd7353de8a6c070115"
   },
   "textual": "7.x"
 }
