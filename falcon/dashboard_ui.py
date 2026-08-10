@@ -828,6 +828,15 @@ class FalconDashboard(App):
 
     def _record_history(self) -> None:
         for row in self.rows:
+            history = self.histories.setdefault(row.uid, deque(maxlen=600))
+            # A terminal Pod has no current allocation to sample.  If this
+            # dashboard observed the Job while it was active, keep its last
+            # captured live series as the final sample; otherwise do not let
+            # a backend's partial/stale terminal values create a GPU-only or
+            # CPU-only history.  GPU utilization, VRAM, CPU, and RAM therefore
+            # have identical completed-job semantics.
+            if row.status in {"Succeeded", "Failed"}:
+                continue
             values = (
                 row.gpu_util if row.gpu_metrics_available else None,
                 row.gpu_memory_percent,
@@ -835,14 +844,6 @@ class FalconDashboard(App):
                 row.memory_percent,
             )
             if not any(value is not None for value in values):
-                continue
-            history = self.histories.setdefault(row.uid, deque(maxlen=600))
-            # Completed Jobs have no new live telemetry. Some metrics backends
-            # retain their last GPU sample, which previously caused that same
-            # value to be appended every second until it filled the history.
-            # Freeze an existing series at its final live sample so moving the
-            # history cursor immediately reveals the preceding value.
-            if row.status in {"Succeeded", "Failed"} and history:
                 continue
             history.append(
                 MetricPoint(

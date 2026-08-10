@@ -102,6 +102,29 @@ def _seed_resources_history(app: FalconResourcesApp) -> None:
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_job_does_not_create_partial_resource_history(self) -> None:
+        collector = DemoUsageCollector("mixed")
+        app = FalconDashboard(collector, refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            row = next(item for item in app.rows if item.status == "Succeeded")
+            app.histories.pop(row.uid, None)
+            terminal_with_stale_gpu = replace(
+                row,
+                gpu_util=65.0,
+                gpu_metrics_available=True,
+                gpu_memory_used_gib=24.0,
+                gpu_memory_total_gib=80.0,
+            )
+            app.rows = [terminal_with_stale_gpu]
+            app._record_history()
+
+            self.assertEqual(list(app.histories[row.uid]), [])
+            self.assertIsNone(terminal_with_stale_gpu.cpu_percent)
+            self.assertIsNone(terminal_with_stale_gpu.memory_percent)
+            self.assertIsNotNone(terminal_with_stale_gpu.gpu_util)
+            self.assertIsNotNone(terminal_with_stale_gpu.gpu_memory_percent)
+
     async def test_completed_job_history_changes_the_rendered_gpu_value(self) -> None:
         collector = DemoUsageCollector("mixed")
         app = FalconDashboard(collector, refresh_seconds=999)
