@@ -34,6 +34,7 @@ from .config import (
     load_config,
     logname,
     run_setup,
+    save_resources_view,
 )
 from .dashboard import UsageCollector, run_dashboard
 from .demo import DemoCollector
@@ -1120,6 +1121,7 @@ def _resource_snapshot(
 def _resources_command(
     args: argparse.Namespace,
     config: Mapping[str, Any],
+    config_file: Optional[str] = None,
 ) -> int:
     if not 1 <= args.limit <= 500:
         raise CliError("--limit must be between 1 and 500")
@@ -1131,6 +1133,10 @@ def _resources_command(
             collector,
             node_filter=args.node,
             gpu_filter=args.gpu,
+            initial_view=str(
+                config.get("resources", {}).get("last_view", "nodes")
+            ),
+            persist_view=lambda view: save_resources_view(view, config_file),
         ).run(mouse=True)
         return 0
     nodes = list(snapshot.nodes)
@@ -1331,7 +1337,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             return 0
         if args.command_name == "resources":
-            return _resources_command(args, config)
+            return _resources_command(args, config, config_arg)
         if args.command_name == "setup":
             target, rc = run_setup(
                 config_arg,

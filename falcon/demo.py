@@ -593,14 +593,26 @@ def _mixed_workloads() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 def demo_inventory(state: str = "mixed") -> List[Dict[str, Any]]:
     """Return deterministic mixed Kubernetes objects.
 
-    Supported states are ``no-jobs``, ``one-job``, ``mixed``, ``many``, and
-    ``stale``.  ``stale`` uses the same last-known-good objects as ``mixed``;
-    the collector/snapshot carries the stale marker separately.
+    Supported states are ``no-jobs``, ``no-gpus``, ``one-job``, ``mixed``,
+    ``many``, and ``stale``. ``stale`` uses the same last-known-good objects
+    as ``mixed``; the collector/snapshot carries the stale marker separately.
     """
 
     normalized = state.lower().replace("_", "-")
-    if normalized not in {"no-jobs", "one-job", "mixed", "many", "stale"}:
+    if normalized not in {
+        "no-jobs",
+        "no-gpus",
+        "one-job",
+        "mixed",
+        "many",
+        "stale",
+    }:
         raise ValueError(f"unknown demo state: {state}")
+    if normalized == "no-gpus":
+        return [
+            _node("node-cpu-1", cpu="64", memory="256Gi"),
+            _node("node-cpu-2", cpu="64", memory="256Gi"),
+        ]
     nodes = demo_nodes()
     jobs, pods = _mixed_workloads()
     if normalized == "no-jobs":

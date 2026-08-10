@@ -20,7 +20,8 @@ os.environ.pop("NO_COLOR", None)
 
 from falcon.dashboard import DemoUsageCollector  # noqa: E402
 from falcon.dashboard_ui import FalconDashboard  # noqa: E402
-from falcon.demo import DemoCollector  # noqa: E402
+from falcon.demo import DEMO_NOW, DemoCollector  # noqa: E402
+from falcon.resources_charts import GPUHistoryPoint  # noqa: E402
 from falcon.resources_ui import FalconResourcesApp  # noqa: E402
 
 ARTIFACTS = ROOT / "artifacts" / "tui"
@@ -56,7 +57,10 @@ def digest(value: str) -> str:
 
 def write_svg(name: str, value: str) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    (ARTIFACTS / f"{name}.svg").write_text(value, encoding="utf-8")
+    (ARTIFACTS / f"{name}.svg").write_text(
+        normalize_svg(value),
+        encoding="utf-8",
+    )
 
 
 async def dashboard_capture(
@@ -106,7 +110,11 @@ async def resources_capture(
     async with app.run_test(size=size) as pilot:
         await pilot.pause(0.5)
         for action in actions:
-            await pilot.press(*str(action).split())
+            if callable(action):
+                action(app)
+                await pilot.pause()
+            else:
+                await pilot.press(*str(action).split())
         app._spinner = 0
         app._render_header()
         value = app.export_screenshot(
@@ -134,6 +142,35 @@ def filter_dialog(app: FalconDashboard) -> None:
 
 def action_dialog(app: FalconDashboard) -> None:
     app.action_kill()
+
+
+def seed_resources_history(app: FalconResourcesApp) -> None:
+    """Populate a deterministic since-launch window for visual review."""
+
+    namespaces = sorted(
+        {
+            consumer.namespace
+            for node in app._gpu_nodes()
+            if node.ready and node.schedulable
+            for consumer in node.consumers
+            if consumer.requested.gpu_count > 0
+        }
+    )
+    app.history = [
+        GPUHistoryPoint.from_mapping(
+            DEMO_NOW - (15 - index) * 5 * 60,
+            {
+                namespace: min(
+                    8,
+                    (index // (namespace_index + 2) + namespace_index)
+                    % 9,
+                )
+                for namespace_index, namespace in enumerate(namespaces)
+            },
+        )
+        for index in range(16)
+    ]
+    app._render_all()
 
 
 async def capture() -> None:
@@ -173,10 +210,51 @@ async def capture() -> None:
         ("resources-80x22", "mixed", (80, 22), ()),
         ("resources-140x32", "mixed", (140, 32), ()),
         ("resources-200x50", "mixed", (200, 50), ()),
+        ("resources-gpu-overview-80x22", "mixed", (80, 22), ("right",)),
+        ("resources-gpu-overview-140x32", "mixed", (140, 32), ("right",)),
+        ("resources-gpu-overview-200x50", "mixed", (200, 50), ("right",)),
+        (
+            "resources-gpu-allocations-80x22",
+            "mixed",
+            (80, 22),
+            (seed_resources_history, "right", "right"),
+        ),
+        (
+            "resources-gpu-allocations-140x32",
+            "mixed",
+            (140, 32),
+            (seed_resources_history, "right", "right"),
+        ),
+        (
+            "resources-gpu-allocations-200x50",
+            "mixed",
+            (200, 50),
+            (seed_resources_history, "right", "right"),
+        ),
+        (
+            "resources-gpu-allocations-vram-140x32",
+            "mixed",
+            (140, 32),
+            (seed_resources_history, "right", "right", "v"),
+        ),
         ("resources-node-expanded-80x22", "mixed", (80, 22), ("enter",)),
         ("resources-node-expanded-140x40", "mixed", (140, 40), ("enter",)),
         ("resources-stale", "stale", (120, 30), ()),
         ("resources-no-jobs", "no-jobs", (120, 30), ()),
+        ("resources-gpu-overview-stale", "stale", (140, 32), ("right",)),
+        (
+            "resources-gpu-allocations-stale",
+            "stale",
+            (140, 32),
+            (seed_resources_history, "right", "right"),
+        ),
+        ("resources-gpu-overview-no-gpus", "no-gpus", (140, 32), ("right",)),
+        (
+            "resources-gpu-allocations-no-gpus",
+            "no-gpus",
+            (140, 32),
+            ("right", "right"),
+        ),
     )
     for name, state, size, actions in resource_states:
         key, value = await resources_capture(
@@ -184,16 +262,30 @@ async def capture() -> None:
         )
         results[key] = value
 
-    # Keep the two README visuals on the same deterministic 140×32 canvas so
-    # their typography, gutters, and section borders can be compared directly.
+    # Keep the README visuals on the same deterministic 140×32 canvas so their
+    # typography, gutters, and section borders can be compared directly.
     dashboard_asset, dashboard_digest = await dashboard_capture(
         "dashboard-asset", state="mixed", size=(140, 32)
     )
     resources_asset, resources_digest = await resources_capture(
         "resources-asset", state="mixed", size=(140, 32)
     )
+    overview_asset, overview_digest = await resources_capture(
+        "resources-overview-asset",
+        state="mixed",
+        size=(140, 32),
+        actions=("right",),
+    )
+    allocations_asset, allocations_digest = await resources_capture(
+        "resources-allocations-asset",
+        state="mixed",
+        size=(140, 32),
+        actions=(seed_resources_history, "right", "right"),
+    )
     results[dashboard_asset] = dashboard_digest
     results[resources_asset] = resources_digest
+    results[overview_asset] = overview_digest
+    results[allocations_asset] = allocations_digest
 
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -214,6 +306,14 @@ async def capture() -> None:
     )
     (ASSETS / "falcon-resources.svg").write_text(
         (ARTIFACTS / "resources-asset.svg").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (ASSETS / "falcon-resources-overview.svg").write_text(
+        (ARTIFACTS / "resources-overview-asset.svg").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (ASSETS / "falcon-resources-allocations.svg").write_text(
+        (ARTIFACTS / "resources-allocations-asset.svg").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     print(

@@ -15,12 +15,19 @@ from unittest.mock import patch
 from falcon.cli import (
     EXIT_KUBERNETES,
     EXIT_USAGE,
+    _resources_command,
     _rewrite_shorthand,
     main,
     resolve_preset,
 )
 from falcon.completion import COMMAND_ALIASES, candidates, shell_script
-from falcon.config import DEFAULT_CONFIG, load_config, run_setup
+from falcon.config import (
+    DEFAULT_CONFIG,
+    load_config,
+    run_setup,
+    save_resources_view,
+    validate_config,
+)
 from falcon.demo import demo_cluster_snapshot, demo_inventory
 from falcon.kubernetes import KubernetesClient, KubernetesError
 
@@ -746,6 +753,44 @@ class InspectionCliTests(CliHarness):
         self.assertIn("27.5/64.0", stdout)
         self.assertNotIn("CPU requested", stdout)
 
+    def test_resources_tui_receives_restored_view_and_persistence_callback(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        collector = SimpleNamespace(collect=lambda force=False: snapshot)
+        captured = {}
+
+        class App:
+            def __init__(self, received_collector, **kwargs):
+                self.collector = received_collector
+                captured.update(kwargs)
+
+            def run(self, mouse=False):
+                captured["mouse"] = mouse
+
+        args = SimpleNamespace(
+            limit=100,
+            consumer_limit=100,
+            demo="mixed",
+            output="human",
+            node=None,
+            gpu=None,
+            namespace=None,
+        )
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+        config["resources"]["last_view"] = "gpu-overview"
+        with patch("falcon.cli.sys.stdout.isatty", return_value=True), patch(
+            "falcon.cli._resource_snapshot", return_value=(collector, snapshot)
+        ), patch("falcon.cli.FalconResourcesApp", App), patch(
+            "falcon.cli.save_resources_view"
+        ) as save:
+            code = _resources_command(args, config, "/tmp/falcon-test-config")
+            captured["persist_view"]("gpu-allocations")
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["initial_view"], "gpu-overview")
+        self.assertTrue(captured["mouse"])
+        save.assert_called_once_with(
+            "gpu-allocations", "/tmp/falcon-test-config"
+        )
+
     def test_resources_prefers_metrics_when_node_api_rbac_is_unavailable(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
 
@@ -984,6 +1029,40 @@ class InspectionCliTests(CliHarness):
 
 
 class SetupTests(unittest.TestCase):
+    def test_resources_view_default_validation_and_atomic_persistence(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["resources"]["last_view"], "nodes")
+        invalid = json.loads(json.dumps(DEFAULT_CONFIG))
+        invalid["resources"]["last_view"] = "utilization"
+        with self.assertRaisesRegex(ValueError, "resources.last_view"):
+            validate_config(invalid)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            run_setup(str(target), non_interactive=True, install_shell=False)
+            original = load_config(str(target))
+            saved = save_resources_view("gpu-allocations", str(target))
+            reloaded = load_config(str(target))
+            self.assertEqual(saved, target)
+            self.assertEqual(reloaded["resources"]["last_view"], "gpu-allocations")
+            self.assertEqual(
+                reloaded["resources"]["shared_memory_percent"],
+                original["resources"]["shared_memory_percent"],
+            )
+            self.assertEqual(list(target.parent.glob(".*.tmp")), [])
+
+        with self.assertRaisesRegex(ValueError, "resources.last_view"):
+            save_resources_view("not-a-view", "/tmp/unused-falcon-config")
+
+    def test_invalid_persisted_resources_view_falls_back_to_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            target.write_text(
+                "version: 1\nresources:\n  last_view: retired-preview\n",
+                encoding="utf-8",
+            )
+            config = load_config(str(target))
+        self.assertEqual(config["resources"]["last_view"], "nodes")
+
     def test_noninteractive_setup_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / ".falconrc"

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional, Sequence
 
 from rich import box
 from rich.align import Align
@@ -19,7 +21,22 @@ from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
-from .cluster import ClusterSnapshot, NodeSnapshot, natural_name_key
+from .cluster import (
+    ClusterSnapshot,
+    NodeSnapshot,
+    WorkloadConsumer,
+    is_system_consumer,
+    is_system_namespace,
+    natural_name_key,
+)
+from .resources_charts import (
+    HISTORY_LIMIT,
+    HISTORY_SECONDS,
+    GPUHistoryPoint,
+    render_gpu_history,
+    render_namespace_pie,
+)
+from .resources_telemetry import GpuTelemetrySnapshot, allocation_snapshot
 from .theme import (
     BACKGROUND,
     BORDER,
@@ -34,6 +51,31 @@ from .theme import (
     WHITE,
     YELLOW,
 )
+
+RESOURCE_VIEWS = ("nodes", "gpu-overview", "gpu-allocations")
+RESOURCE_VIEW_LABELS = {
+    "nodes": "Nodes",
+    "gpu-overview": "GPU Overview",
+    "gpu-allocations": "GPU Allocations",
+}
+
+
+def _valid_view(value: object) -> str:
+    normalized = str(value or "")
+    return normalized if normalized in RESOURCE_VIEWS else "nodes"
+
+
+def _eligible(node: NodeSnapshot) -> bool:
+    return node.ready is True and node.schedulable
+
+
+def _gpu_totals(nodes: Sequence[NodeSnapshot]) -> tuple[int, int, int, float]:
+    eligible = [node for node in nodes if _eligible(node)]
+    allocatable = sum(node.allocatable.gpu_count for node in eligible)
+    requested = sum(node.requested.gpu_count for node in eligible)
+    free = max(0, allocatable - requested)
+    pressure = requested / allocatable * 100 if allocatable else 0.0
+    return allocatable, requested, free, pressure
 
 
 def _short_cpu(value: float) -> str:
@@ -98,12 +140,29 @@ def _resource_headroom_color(free: float, allocatable: float) -> str:
 
 @dataclass
 class ResourcesViewState:
+    view: str = "nodes"
     selected_node: str = ""
     node_scroll: int = 0
     expanded: bool = False
     selected_consumer: int = 0
     consumer_scroll: int = 0
     active_pane: str = "nodes"
+    overview_scroll: int = 0
+    allocation_scroll: int = 0
+    namespace_basis: str = "gpu"
+    expanded_panels: dict[str, str] = field(
+        default_factory=lambda: {
+            "gpu-overview": "",
+            "gpu-allocations": "",
+        }
+    )
+    focused_panes: dict[str, str] = field(
+        default_factory=lambda: {
+            "nodes": "nodes",
+            "gpu-overview": "gpu-overview",
+            "gpu-allocations": "gpu-allocations",
+        }
+    )
 
 
 class ResourcesPane(Static):
@@ -148,6 +207,14 @@ class ResourcesPane(Static):
     def on_click(self, event: events.Click) -> None:
         self._activate()
         self.app.set_focus(self, scroll_visible=False)
+        if self.id == "gpu-overview-pane" or self.id == "gpu-allocations-pane":
+            callback = getattr(self.app, "gpu_panel_clicked", None)
+            if callback:
+                callback(
+                    self.id.replace("-pane", ""),
+                    event.get_content_offset(self),
+                )
+            return
         if self.id != "nodes-pane":
             return
         callback = getattr(self.app, "node_clicked", None)
@@ -155,10 +222,20 @@ class ResourcesPane(Static):
             callback(event.get_content_offset(self))
 
 
+class ResourcesViewSelector(Static):
+    """Clickable view labels; keyboard navigation remains available globally."""
+
+    def on_click(self, event: events.Click) -> None:
+        callback = getattr(self.app, "view_clicked", None)
+        if callback:
+            callback(event.get_content_offset(self).x)
+
+
 CSS = f"""
 Screen {{ background: {BACKGROUND}; color: {WHITE}; overflow: hidden; }}
 Static {{ background: {BACKGROUND}; }}
 #resources-header {{ height: 1; padding: 0 1; color: {WHITE}; }}
+#resources-views {{ height: 1; padding: 0 1; color: {GRAY}; }}
 #cluster-overview {{ height: 2; border-bottom: solid {BORDER}; padding: 0 1; }}
 #resource-controls {{ height: 1; padding: 0 1; color: {GRAY}; }}
 ResourcesPane {{
@@ -170,6 +247,7 @@ ResourcesPane {{
 ResourcesPane:focus {{ border: solid {CYAN}; }}
 #nodes-pane {{ height: 1fr; min-height: 6; }}
 #node-pane {{ height: 9; min-height: 5; }}
+#gpu-overview-pane, #gpu-allocations-pane {{ height: 1fr; min-height: 8; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #resources-footer {{ height: 1; padding: 0 1; color: {GRAY}; }}
 """
@@ -179,10 +257,10 @@ class FalconResourcesApp(App[None]):
     """Keyboard-first realtime view of schedulable request headroom."""
 
     # The fixed sections surrounding the two resource panes are one header,
-    # two overview rows, one controls row, and one footer row.  The node
+    # one view selector, two overview rows, one controls row, and one footer. The node
     # table needs its top spacer, header, separator, and two pane borders. The
     # trailing Rich spacer can be clipped without hiding a data row.
-    _FIXED_LAYOUT_HEIGHT = 5
+    _FIXED_LAYOUT_HEIGHT = 6
     _NODE_TABLE_OVERHEAD = 5
     _DETAIL_MIN_HEIGHT = 5
 
@@ -200,8 +278,11 @@ class FalconResourcesApp(App[None]):
         Binding("pagedown", "page_down", "Page down", show=False),
         Binding("home", "home", "First", show=False),
         Binding("end", "end", "Last", show=False),
+        Binding("left", "previous_view", "Previous view", show=False),
+        Binding("right", "next_view", "Next view", show=False),
         Binding("enter", "expand", "Inspect"),
         Binding("escape", "collapse", "Back", show=False),
+        Binding("v", "toggle_namespace_basis", "GPU/VRAM", show=False),
         Binding("r", "refresh_data", "Refresh"),
     ]
 
@@ -213,6 +294,11 @@ class FalconResourcesApp(App[None]):
         node_filter: Optional[str] = None,
         gpu_filter: Optional[str] = None,
         clock: Optional[Callable[[ClusterSnapshot], str]] = None,
+        history_clock: Optional[Callable[[], float]] = None,
+        initial_view: str = "nodes",
+        persist_view: Optional[Callable[[str], object]] = None,
+        telemetry_collector=None,
+        telemetry_refresh_seconds: float = 5.0,
     ) -> None:
         super().__init__()
         self.collector = collector
@@ -220,31 +306,51 @@ class FalconResourcesApp(App[None]):
         self.node_filter = (node_filter or "").lower()
         self.gpu_filter = (gpu_filter or "").lower()
         self.clock = clock or self._snapshot_clock
-        self.state = ResourcesViewState()
+        self.history_clock = history_clock or time.time
+        view = _valid_view(initial_view)
+        self.state = ResourcesViewState(
+            view=view,
+            active_pane={
+                "nodes": "nodes",
+                "gpu-overview": "gpu-overview",
+                "gpu-allocations": "gpu-allocations",
+            }[view],
+        )
+        self.persist_view = persist_view
+        # Kept as a soft compatibility argument for callers of the preview
+        # API. Resource allocation data comes from ``collector`` itself.
+        del telemetry_collector, telemetry_refresh_seconds
         self.snapshot = ClusterSnapshot.empty()
         self.nodes: List[NodeSnapshot] = []
+        self.history: list[GPUHistoryPoint] = []
+        self.gpu_telemetry = GpuTelemetrySnapshot()
         self._refreshing = False
         self._results: "queue.Queue[ClusterSnapshot]" = queue.Queue(maxsize=1)
         self._last_terminal_size = (-1, -1)
         self._spinner = 0
         self._detail_auto_hidden = False
         self._layout_node_names: tuple[str, ...] = ()
+        self._last_telemetry_history_key: object = None
+        self._view_hitboxes: list[tuple[int, int, str]] = []
+        self._history_cache_key: object = None
+        self._history_cache: Optional[Text] = None
+        self._pie_cache_key: object = None
+        self._pie_cache: Optional[Text] = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="resources-header")
+        yield ResourcesViewSelector(id="resources-views")
         yield Static(id="cluster-overview")
         yield Static(id="resource-controls")
         yield ResourcesPane(id="nodes-pane")
         yield ResourcesPane(id="node-pane")
+        yield ResourcesPane(id="gpu-overview-pane")
+        yield ResourcesPane(id="gpu-allocations-pane")
         yield Static(id="resize-message")
         yield Static(id="resources-footer")
 
     def on_mount(self) -> None:
         self._set_titles()
-        self.set_focus(
-            self.query_one("#nodes-pane", ResourcesPane),
-            scroll_visible=False,
-        )
         self._apply_layout(recompute_detail=True)
         self._request_update(force=True)
         self.set_interval(self.refresh_seconds, self._request_update)
@@ -290,9 +396,15 @@ class FalconResourcesApp(App[None]):
             return
 
     def pane_focused(self, pane: str) -> None:
-        if pane not in {"nodes", "node"}:
+        valid = {
+            "nodes": {"nodes", "node"},
+            "gpu-overview": {"gpu-overview"},
+            "gpu-allocations": {"gpu-allocations"},
+        }
+        if pane not in valid[self.state.view]:
             return
         self.state.active_pane = pane
+        self.state.focused_panes[self.state.view] = pane
         self._set_titles()
 
     def watch_app_focus(self, focused: bool) -> None:
@@ -302,9 +414,88 @@ class FalconResourcesApp(App[None]):
             return
         try:
             self._set_titles()
-            self._render_nodes()
+            if self.state.view == "nodes":
+                self._render_nodes()
         except NoMatches:
             return
+
+    def view_clicked(self, x: int) -> None:
+        for start, end, view in self._view_hitboxes:
+            if start <= x < end:
+                self._switch_view(view)
+                return
+
+    def gpu_panel_clicked(self, view: str, offset) -> None:
+        """Expand the Rich panel under a mouse click."""
+
+        if view not in self.state.expanded_panels or offset is None:
+            return
+        x, y = max(0, int(offset.x)), max(0, int(offset.y))
+        panel = ""
+        if view == "gpu-overview":
+            pane = self.query_one("#gpu-overview-pane")
+            summary_height = 3 if self.size.width < 120 else 5
+            if y < summary_height:
+                panel = "summary"
+            elif x < max(1, pane.content_size.width // 2):
+                panel = "free"
+            else:
+                panel = "pressure"
+        else:
+            history_height, _ = self._allocation_layout()
+            if y < history_height:
+                panel = "history"
+            else:
+                pane = self.query_one("#gpu-allocations-pane")
+                namespace_width = max(
+                    22,
+                    round(
+                        pane.content_size.width
+                        * (0.42 if self.size.width >= 120 else 0.38)
+                    ),
+                )
+                panel = "pie" if x < namespace_width else "pods"
+        current = self.state.expanded_panels[view]
+        self.state.expanded_panels[view] = "" if current == panel else panel
+        self._render_all()
+
+    def _switch_view(self, view: str) -> None:
+        view = _valid_view(view)
+        if view == self.state.view:
+            return
+        self.state.focused_panes[self.state.view] = self.state.active_pane
+        self.state.view = view
+        self.state.active_pane = self.state.focused_panes[view]
+        self._apply_layout(recompute_detail=False)
+        # Page geometry is committed on the next refresh. Render only shared
+        # chrome now so charts are not built once at stale hidden dimensions
+        # and immediately rebuilt at their real size.
+        self._set_titles()
+        self._render_header()
+        self._render_views()
+        self._render_footer()
+        self.call_after_refresh(self._finish_view_switch)
+        if self.persist_view is not None:
+            try:
+                self.persist_view(view)
+            except Exception as exc:
+                self.notify(
+                    f"Could not save Resources view: {exc}",
+                    severity="warning",
+                    timeout=4,
+                )
+
+    def _finish_view_switch(self) -> None:
+        self._ensure_visible()
+        self._render_all()
+
+    def action_previous_view(self) -> None:
+        index = RESOURCE_VIEWS.index(self.state.view)
+        self._switch_view(RESOURCE_VIEWS[(index - 1) % len(RESOURCE_VIEWS)])
+
+    def action_next_view(self) -> None:
+        index = RESOURCE_VIEWS.index(self.state.view)
+        self._switch_view(RESOURCE_VIEWS[(index + 1) % len(RESOURCE_VIEWS)])
 
     @staticmethod
     def _snapshot_clock(snapshot: ClusterSnapshot) -> str:
@@ -368,6 +559,17 @@ class FalconResourcesApp(App[None]):
             ]
         previous_names = self._layout_node_names
         self.nodes = nodes
+        # The resource collector already runs in the background against the
+        # configured local metrics endpoint. Derive both selectable usage
+        # bases from every fresh allocation snapshot, even while this page is
+        # hidden.
+        self.gpu_telemetry = allocation_snapshot(
+            self.nodes,
+            collected_at=snapshot.collected_at,
+            stale=snapshot.stale,
+            error=snapshot.error or "",
+        )
+        self._record_gpu_history(self.gpu_telemetry)
         current_names = tuple(node.name for node in nodes)
         names = {node.name for node in nodes}
         if self.state.selected_node not in names:
@@ -395,6 +597,44 @@ class FalconResourcesApp(App[None]):
             self._render_all()
         except NoMatches:
             return
+
+    def _gpu_nodes(self) -> list[NodeSnapshot]:
+        return [
+            node
+            for node in self.nodes
+            if (
+                node.capacity.gpu_count
+                or node.allocatable.gpu_count
+                or node.requested.gpu_count
+                or node.gpu_model
+            )
+        ]
+
+    def _record_gpu_history(self, telemetry: GpuTelemetrySnapshot) -> None:
+        """Append one point per fresh allocation snapshot and prune the window."""
+
+        if telemetry.stale or not telemetry.sampled_pods:
+            return
+        identity = (telemetry.collected_at, telemetry.effective_gpus_by_namespace)
+        if identity == self._last_telemetry_history_key:
+            return
+        self._last_telemetry_history_key = identity
+        values = dict(telemetry.effective_gpus_by_namespace)
+        if not values:
+            return
+        timestamp = float(telemetry.collected_at)
+        if timestamp <= 0:
+            return
+        # Test and adapter collectors may use monotonic cache timestamps.
+        if timestamp < 946_684_800:  # 2000-01-01 UTC
+            timestamp = float(self.history_clock())
+        self.history.append(GPUHistoryPoint.from_mapping(timestamp, values))
+        self.history.sort(key=lambda point: point.timestamp)
+        newest = self.history[-1].timestamp
+        cutoff = newest - HISTORY_SECONDS
+        self.history = [point for point in self.history if point.timestamp >= cutoff]
+        if len(self.history) > HISTORY_LIMIT:
+            self.history = self.history[-HISTORY_LIMIT:]
 
     def _selected(self) -> Optional[NodeSnapshot]:
         return next(
@@ -458,6 +698,20 @@ class FalconResourcesApp(App[None]):
     def _ensure_visible(self) -> None:
         if not self.is_mounted:
             return
+        if self.state.view == "gpu-overview":
+            visible = self._overview_visible_rows()
+            self.state.overview_scroll = min(
+                max(0, len(self._gpu_nodes()) - visible),
+                max(0, self.state.overview_scroll),
+            )
+            return
+        if self.state.view == "gpu-allocations":
+            visible = self._allocation_visible_rows()
+            self.state.allocation_scroll = min(
+                max(0, len(self._gpu_consumers()) - visible),
+                max(0, self.state.allocation_scroll),
+            )
+            return
         index = self._selected_index()
         count = self._visible_nodes()
         if index < self.state.node_scroll:
@@ -485,26 +739,69 @@ class FalconResourcesApp(App[None]):
             max(0, self.state.consumer_scroll),
         )
 
+    def _overview_visible_rows(self) -> int:
+        pane = self.query_one("#gpu-overview-pane")
+        summary_height = 3 if self.size.width < 120 else 5
+        return max(1, pane.content_size.height - summary_height - 2)
+
+    def _allocation_layout(self) -> tuple[int, int]:
+        pane = self.query_one("#gpu-allocations-pane")
+        content_height = max(10, pane.content_size.height)
+        history_height = max(7, min(16, round(content_height * 0.46)))
+        if self.size.width < 100:
+            # The namespace legend can contain six visible teams plus Other
+            # and System/hidden. Reserve all eight rows at the 80×22 minimum.
+            history_height = min(
+                history_height,
+                max(7, content_height - 10),
+            )
+        return history_height, max(5, content_height - history_height)
+
+    def _allocation_visible_rows(self) -> int:
+        if self.state.expanded_panels["gpu-allocations"] == "pods":
+            pane = self.query_one("#gpu-allocations-pane")
+            return max(1, pane.content_size.height - 5)
+        _, bottom_height = self._allocation_layout()
+        return max(1, bottom_height - 5)
+
     def _apply_layout(self, *, recompute_detail: bool = False) -> None:
         if not self.is_mounted:
             return
         small = self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT
         resize = self.query_one("#resize-message")
         ids = (
-            "cluster-overview", "resource-controls", "nodes-pane", "node-pane"
+            "cluster-overview",
+            "resource-controls",
+            "nodes-pane",
+            "node-pane",
+            "gpu-overview-pane",
+            "gpu-allocations-pane",
         )
         if small:
             for identifier in ids:
                 self.query_one(f"#{identifier}").display = False
+            self.query_one("#resources-views").display = False
             resize.display = True
             resize.update(
                 f"Falcon Resources requires at least "
                 f"{MINIMUM_WIDTH}×{MINIMUM_HEIGHT}.\n"
                 f"Current terminal: {self.size.width}×{self.size.height}.\n\n"
-                "Resize to inspect nodes and resource consumers."
+                "Resize to inspect cluster resources."
             )
             return
         resize.display = False
+        self.query_one("#resources-views").display = True
+        for identifier in ids:
+            self.query_one(f"#{identifier}").display = False
+        if self.state.view != "nodes":
+            identifier = f"{self.state.view}-pane"
+            target = self.query_one(f"#{identifier}", ResourcesPane)
+            target.display = True
+            target.styles.height = "1fr"
+            self.state.active_pane = self.state.focused_panes[self.state.view]
+            if self.app_focus and self.focused is not target:
+                self.set_focus(target, scroll_visible=False)
+            return
         if self.state.expanded:
             self._detail_auto_hidden = False
             self._layout_node_names = tuple(node.name for node in self.nodes)
@@ -580,10 +877,33 @@ class FalconResourcesApp(App[None]):
             left + " " * gap + right
         )
 
+    def _render_views(self) -> None:
+        target = self.query_one("#resources-views", ResourcesViewSelector)
+        available = max(1, self.size.width - 2)
+        labels = [RESOURCE_VIEW_LABELS[view] for view in RESOURCE_VIEWS]
+        total_width = sum(len(label) + 2 for label in labels) + 3 * (len(labels) - 1)
+        offset = max(0, (available - total_width) // 2)
+        line = Text(" " * offset)
+        hitboxes: list[tuple[int, int, str]] = []
+        for index, view in enumerate(RESOURCE_VIEWS):
+            if index:
+                line.append(" · ", style=BORDER)
+            start = len(line.plain)
+            label = f" {RESOURCE_VIEW_LABELS[view]} "
+            line.append(
+                label,
+                style=(f"bold {BACKGROUND} on {CYAN}" if view == self.state.view else GRAY),
+            )
+            hitboxes.append((start, start + len(label), view))
+        self._view_hitboxes = hitboxes
+        target.update(line)
+
     def _set_titles(self) -> None:
         titles = {
             "nodes": ("nodes-pane", "NODES"),
             "node": ("node-pane", "SELECTED NODE"),
+            "gpu-overview": ("gpu-overview-pane", "GPU OVERVIEW"),
+            "gpu-allocations": ("gpu-allocations-pane", "GPU ALLOCATIONS"),
         }
         for pane, (identifier, base) in titles.items():
             self.query_one(f"#{identifier}", ResourcesPane).border_title = (
@@ -591,7 +911,13 @@ class FalconResourcesApp(App[None]):
             )
 
     def _render_overview(self) -> None:
-        snapshot = self.snapshot
+        snapshot = ClusterSnapshot(
+            nodes=tuple(self.nodes),
+            jobs=self.snapshot.jobs,
+            collected_at=self.snapshot.collected_at,
+            stale=self.snapshot.stale,
+            error=self.snapshot.error,
+        )
         headroom = snapshot.request_headroom
         text = Text(no_wrap=True, overflow="ellipsis")
         text.append(
@@ -664,6 +990,493 @@ class FalconResourcesApp(App[None]):
                 style=GRAY,
             )
         )
+
+    @staticmethod
+    def _gpu_bar(
+        node: NodeSnapshot,
+        *,
+        width: int,
+        pressure: bool,
+    ) -> Text:
+        allocatable = max(0, node.allocatable.gpu_count)
+        requested = max(0, node.requested.gpu_count)
+        free = max(0, allocatable - requested)
+        eligible = _eligible(node)
+        value = requested if pressure else free
+        ratio = (
+            min(1.0, value / allocatable)
+            if eligible and allocatable
+            else 0.0
+        )
+        suffix = (
+            f"{requested}/{allocatable}"
+            if pressure
+            else f"{free}/{allocatable}"
+        )
+        if not eligible:
+            suffix = "excluded"
+        label_width = max(8, min(24, width // 3))
+        bar_width = max(3, width - label_width - len(suffix) - 4)
+        label = f"{node.name} · {node.gpu_model or 'GPU'}"
+        label = _truncate(label, label_width).ljust(label_width)
+        filled = min(bar_width, round(ratio * bar_width))
+        color = _gpu_headroom_color(free, allocatable) if eligible else RED
+        line = Text()
+        line.append(label, style=WHITE if eligible else MUTED)
+        line.append("  ")
+        line.append("█" * filled, style=color)
+        line.append("·" * (bar_width - filled), style=BORDER)
+        line.append(f"  {suffix}", style=color if eligible else RED)
+        return line
+
+    def _gpu_summary(self, *, width: int, height: int):
+        allocatable, requested, free, pressure = _gpu_totals(self._gpu_nodes())
+        color = _gpu_headroom_color(free, allocatable)
+        if self.size.width < 120:
+            line = Text(justify="center")
+            values = (
+                ("ALLOCATABLE", str(allocatable), CYAN),
+                ("REQUESTED", str(requested), color),
+                ("FREE", str(free), color),
+                ("PRESSURE", f"{pressure:.0f}%", color),
+            )
+            for index, (label, value, value_color) in enumerate(values):
+                if index:
+                    line.append("   ", style=BORDER)
+                line.append(f"{label} ", style=GRAY)
+                line.append(value, style=f"bold {value_color}")
+            return Panel(line, box=box.SQUARE, border_style=BORDER, height=height)
+
+        cards = Table.grid(expand=True, padding=(0, 1))
+        for _ in range(4):
+            cards.add_column(ratio=1)
+        card_values = (
+            ("ALLOCATABLE GPUS", str(allocatable), CYAN),
+            ("REQUESTED NOW", str(requested), color),
+            ("FREE GPUS", str(free), color),
+            ("REQUEST PRESSURE", f"{pressure:.1f}%", color),
+        )
+        cards.add_row(
+            *(
+                Panel(
+                    Align.center(Text(value, style=f"bold {value_color}"), vertical="middle"),
+                    title=Text(f" {label} ", style=f"bold {GRAY}"),
+                    box=box.SQUARE,
+                    border_style=BORDER,
+                    height=height,
+                )
+                for label, value, value_color in card_values
+            )
+        )
+        return cards
+
+    def _render_gpu_overview(self) -> None:
+        target = self.query_one("#gpu-overview-pane", ResourcesPane)
+        width = max(20, target.content_size.width)
+        height = max(8, target.content_size.height)
+        expanded = self.state.expanded_panels["gpu-overview"]
+        summary_height = 3 if self.size.width < 120 else 5
+        if expanded:
+            if expanded == "summary":
+                target.border_subtitle = " click panel to restore · Esc restore "
+                target.update(
+                    Panel(
+                        self._gpu_summary(width=width, height=max(5, height - 2)),
+                        title=Text(" GPU SUMMARY ", style=f"bold {CYAN_2}"),
+                        box=box.SQUARE,
+                        border_style=BORDER,
+                        height=height,
+                    )
+                )
+                return
+            nodes = self._gpu_nodes()
+            visible = max(1, height - 3)
+            start = self.state.overview_scroll
+            shown = nodes[start : start + visible]
+            lines = Text()
+            if shown:
+                for index, node in enumerate(shown):
+                    lines.append_text(
+                        self._gpu_bar(
+                            node,
+                            width=max(12, width - 6),
+                            pressure=expanded == "pressure",
+                        )
+                    )
+                    if index != len(shown) - 1:
+                        lines.append("\n")
+            else:
+                lines.append("No GPU nodes match the active filters.", style=MUTED)
+            title = (
+                " FREE GPUS PER NODE "
+                if expanded == "free"
+                else " GPU REQUEST PRESSURE PER NODE "
+            )
+            target.border_subtitle = " click panel to restore · Esc restore "
+            target.update(
+                Panel(
+                    lines,
+                    title=Text(title, style=f"bold {CYAN_2}"),
+                    box=box.SQUARE,
+                    border_style=BORDER,
+                    height=height,
+                )
+            )
+            return
+        bars_height = max(5, height - summary_height)
+        visible = self._overview_visible_rows()
+        nodes = self._gpu_nodes()
+        start = self.state.overview_scroll
+        shown = nodes[start : start + visible]
+        column_width = max(12, (width - 3) // 2)
+        free_lines = Text()
+        pressure_lines = Text()
+        if shown:
+            for index, node in enumerate(shown):
+                free_lines.append_text(
+                    self._gpu_bar(node, width=column_width - 4, pressure=False)
+                )
+                pressure_lines.append_text(
+                    self._gpu_bar(node, width=column_width - 4, pressure=True)
+                )
+                if index != len(shown) - 1:
+                    free_lines.append("\n")
+                    pressure_lines.append("\n")
+        else:
+            message = "No GPU nodes match the active filters."
+            free_lines.append(message, style=MUTED)
+            pressure_lines.append(message, style=MUTED)
+        bars = Table.grid(expand=True, padding=(0, 1))
+        bars.add_column(ratio=1)
+        bars.add_column(ratio=1)
+        bars.add_row(
+            Panel(
+                free_lines,
+                title=Text(" FREE GPUS PER NODE ", style=f"bold {CYAN_2}"),
+                box=box.SQUARE,
+                border_style=BORDER,
+                height=bars_height,
+            ),
+            Panel(
+                pressure_lines,
+                title=Text(" GPU REQUEST PRESSURE PER NODE ", style=f"bold {CYAN_2}"),
+                box=box.SQUARE,
+                border_style=BORDER,
+                height=bars_height,
+            ),
+        )
+        content = Table.grid(expand=True)
+        content.add_column()
+        content.add_row(self._gpu_summary(width=width, height=summary_height))
+        content.add_row(bars)
+        end = min(len(nodes), start + visible)
+        excluded = sum(not _eligible(node) for node in nodes)
+        subtitle = ""
+        if len(nodes) > visible:
+            subtitle += f" nodes {start + 1}-{end}/{len(nodes)} "
+        if excluded:
+            subtitle += f" · {excluded} excluded from totals "
+        target.border_subtitle = subtitle
+        target.update(content)
+
+    def _gpu_consumers(self) -> list[WorkloadConsumer]:
+        consumers = [
+            consumer
+            for node in self._gpu_nodes()
+            if _eligible(node)
+            for consumer in node.consumers
+            if consumer.requested.gpu_count > 0 and not is_system_consumer(consumer)
+        ]
+        return sorted(
+            consumers,
+            key=lambda consumer: (
+                -consumer.requested.gpu_count,
+                consumer.namespace.casefold(),
+                natural_name_key(consumer.node_name),
+                consumer.pod_name.casefold(),
+            ),
+        )
+
+    def _namespace_categories(self) -> tuple[tuple[str, float], ...]:
+        source = (
+            self.gpu_telemetry.vram_gib_by_namespace
+            if self.state.namespace_basis == "vram"
+            else self.gpu_telemetry.effective_gpus_by_namespace
+        )
+        visible: defaultdict[str, float] = defaultdict(float)
+        hidden = 0.0
+        for namespace, value in source:
+            if is_system_namespace(namespace):
+                hidden += value
+            else:
+                visible[namespace] += value
+        ordered = sorted(visible.items(), key=lambda item: (-item[1], item[0].casefold()))
+        categories = list(ordered[:6])
+        other = sum(value for _, value in ordered[6:])
+        if other:
+            categories.append(("Other", other))
+        if hidden:
+            categories.append(("System/hidden", hidden))
+        return tuple(categories)
+
+    def _telemetry_empty_label(self, basis: str) -> str:
+        if not self.gpu_telemetry.target_pods:
+            return "No running GPU Pods"
+        if self.gpu_telemetry.stale:
+            return (
+                "VRAM telemetry unavailable"
+                if basis == "vram"
+                else "GPU telemetry unavailable"
+            )
+        if not self.gpu_telemetry.sampled_pods:
+            return "No GPU allocations"
+        if basis == "vram" and not self.gpu_telemetry.vram_gib_by_namespace:
+            return "VRAM allocation unavailable"
+        return (
+            "No VRAM allocation"
+            if basis == "vram"
+            else "No GPU allocation"
+        )
+
+    def _gpu_pod_table(self) -> Table:
+        width = self.size.width
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            padding=(0, 1),
+            collapse_padding=True,
+            header_style=f"bold {CYAN_2}",
+        )
+        narrow = width < 100
+        table.add_column(
+            "NS" if narrow else "NAMESPACE",
+            ratio=1,
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+        table.add_column(
+            "NODE",
+            width=6 if narrow else 10,
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+        table.add_column("POD", ratio=2, no_wrap=True, overflow="ellipsis")
+        table.add_column(
+            "GPU/#" if narrow else "GPU MODEL / COUNT",
+            width=7 if narrow else 17,
+            justify="right",
+            no_wrap=True,
+        )
+        consumers = self._gpu_consumers()
+        start = self.state.allocation_scroll
+        visible = self._allocation_visible_rows()
+        for consumer in consumers[start : start + visible]:
+            vector = consumer.requested
+            model = vector.gpu_model
+            if not model:
+                node = next(
+                    (candidate for candidate in self.nodes if candidate.name == consumer.node_name),
+                    None,
+                )
+                model = node.gpu_model if node else None
+            table.add_row(
+                Text(consumer.namespace, style=WHITE),
+                Text(consumer.node_name, style=GRAY),
+                Text(consumer.pod_name, style=WHITE),
+                Text(
+                    (
+                        f"{model or 'GPU'}×{vector.gpu_count}"
+                        if narrow
+                        else f"{model or 'GPU'} ×{vector.gpu_count}"
+                    ),
+                    style=CYAN,
+                ),
+            )
+        if not consumers:
+            table.add_row(Text("No active GPU-requesting Pods", style=MUTED))
+        return table
+
+    def _render_gpu_allocations(self) -> None:
+        target = self.query_one("#gpu-allocations-pane", ResourcesPane)
+        width = max(20, target.content_size.width)
+        expanded = self.state.expanded_panels["gpu-allocations"]
+        if expanded:
+            height = max(8, target.content_size.height)
+            target.border_subtitle = " click panel to restore · Esc restore "
+            if expanded == "history":
+                history_key = ("expanded", tuple(self.history), width, height)
+                if (
+                    history_key != self._history_cache_key
+                    or self._history_cache is None
+                ):
+                    self._history_cache_key = history_key
+                    self._history_cache = render_gpu_history(
+                        self.history,
+                        width=max(18, width - 4),
+                        height=max(5, height - 2),
+                    )
+                target.update(
+                    Panel(
+                        self._history_cache,
+                        title=Text(
+                            " GPU ALLOCATION HISTORY · namespace · since launch ",
+                            style=f"bold {CYAN_2}",
+                        ),
+                        box=box.SQUARE,
+                        border_style=BORDER,
+                        height=height,
+                    )
+                )
+                return
+            if expanded == "pods":
+                target.update(
+                    Panel(
+                        self._gpu_pod_table(),
+                        title=Text(
+                            " GPU-REQUESTING PODS ",
+                            style=f"bold {CYAN_2}",
+                        ),
+                        box=box.SQUARE,
+                        border_style=BORDER,
+                        height=height,
+                    )
+                )
+                return
+            categories = self._namespace_categories()
+            basis = self.state.namespace_basis
+            unit = "G" if basis == "vram" else ""
+            pie_key = ("expanded", categories, basis, width, height)
+            if pie_key != self._pie_cache_key or self._pie_cache is None:
+                self._pie_cache_key = pie_key
+                self._pie_cache = render_namespace_pie(
+                    categories,
+                    width=max(16, width - 4),
+                    height=max(5, height - 2),
+                    unit=unit,
+                    empty_label=self._telemetry_empty_label(basis),
+                )
+            title = (
+                " VRAM ALLOCATION BY NAMESPACE "
+                if basis == "vram"
+                else " GPU COUNT ALLOCATION BY NAMESPACE "
+            )
+            target.update(
+                Panel(
+                    self._pie_cache,
+                    title=Text(title, style=f"bold {CYAN_2}"),
+                    box=box.SQUARE,
+                    border_style=BORDER,
+                    height=height,
+                )
+            )
+            return
+        history_height, bottom_height = self._allocation_layout()
+        history_key = (tuple(self.history), width, history_height)
+        if history_key != self._history_cache_key or self._history_cache is None:
+            self._history_cache_key = history_key
+            self._history_cache = render_gpu_history(
+                self.history,
+                width=max(18, width - 4),
+                height=max(5, history_height - 2),
+            )
+        history_panel = Panel(
+            self._history_cache,
+            title=Text(
+                " GPU ALLOCATION HISTORY · namespace · since launch (up to 24h) ",
+                style=f"bold {CYAN_2}",
+            ),
+            box=box.SQUARE,
+            border_style=BORDER,
+            height=history_height,
+        )
+
+        categories = self._namespace_categories()
+        namespace_width = max(22, round(width * (0.42 if width >= 120 else 0.38)))
+        basis = self.state.namespace_basis
+        unit = "G" if basis == "vram" else ""
+        empty_label = self._telemetry_empty_label(basis)
+        pie_key = (
+            categories,
+            basis,
+            empty_label,
+            namespace_width,
+            bottom_height,
+        )
+        if pie_key != self._pie_cache_key or self._pie_cache is None:
+            self._pie_cache_key = pie_key
+            self._pie_cache = render_namespace_pie(
+                categories,
+                width=max(16, namespace_width - 4),
+                height=max(5, bottom_height - 2),
+                unit=unit,
+                empty_label=empty_label,
+            )
+        bottom = Table.grid(expand=True, padding=(0, 1))
+        bottom.add_column(width=namespace_width)
+        bottom.add_column(ratio=1)
+        consumers = self._gpu_consumers()
+        visible_requests = sum(
+            consumer.requested.gpu_count for consumer in consumers
+        )
+        total_requested = _gpu_totals(self._gpu_nodes())[1]
+        hidden = max(0, total_requested - visible_requests)
+        bottom.add_row(
+            Panel(
+                self._pie_cache,
+                title=Text(
+                    (
+                        (
+                            " NAMESPACE VRAM ALLOC · v GPU count "
+                            if basis == "vram"
+                            else " NAMESPACE GPU ALLOC · v VRAM "
+                        )
+                        if self.size.width < 100
+                        else (
+                            " VRAM ALLOCATION BY NAMESPACE · v GPU count "
+                            if basis == "vram"
+                            else " GPU COUNT ALLOCATION BY NAMESPACE · v VRAM "
+                        )
+                    ),
+                    style=f"bold {CYAN_2}",
+                ),
+                subtitle=Text(
+                    (
+                        f" {self.gpu_telemetry.target_pods} Pods accounted "
+                        if self.gpu_telemetry.target_pods
+                        else " No GPU allocations "
+                    ),
+                    style=RED if self.gpu_telemetry.stale else GRAY,
+                ),
+                box=box.SQUARE,
+                border_style=BORDER,
+                height=bottom_height,
+            ),
+            Panel(
+                self._gpu_pod_table(),
+                title=Text(" GPU-REQUESTING PODS ", style=f"bold {CYAN_2}"),
+                subtitle=(
+                    Text(f" {visible_requests} visible + {hidden} system/hidden ", style=GRAY)
+                    if hidden
+                    else Text(f" {visible_requests} requested ", style=GRAY)
+                ),
+                box=box.SQUARE,
+                border_style=BORDER,
+                height=bottom_height,
+            ),
+        )
+        content = Table.grid(expand=True)
+        content.add_column()
+        content.add_row(history_panel)
+        content.add_row(bottom)
+        start = self.state.allocation_scroll
+        visible = self._allocation_visible_rows()
+        end = min(len(consumers), start + visible)
+        target.border_subtitle = (
+            f" Pods {start + 1}-{end}/{len(consumers)} "
+            if len(consumers) > visible
+            else ""
+        )
+        target.update(content)
 
     def _render_nodes(self) -> None:
         target = self.query_one("#nodes-pane", ResourcesPane)
@@ -1062,12 +1875,21 @@ class FalconResourcesApp(App[None]):
     def _render_footer(self) -> None:
         if self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT:
             value = "q Quit   r Retry"
+        elif self.state.view == "gpu-overview" and self.state.expanded_panels["gpu-overview"]:
+            value = "Esc restore panel   ←/→ Views   ↑/↓ Scroll   r Refresh   q Quit"
+        elif self.state.view == "gpu-overview":
+            value = "←/→ Views   ↑/↓ Scroll nodes   PgUp/PgDn Page   r Refresh   q Quit"
+        elif self.state.view == "gpu-allocations":
+            expanded_panel = self.state.expanded_panels["gpu-allocations"]
+            value = (
+                "Esc restore panels   " if expanded_panel else ""
+            ) + "←/→ Views   ↑/↓ Scroll Pods   v GPU/VRAM allocation pie   r Refresh   q Quit"
         elif self.state.expanded:
-            value = "↑/↓ Consumers   PgUp/PgDn Page   Home/End   Esc Nodes   r Refresh   q Quit"
+            value = "←/→ Views   ↑/↓ Consumers   PgUp/PgDn Page   Esc Nodes   r Refresh   q Quit"
         elif self.size.width < 100:
-            value = "↑/↓ Nodes   Enter Inspect   r Refresh   q Quit"
+            value = "←/→ Views   ↑/↓ Nodes   Enter Inspect   r Refresh   q Quit"
         else:
-            value = "↑/↓ Navigate nodes   PgUp/PgDn Page   Enter Inspect consumers   r Refresh   q Quit"
+            value = "←/→ Views   ↑/↓ Navigate nodes   Enter Inspect consumers   r Refresh   q Quit"
         self.query_one("#resources-footer", Static).update(Text(value, style=GRAY))
 
     def _render_all(self) -> None:
@@ -1075,10 +1897,17 @@ class FalconResourcesApp(App[None]):
             return
         self._set_titles()
         self._render_header()
-        self._render_overview()
-        self._render_controls()
-        self._render_nodes()
-        self._render_node()
+        self._render_views()
+        if self.size.width >= MINIMUM_WIDTH and self.size.height >= MINIMUM_HEIGHT:
+            if self.state.view == "nodes":
+                self._render_overview()
+                self._render_controls()
+                self._render_nodes()
+                self._render_node()
+            elif self.state.view == "gpu-overview":
+                self._render_gpu_overview()
+            else:
+                self._render_gpu_allocations()
         self._render_footer()
 
     def node_clicked(self, offset) -> None:
@@ -1098,6 +1927,22 @@ class FalconResourcesApp(App[None]):
             self._render_all()
 
     def _move(self, amount: int) -> None:
+        if self.state.view == "gpu-overview":
+            maximum = max(0, len(self._gpu_nodes()) - self._overview_visible_rows())
+            self.state.overview_scroll = min(
+                maximum,
+                max(0, self.state.overview_scroll + amount),
+            )
+            self._render_gpu_overview()
+            return
+        if self.state.view == "gpu-allocations":
+            maximum = max(0, len(self._gpu_consumers()) - self._allocation_visible_rows())
+            self.state.allocation_scroll = min(
+                maximum,
+                max(0, self.state.allocation_scroll + amount),
+            )
+            self._render_gpu_allocations()
+            return
         if self.state.expanded:
             node = self._selected()
             if node and node.visible_consumers:
@@ -1141,17 +1986,33 @@ class FalconResourcesApp(App[None]):
         self._render_node()
 
     def action_page_up(self) -> None:
+        if self.state.view == "gpu-overview":
+            self._move(-self._overview_visible_rows())
+            return
+        if self.state.view == "gpu-allocations":
+            self._move(-self._allocation_visible_rows())
+            return
         self._move(
             -(self._visible_consumers() if self.state.expanded else self._visible_nodes())
         )
 
     def action_page_down(self) -> None:
+        if self.state.view == "gpu-overview":
+            self._move(self._overview_visible_rows())
+            return
+        if self.state.view == "gpu-allocations":
+            self._move(self._allocation_visible_rows())
+            return
         self._move(
             self._visible_consumers() if self.state.expanded else self._visible_nodes()
         )
 
     def action_home(self) -> None:
-        if self.state.expanded:
+        if self.state.view == "gpu-overview":
+            self.state.overview_scroll = 0
+        elif self.state.view == "gpu-allocations":
+            self.state.allocation_scroll = 0
+        elif self.state.expanded:
             self.state.selected_consumer = 0
         elif self.nodes:
             self.state.selected_node = self.nodes[0].name
@@ -1159,7 +2020,15 @@ class FalconResourcesApp(App[None]):
         self._render_all()
 
     def action_end(self) -> None:
-        if self.state.expanded:
+        if self.state.view == "gpu-overview":
+            self.state.overview_scroll = max(
+                0, len(self._gpu_nodes()) - self._overview_visible_rows()
+            )
+        elif self.state.view == "gpu-allocations":
+            self.state.allocation_scroll = max(
+                0, len(self._gpu_consumers()) - self._allocation_visible_rows()
+            )
+        elif self.state.expanded:
             node = self._selected()
             self.state.selected_consumer = (
                 max(0, len(node.visible_consumers) - 1) if node else 0
@@ -1170,21 +2039,39 @@ class FalconResourcesApp(App[None]):
         self._render_all()
 
     def action_expand(self) -> None:
-        if self._selected() is None:
+        if self.state.view != "nodes" or self._selected() is None:
             return
         self.state.expanded = True
+        self.state.active_pane = "node"
+        self.state.focused_panes["nodes"] = "node"
         self._apply_layout(recompute_detail=True)
         self.call_after_refresh(self._render_all)
 
     def action_collapse(self) -> None:
-        if not self.state.expanded:
+        if self.state.view in self.state.expanded_panels:
+            if self.state.expanded_panels[self.state.view]:
+                self.state.expanded_panels[self.state.view] = ""
+                self._render_all()
+                return
+            return
+        if self.state.view != "nodes" or not self.state.expanded:
             return
         self.state.expanded = False
+        self.state.active_pane = "nodes"
+        self.state.focused_panes["nodes"] = "nodes"
         self._apply_layout(recompute_detail=True)
         self.call_after_refresh(self._render_all)
 
     def action_refresh_data(self) -> None:
         self._request_update(force=True)
+
+    def action_toggle_namespace_basis(self) -> None:
+        if self.state.view != "gpu-allocations":
+            return
+        self.state.namespace_basis = (
+            "vram" if self.state.namespace_basis == "gpu" else "gpu"
+        )
+        self._render_gpu_allocations()
 
 
 ResourcesDashboard = FalconResourcesApp

@@ -7,6 +7,7 @@ import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from textual import events
 
@@ -20,10 +21,18 @@ from falcon.dashboard_ui import (
     FalconDashboard,
     _restart_job_manifest,
 )
-from falcon.demo import DemoCollector, demo_cluster_snapshot
+from falcon.demo import DEMO_NOW, DemoCollector, demo_cluster_snapshot
+from falcon.resources_charts import (
+    GPUHistoryPoint,
+    render_gpu_history,
+    render_namespace_pie,
+)
+from falcon.resources_telemetry import GpuTelemetrySnapshot
 from falcon.resources_ui import (
     FalconResourcesApp,
+    RESOURCE_VIEWS,
     ResourcesPane,
+    _gpu_totals,
     _gpu_headroom_color,
     _resource_headroom_color,
     _short_cpu,
@@ -60,6 +69,33 @@ def _golden_manifest():
             encoding="utf-8"
         )
     )
+
+
+def _seed_resources_history(app: FalconResourcesApp) -> None:
+    namespaces = sorted(
+        {
+            consumer.namespace
+            for node in app._gpu_nodes()
+            if node.ready and node.schedulable
+            for consumer in node.consumers
+            if consumer.requested.gpu_count > 0
+        }
+    )
+    app.history = [
+        GPUHistoryPoint.from_mapping(
+            DEMO_NOW - (15 - index) * 5 * 60,
+            {
+                namespace: min(
+                    8,
+                    (index // (namespace_index + 2) + namespace_index)
+                    % 9,
+                )
+                for namespace_index, namespace in enumerate(namespaces)
+            },
+        )
+        for index in range(16)
+    ]
+    app._render_all()
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
@@ -544,6 +580,335 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(label_style.bold)
                 self.assertEqual(label_style.foreground.hex6, GRAY)
 
+    async def test_three_views_wrap_restore_persist_and_support_clicks(self) -> None:
+        saved = []
+        app = FalconResourcesApp(
+            DemoCollector("mixed"),
+            refresh_seconds=999,
+            initial_view="gpu-overview",
+            persist_view=saved.append,
+        )
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            self.assertEqual(app.state.view, "gpu-overview")
+            self.assertEqual(app.focused.id, "gpu-overview-pane")
+
+            await pilot.press("right")
+            self.assertEqual(app.state.view, "gpu-allocations")
+            await pilot.press("right")
+            self.assertEqual(app.state.view, "nodes")
+            await pilot.press("left")
+            self.assertEqual(app.state.view, "gpu-allocations")
+
+            start, _, _ = next(
+                hitbox for hitbox in app._view_hitboxes if hitbox[2] == "nodes"
+            )
+            # Pilot offsets include the selector's one-cell left padding.
+            clicked = await pilot.click("#resources-views", offset=(start + 1, 0))
+            self.assertTrue(clicked)
+            self.assertEqual(app.state.view, "nodes")
+            self.assertEqual(
+                saved,
+                ["gpu-allocations", "nodes", "gpu-allocations", "nodes"],
+            )
+
+            def fail_to_save(view):
+                raise OSError("read-only config")
+
+            app.persist_view = fail_to_save
+            await pilot.press("right")
+            self.assertEqual(app.state.view, "gpu-overview")
+
+        fallback = FalconResourcesApp(DemoCollector("mixed"), initial_view="invalid")
+        self.assertEqual(fallback.state.view, "nodes")
+        self.assertEqual(RESOURCE_VIEWS, ("nodes", "gpu-overview", "gpu-allocations"))
+
+    async def test_view_switching_preserves_each_scroll_and_node_state(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        source = snapshot.nodes[0]
+        base_consumer = next(
+            consumer
+            for consumer in source.visible_consumers
+            if consumer.requested.gpu_count
+        )
+        source = replace(
+            source,
+            consumers=tuple(
+                replace(
+                    base_consumer,
+                    pod_name=f"consumer-{index:02d}",
+                    workload_name=f"workload-{index:02d}",
+                )
+                for index in range(20)
+            ),
+        )
+        snapshot = replace(
+            snapshot,
+            nodes=tuple(
+                replace(source, name=f"gpu-node-{index:02d}")
+                for index in range(30)
+            ),
+        )
+
+        class Collector:
+            def collect(self, force=False):
+                return snapshot
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(Collector(), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            app.state.selected_node = app.nodes[-1].name
+            app.state.selected_consumer = 2
+            app.state.consumer_scroll = 1
+            app.state.expanded = True
+            app.state.focused_panes["nodes"] = "node"
+            app.state.active_pane = "node"
+
+            await pilot.press("right")
+            app.state.overview_scroll = 2
+            await pilot.press("right")
+            app.state.allocation_scroll = 1
+            await pilot.resize_terminal(140, 32)
+            await pilot.press("right")
+
+            self.assertEqual(app.state.view, "nodes")
+            self.assertTrue(app.state.expanded)
+            self.assertEqual(app.state.selected_node, app.nodes[-1].name)
+            self.assertEqual(app.state.consumer_scroll, 1)
+            self.assertEqual(app.state.focused_panes["nodes"], "node")
+
+            await pilot.press("right", "right")
+            self.assertEqual(app.state.allocation_scroll, 1)
+            await pilot.press("left")
+            self.assertEqual(app.state.overview_scroll, 2)
+
+    async def test_gpu_page_arrows_route_to_their_own_scroll_offsets(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        source = snapshot.nodes[0]
+        nodes = tuple(
+            replace(source, name=f"gpu-node-{index:02d}")
+            for index in range(30)
+        )
+        snapshot = replace(snapshot, nodes=nodes)
+
+        class Collector:
+            def collect(self, force=False):
+                return snapshot
+
+            def close(self):
+                pass
+
+        app = FalconResourcesApp(
+            Collector(), refresh_seconds=999, initial_view="gpu-overview"
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("down", "down")
+            self.assertEqual(app.state.overview_scroll, 2)
+            self.assertEqual(app.state.node_scroll, 0)
+            await pilot.press("right")
+            await pilot.press("down")
+            self.assertGreaterEqual(app.state.allocation_scroll, 1)
+            self.assertEqual(app.state.overview_scroll, 2)
+
+    async def test_gpu_telemetry_collects_before_allocations_view_and_v_toggles_pie(self) -> None:
+        app = FalconResourcesApp(
+            DemoCollector("mixed"),
+            refresh_seconds=999,
+        )
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            self.assertEqual(app.state.view, "nodes")
+            self.assertEqual(len(app.history), 1)
+
+            await pilot.press("right", "right")
+            self.assertEqual(app.state.view, "gpu-allocations")
+            self.assertEqual(app.state.namespace_basis, "gpu")
+            await pilot.press("v")
+            self.assertEqual(app.state.namespace_basis, "vram")
+            rendered = app.export_screenshot(simplify=True)
+            self.assertIn("VRAM&#160;ALLOCATION&#160;BY&#160;NAMESPACE", rendered)
+
+    async def test_gpu_panels_expand_from_mouse_and_escape_restores_them(self) -> None:
+        app = FalconResourcesApp(
+            DemoCollector("mixed"),
+            refresh_seconds=999,
+            initial_view="gpu-overview",
+        )
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.click("#gpu-overview-pane", offset=(5, 2))
+            self.assertEqual(app.state.expanded_panels["gpu-overview"], "summary")
+            await pilot.press("escape")
+            self.assertEqual(app.state.expanded_panels["gpu-overview"], "")
+
+            await pilot.press("right")
+            await pilot.click("#gpu-allocations-pane", offset=(5, 2))
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "history")
+            await pilot.press("escape")
+            await pilot.click("#gpu-allocations-pane", offset=(5, 14))
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pie")
+            await pilot.press("escape")
+            await pilot.click("#gpu-allocations-pane", offset=(95, 14))
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pods")
+            await pilot.press("escape")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
+
+    async def test_hidden_and_unchanged_charts_are_not_rebuilt(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        with patch(
+            "falcon.resources_ui.render_gpu_history", wraps=render_gpu_history
+        ) as history_renderer, patch(
+            "falcon.resources_ui.render_namespace_pie",
+            wraps=render_namespace_pie,
+        ) as pie_renderer:
+            async with app.run_test(size=(140, 32)) as pilot:
+                await pilot.pause(0.5)
+                app._tick_clock()
+                app._results.put_nowait(app.snapshot)
+                app._drain_results()
+                self.assertEqual(history_renderer.call_count, 0)
+                self.assertEqual(pie_renderer.call_count, 0)
+
+                await pilot.press("right")
+                self.assertEqual(history_renderer.call_count, 0)
+                await pilot.press("right")
+                self.assertEqual(history_renderer.call_count, 1)
+                self.assertEqual(pie_renderer.call_count, 1)
+
+                app._tick_clock()
+                app._render_all()
+                self.assertEqual(history_renderer.call_count, 1)
+                self.assertEqual(pie_renderer.call_count, 1)
+
+    def test_history_deduplicates_stale_points_prunes_and_tracks_disappearing_nodes(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"))
+        snapshot = GpuTelemetrySnapshot.from_mappings(
+            collected_at=DEMO_NOW,
+            effective_gpus_by_node={"node-a-h100": 2.4, "node-b-a6000": 0.7},
+            effective_gpus_by_namespace={"team-a": 2.4, "team-b": 0.7},
+            vram_gib_by_namespace={"team-a": 41.0, "team-b": 12.0},
+            target_pods=2,
+            sampled_pods=2,
+        )
+        app._record_gpu_history(snapshot)
+        app._record_gpu_history(snapshot)
+        app._record_gpu_history(snapshot.mark_stale("cached failure"))
+        self.assertEqual(len(app.history), 1)
+
+        later = GpuTelemetrySnapshot.from_mappings(
+            collected_at=snapshot.collected_at + 60,
+            effective_gpus_by_node={"node-a-h100": 1.25},
+            effective_gpus_by_namespace={"team-a": 1.25},
+            vram_gib_by_namespace={"team-a": 32.0},
+            target_pods=1,
+            sampled_pods=1,
+        )
+        app._record_gpu_history(later)
+        self.assertEqual(len(app.history), 2)
+        self.assertEqual(dict(app.history[-1].usage_by_namespace), {"team-a": 1.25})
+
+        newest = replace(snapshot, collected_at=snapshot.collected_at + 25 * 3600)
+        app._record_gpu_history(newest)
+        self.assertEqual([point.timestamp for point in app.history], [newest.collected_at])
+
+        with patch("falcon.resources_ui.HISTORY_LIMIT", 3):
+            for index in range(1, 6):
+                point = replace(newest, collected_at=newest.collected_at + index)
+                app._record_gpu_history(point)
+        self.assertEqual(len(app.history), 3)
+
+        empty = FalconResourcesApp(DemoCollector("mixed"))
+        empty._record_gpu_history(
+            replace(
+                snapshot,
+                effective_gpus_by_node=(),
+                effective_gpus_by_namespace=(),
+                sampled_pods=0,
+            )
+        )
+        self.assertEqual(empty.history, [])
+
+        monotonic = FalconResourcesApp(
+            DemoCollector("mixed"), history_clock=lambda: 1_900_000_000.0
+        )
+        monotonic._record_gpu_history(replace(snapshot, collected_at=1234.0))
+        self.assertEqual(monotonic.history[0].timestamp, 1_900_000_000.0)
+
+    def test_filtered_gpu_totals_namespace_and_pods_reconcile_hidden_requests(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        node = snapshot.nodes[0]
+        hidden = replace(
+            node.consumers[0],
+            namespace="kube-system",
+            pod_name="system-gpu",
+            requested=replace(node.consumers[0].requested, gpu_count=1),
+        )
+        node = replace(
+            node,
+            requested=replace(node.requested, gpu_count=4),
+            consumers=(*node.consumers, hidden),
+        )
+        app = FalconResourcesApp(
+            DemoCollector("mixed"), node_filter="node-a", gpu_filter="h100"
+        )
+        app.nodes = [node]
+
+        allocatable, requested, free, pressure = _gpu_totals(app._gpu_nodes())
+        self.assertEqual((allocatable, requested, free, pressure), (4, 4, 0, 100.0))
+        visible_namespace = next(
+            consumer.namespace
+            for consumer in node.consumers
+            if consumer.requested.gpu_count and not consumer.namespace.startswith("kube-")
+        )
+        app.gpu_telemetry = GpuTelemetrySnapshot.from_mappings(
+            collected_at=DEMO_NOW,
+            effective_gpus_by_node={node.name: 1.75},
+            effective_gpus_by_namespace={
+                visible_namespace: 1.5,
+                "kube-system": 0.25,
+            },
+            vram_gib_by_namespace={
+                visible_namespace: 18.0,
+                "kube-system": 6.0,
+            },
+            target_pods=2,
+            sampled_pods=2,
+        )
+        categories = dict(app._namespace_categories())
+        self.assertEqual(categories["System/hidden"], 0.25)
+        self.assertEqual(sum(categories.values()), 1.75)
+        app.state.namespace_basis = "vram"
+        vram_categories = dict(app._namespace_categories())
+        self.assertEqual(vram_categories[visible_namespace], 18.0)
+        self.assertEqual(vram_categories["System/hidden"], 6.0)
+        consumers = app._gpu_consumers()
+        self.assertEqual(sum(item.requested.gpu_count for item in consumers), 3)
+        self.assertEqual(consumers[0].requested.gpu_count, 2)
+
+        excluded = replace(node, schedulable=False)
+        self.assertEqual(_gpu_totals([excluded]), (0, 0, 0, 0.0))
+
+        app.gpu_telemetry = GpuTelemetrySnapshot.from_mappings(
+            collected_at=DEMO_NOW + 5,
+            effective_gpus_by_node={node.name: 36.0},
+            effective_gpus_by_namespace={
+                f"team-{index}": 8 - index for index in range(8)
+            },
+            vram_gib_by_namespace={
+                f"team-{index}": (8 - index) * 10 for index in range(8)
+            },
+            target_pods=8,
+            sampled_pods=8,
+        )
+        app.state.namespace_basis = "gpu"
+        categories = app._namespace_categories()
+        self.assertEqual(len(categories), 7)
+        self.assertEqual(categories[-1], ("Other", 3.0))
+
     async def test_node_expansion_reconciles_consumers_at_narrow_size(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(80, 22)) as pilot:
@@ -649,14 +1014,14 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.5)
             self.assertFalse(app._detail_auto_hidden)
             self.assertEqual(app.query_one("#nodes-pane").region.height, 15)
-            self.assertEqual(app.query_one("#node-pane").region.height, 7)
+            self.assertEqual(app.query_one("#node-pane").region.height, 6)
             await pilot.click("#node-pane", offset=(2, 2))
             self.assertEqual(app.state.active_pane, "node")
             await pilot.resize_terminal(140, 24)
             await pilot.pause()
             self.assertTrue(app._detail_auto_hidden)
             self.assertFalse(app.query_one("#node-pane").display)
-            self.assertEqual(app.query_one("#nodes-pane").region.height, 19)
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 18)
             self.assertEqual(app.state.active_pane, "nodes")
             self.assertIs(app.focused, app.query_one("#nodes-pane"))
 
@@ -957,7 +1322,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             visible = app._visible_consumers()
-            self.assertEqual(visible, 22)
+            self.assertEqual(visible, 21)
             self.assertEqual(
                 app._consumer_table(app._selected(), expanded=True).row_count,
                 visible,
@@ -972,12 +1337,12 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("end")
             await pilot.resize_terminal(80, 22)
             await pilot.pause()
-            self.assertEqual(app._visible_consumers(), 5)
-            self.assertEqual(app.state.consumer_scroll, 25)
+            self.assertEqual(app._visible_consumers(), 4)
+            self.assertEqual(app.state.consumer_scroll, 26)
             svg = app.export_screenshot(simplify=True)
             self.assertEqual(
                 re.findall(r"consumer-(\d\d)", svg),
-                ["25", "26", "27", "28", "29"],
+                ["26", "27", "28", "29"],
             )
             self.assertIn("Quit", svg)
 
@@ -1090,6 +1455,33 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             ("resources-80x22", "mixed", (80, 22), ()),
             ("resources-140x32", "mixed", (140, 32), ()),
             ("resources-200x50", "mixed", (200, 50), ()),
+            ("resources-gpu-overview-80x22", "mixed", (80, 22), ("right",)),
+            ("resources-gpu-overview-140x32", "mixed", (140, 32), ("right",)),
+            ("resources-gpu-overview-200x50", "mixed", (200, 50), ("right",)),
+            (
+                "resources-gpu-allocations-80x22",
+                "mixed",
+                (80, 22),
+                (_seed_resources_history, "right", "right"),
+            ),
+            (
+                "resources-gpu-allocations-140x32",
+                "mixed",
+                (140, 32),
+                (_seed_resources_history, "right", "right"),
+            ),
+            (
+                "resources-gpu-allocations-200x50",
+                "mixed",
+                (200, 50),
+                (_seed_resources_history, "right", "right"),
+            ),
+            (
+                "resources-gpu-allocations-vram-140x32",
+                "mixed",
+                (140, 32),
+                (_seed_resources_history, "right", "right", "v"),
+            ),
             ("resources-node-expanded-80x22", "mixed", (80, 22), ("enter",)),
             (
                 "resources-node-expanded-140x40",
@@ -1099,6 +1491,20 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("resources-stale", "stale", (120, 30), ()),
             ("resources-no-jobs", "no-jobs", (120, 30), ()),
+            ("resources-gpu-overview-stale", "stale", (140, 32), ("right",)),
+            (
+                "resources-gpu-allocations-stale",
+                "stale",
+                (140, 32),
+                (_seed_resources_history, "right", "right"),
+            ),
+            ("resources-gpu-overview-no-gpus", "no-gpus", (140, 32), ("right",)),
+            (
+                "resources-gpu-allocations-no-gpus",
+                "no-gpus",
+                (140, 32),
+                ("right", "right"),
+            ),
         )
         for name, state, size, actions in resource_states:
             app = FalconResourcesApp(
@@ -1109,7 +1515,11 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=size) as pilot:
                 await pilot.pause(0.5)
                 for action in actions:
-                    await pilot.press(*action.split())
+                    if callable(action):
+                        action(app)
+                        await pilot.pause()
+                    else:
+                        await pilot.press(*action.split())
                 app._spinner = 0
                 app._render_header()
                 svg = app.export_screenshot(
