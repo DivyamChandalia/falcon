@@ -8,12 +8,12 @@ from rich.console import Console
 # Keep semantic colours shared by Dashboard and Resources.  These muted
 # values are intentionally terminal-true-colour rather than the old neon
 # defaults, so the two screens have the same visual language.
-CYAN = "#3DAFC2"
+CYAN = "#67B8C7"
 CYAN_2 = CYAN
-GREEN = "#4EBD62"
-YELLOW = "#CCB83D"
-RED = "#CC4F55"
-WHITE = "#D0D0D0"
+GREEN = "#7FA87A"
+YELLOW = "#D8C56A"
+RED = "#C97575"
+WHITE = "#D8DEE9"
 GRAY = "#AAAAAA"
 MUTED = "#666666"
 BORDER = "#555555"
