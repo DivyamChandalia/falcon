@@ -2,12 +2,15 @@
 
 from dataclasses import dataclass
 
-CYAN = "#00FFFF"
-CYAN_2 = "#4DDDDD"
-GREEN = "#55FF55"
-YELLOW = "#FFFF55"
-RED = "#FF5555"
-WHITE = "#F2F2F2"
+# Keep semantic colours shared by Dashboard and Resources.  These muted
+# values are intentionally terminal-true-colour rather than the old neon
+# defaults, so the two screens have the same visual language.
+CYAN = "#3DAFC2"
+CYAN_2 = CYAN
+GREEN = "#4EBD62"
+YELLOW = "#CCB83D"
+RED = "#CC4F55"
+WHITE = "#D0D0D0"
 GRAY = "#AAAAAA"
 MUTED = "#666666"
 BORDER = "#555555"
