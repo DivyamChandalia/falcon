@@ -330,7 +330,7 @@ class FalconResourcesApp(App[None]):
         self._spinner = 0
         self._detail_auto_hidden = False
         self._layout_node_names: tuple[str, ...] = ()
-        self._last_telemetry_history_key: object = None
+        self._last_allocation_history_key: object = None
         self._view_hitboxes: list[tuple[int, int, str]] = []
         self._history_cache_key: object = None
         self._history_cache: Optional[Text] = None
@@ -501,7 +501,13 @@ class FalconResourcesApp(App[None]):
     def _snapshot_clock(snapshot: ClusterSnapshot) -> str:
         if not snapshot.collected_at:
             return "--:--:--"
-        return datetime.fromtimestamp(snapshot.collected_at).strftime("%H:%M:%S")
+        timestamp = float(snapshot.collected_at)
+        # MetricsClusterCollector uses a monotonic clock for cache cadence.
+        # Keep the machine-readable snapshot untouched, but do not render a
+        # monotonic value as a date in 1970 in the human TUI header.
+        if timestamp < 946_684_800:  # 2000-01-01 UTC
+            timestamp = time.time()
+        return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
 
     def _request_update(self, force: bool = False) -> None:
         if self._refreshing:
@@ -560,9 +566,9 @@ class FalconResourcesApp(App[None]):
         previous_names = self._layout_node_names
         self.nodes = nodes
         # The resource collector already runs in the background against the
-        # configured local metrics endpoint. Derive both selectable usage
-        # bases from every fresh allocation snapshot, even while this page is
-        # hidden.
+        # The collector refreshes the configured local metrics endpoint in the
+        # background. Derive both selectable allocation bases from every fresh
+        # snapshot, even while this page is hidden.
         self.gpu_telemetry = allocation_snapshot(
             self.nodes,
             collected_at=snapshot.collected_at,
@@ -616,9 +622,9 @@ class FalconResourcesApp(App[None]):
         if telemetry.stale or not telemetry.sampled_pods:
             return
         identity = (telemetry.collected_at, telemetry.effective_gpus_by_namespace)
-        if identity == self._last_telemetry_history_key:
+        if identity == self._last_allocation_history_key:
             return
-        self._last_telemetry_history_key = identity
+        self._last_allocation_history_key = identity
         values = dict(telemetry.effective_gpus_by_namespace)
         if not values:
             return
@@ -1219,14 +1225,14 @@ class FalconResourcesApp(App[None]):
             categories.append(("System/hidden", hidden))
         return tuple(categories)
 
-    def _telemetry_empty_label(self, basis: str) -> str:
+    def _allocation_empty_label(self, basis: str) -> str:
         if not self.gpu_telemetry.target_pods:
             return "No running GPU Pods"
         if self.gpu_telemetry.stale:
             return (
-                "VRAM telemetry unavailable"
+                "VRAM allocation unavailable"
                 if basis == "vram"
-                else "GPU telemetry unavailable"
+                else "GPU allocation unavailable"
             )
         if not self.gpu_telemetry.sampled_pods:
             return "No GPU allocations"
@@ -1353,7 +1359,7 @@ class FalconResourcesApp(App[None]):
                     width=max(16, width - 4),
                     height=max(5, height - 2),
                     unit=unit,
-                    empty_label=self._telemetry_empty_label(basis),
+                    empty_label=self._allocation_empty_label(basis),
                 )
             title = (
                 " VRAM ALLOCATION BY NAMESPACE "
@@ -1394,7 +1400,7 @@ class FalconResourcesApp(App[None]):
         namespace_width = max(22, round(width * (0.42 if width >= 120 else 0.38)))
         basis = self.state.namespace_basis
         unit = "G" if basis == "vram" else ""
-        empty_label = self._telemetry_empty_label(basis)
+        empty_label = self._allocation_empty_label(basis)
         pie_key = (
             categories,
             basis,

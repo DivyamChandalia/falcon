@@ -20,7 +20,10 @@ class AllocationTelemetryTests(unittest.TestCase):
             sum(value for _, value in telemetry.effective_gpus_by_namespace),
             sum(node.requested.gpu_count for node in nodes if node.ready and node.schedulable),
         )
-        self.assertGreater(sum(value for _, value in telemetry.vram_gib_by_namespace), 0)
+        vram = dict(telemetry.vram_gib_by_namespace)
+        h100_gib = nodes[0].gpu_memory_bytes_per_device / (1024**3)
+        self.assertAlmostEqual(vram["team-a"], 2 * h100_gib)
+        self.assertAlmostEqual(vram["team-b"], h100_gib)
 
     def test_stale_inventory_is_retained_but_not_presented_as_a_new_point(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")

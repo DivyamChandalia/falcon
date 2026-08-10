@@ -30,6 +30,9 @@ page) resumes follow. Changing Jobs resets event position predictably.
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump
 - `Enter`: inspect the node and its consumers
 - `Esc`: return to node list
+- `←` / `→`: cycle Nodes, GPU Overview, and GPU Allocations (wraps)
+- `v`: switch the namespace pie between requested GPU count and allocated VRAM
+- Click a GPU Overview or GPU Allocations pane to expand it; `Esc` restores it
 - `r`: refresh; `q`: quit
 
 The node list uses a single schedulability state (`Yes`, `Cordoned`,
@@ -44,3 +47,12 @@ reaches its minimum height. `Enter` still opens the full inspector. Hover the
 selected-node panel to scroll its workload rows without moving to another
 node. GPU VRAM is the memory of one device, not the sum across the node. Node
 names use natural ordering, so `node10` follows `node9`.
+
+GPU Allocations is scheduler-facing allocation accounting from the same local
+resource snapshot as the other Resources views; it does not query or infer GPU
+compute utilization. The history is collected in the background, is process
+local, and is labeled `since launch` (up to 24 hours and 20,000 points). The
+namespace pie shows the six largest visible namespaces, `Other`, and
+`System/hidden` when needed to reconcile totals. Its percentages are exactly
+namespace requested GPU count divided by total requested GPU count in GPU mode,
+or namespace allocated VRAM divided by total allocated VRAM in VRAM mode.

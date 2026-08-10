@@ -78,6 +78,26 @@ class NamespacePieRendererTests(unittest.TestCase):
             "2G",
         )
 
+    def test_legend_percentages_use_the_selected_allocation_total(self) -> None:
+        gpu_pie = render_namespace_pie(
+            (("team-a", 3), ("team-b", 1)), width=48, height=8
+        )
+        self.assertIn("team-a", gpu_pie.plain)
+        self.assertIn("75%", gpu_pie.plain)
+        self.assertIn("team-b", gpu_pie.plain)
+        self.assertIn("25%", gpu_pie.plain)
+
+        vram_pie = render_namespace_pie(
+            (("team-a", 240), ("team-b", 60)),
+            width=48,
+            height=8,
+            unit="G",
+        )
+        self.assertIn("240G", vram_pie.plain)
+        self.assertIn("80%", vram_pie.plain)
+        self.assertIn("60G", vram_pie.plain)
+        self.assertIn("20%", vram_pie.plain)
+
     def test_many_long_categories_fit_narrow_and_wide_panels(self) -> None:
         categories = tuple(
             (f"extraordinarily-long-namespace-{index}", index + 1)

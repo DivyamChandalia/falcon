@@ -257,7 +257,7 @@ def render_namespace_pie(
     unit: str = "",
     empty_label: str = "No GPU allocation",
 ) -> Text:
-    """Render an aspect-correct, fully filled namespace usage pie."""
+    """Render an aspect-correct, fully filled namespace allocation pie."""
 
     width = max(1, int(width))
     height = max(1, int(height))
