@@ -60,6 +60,11 @@ totals.
 Falcon pins the Rich console used by both apps to truecolour output. This is
 intentional for tmux: a `screen-256color` `$TERM` must not downgrade these
 explicit hex colours to xterm-256 or ANSI-16 values.
+Use `--color=truecolor` (also the default) or `FALCON_COLOR=truecolor` to make
+the choice explicit. `--color=256` and `--color=16` are opt-in fallbacks;
+`--color=auto` still chooses truecolour for tmux-like terminals and only
+falls back automatically for `TERM=dumb`. Set `FALCON_COLOR_DEBUG=1` to log
+the selected mode, the framework-detected mode, and the exact RGB tuple.
 The filled namespace pie and Allocation History use one shared percentage
 legend. The legend is a single vertical list in the left column beside
 Allocation History; the pie is below them with GPU-requesting Pods to its right.

@@ -50,6 +50,7 @@ from .output import dumps, render_table
 from .planning import canonical_gpu, plan_cpu_resources, plan_resources
 from .resources import MetricsClusterCollector, fetch_nodes
 from .resources_ui import FalconResourcesApp
+from .theme import COLOR_MODES
 
 EXIT_USAGE = 2
 EXIT_KUBERNETES = 3
@@ -86,6 +87,19 @@ def _output(parser: argparse.ArgumentParser) -> None:
         choices=("human", "json"),
         default="human",
         help="Output format (default: human)",
+    )
+
+
+def _color(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--color",
+        choices=COLOR_MODES,
+        default=None,
+        metavar="MODE",
+        help=(
+            "TUI colour mode: truecolor (default), 256, 16, or auto; "
+            "FALCON_COLOR may set the default"
+        ),
     )
 
 
@@ -269,6 +283,7 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
         const="mixed",
         help="Use deterministic demo data (optional state)",
     )
+    _color(dashboard)
 
     resources = sub.add_parser(
         "resources", help="Inspect cluster request headroom and node consumers"
@@ -288,6 +303,7 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
         const="mixed",
         help="Use deterministic demo data (optional state)",
     )
+    _color(resources)
     _namespace(resources)
     _output(resources)
 
@@ -1133,6 +1149,7 @@ def _resources_command(
             collector,
             node_filter=args.node,
             gpu_filter=args.gpu,
+            color_mode=getattr(args, "color", None),
             initial_view=str(
                 config.get("resources", {}).get("last_view", "nodes")
             ),
@@ -1327,13 +1344,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "'falcon jobs --output json' in noninteractive processes"
                 )
             if args.demo:
-                run_dashboard(config, demo_state=args.demo)
+                run_dashboard(
+                    config,
+                    demo_state=args.demo,
+                    color_mode=getattr(args, "color", None),
+                )
             else:
                 run_dashboard(
                     config,
                     str(config["cluster"]["namespace"]),
                     job=args.job,
                     config_file=config_arg,
+                    color_mode=getattr(args, "color", None),
                 )
             return 0
         if args.command_name == "resources":

@@ -51,7 +51,7 @@ from .theme import (
     RED,
     WHITE,
     YELLOW,
-    force_truecolor,
+    configure_color,
 )
 
 
@@ -631,9 +631,10 @@ class FalconDashboard(App):
         persist_hidden_panes: Optional[Callable[[Set[str]], None]] = None,
         persist_sort: Optional[Callable[[str, str], None]] = None,
         clock: Optional[Callable[[], str]] = None,
+        color_mode: Optional[str] = None,
     ):
         super().__init__()
-        force_truecolor(self.console)
+        self.color_mode = configure_color(self.console, color_mode)
         self.collector = collector
         self.refresh_seconds = refresh_seconds
         self.state = ViewState()

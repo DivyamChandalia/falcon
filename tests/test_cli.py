@@ -16,6 +16,7 @@ from falcon.cli import (
     EXIT_KUBERNETES,
     EXIT_USAGE,
     _resources_command,
+    _parser,
     _rewrite_shorthand,
     main,
     resolve_preset,
@@ -49,6 +50,14 @@ class CliHarness(unittest.TestCase):
 
 
 class ParserTests(CliHarness):
+    def test_tui_color_mode_options_are_explicit(self) -> None:
+        parser = _parser(DEFAULT_CONFIG)
+        for command in ("dashboard", "resources"):
+            for mode in ("truecolor", "256", "16", "auto"):
+                with self.subTest(command=command, mode=mode):
+                    args = parser.parse_args([command, f"--color={mode}"])
+                    self.assertEqual(args.color, mode)
+
     def test_help(self) -> None:
         code, stdout, _ = self.invoke("--help")
         self.assertEqual(code, 0)

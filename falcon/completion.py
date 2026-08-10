@@ -61,10 +61,10 @@ OPTIONS: Dict[str, List[str]] = {
     "top": ["--namespace"],
     "metrics": ["--interval", "--namespace"],
     "kill": ["--output", "--namespace"],
-    "dashboard": ["--demo", "--job"],
+    "dashboard": ["--demo", "--job", "--color"],
     "resources": [
         "--output", "--node", "--gpu", "--limit", "--consumer-limit", "--demo",
-        "--namespace",
+        "--namespace", "--color",
     ],
     "setup": [
         "--force", "--non-interactive", "--no-shell", "--install-skills",

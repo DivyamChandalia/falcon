@@ -9,11 +9,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from textual import events
-from textual.strip import Strip
 from rich.color import ColorSystem
 from rich.segment import Segment
 from rich.style import Style
+from rich.text import Text
+from textual import events
+from textual.strip import Strip
 
 # Golden rendering is intentionally truecolor and independent of the parent
 # test runner's NO_COLOR setting.
@@ -111,17 +112,29 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
 
         previous_term = os.environ.get("TERM")
         previous_colorterm = os.environ.get("COLORTERM")
+        previous_color = os.environ.get("FALCON_COLOR")
         try:
             os.environ["TERM"] = "screen-256color"
             os.environ.pop("COLORTERM", None)
+            os.environ.pop("FALCON_COLOR", None)
             dashboard = FalconDashboard(DemoUsageCollector("mixed"))
             resources = FalconResourcesApp(DemoCollector())
             for app in (dashboard, resources):
+                self.assertEqual(app.color_mode, "truecolor")
                 self.assertEqual(app.console._color_system, ColorSystem.TRUECOLOR)
                 rendered = Strip(
-                    [Segment("X", Style(color=PALETTE.accent))], cell_length=1
+                    [
+                        Segment(
+                            "X",
+                            Style(
+                                color=PALETTE.accent,
+                                bgcolor=PALETTE.success,
+                            ),
+                        )
+                    ],
+                    cell_length=1,
                 ).render(app.console)
-                self.assertIn("\x1b[38;2;61;175;194m", rendered)
+                self.assertIn("\x1b[38;2;86;180;233;48;2;0;158;115m", rendered)
         finally:
             if previous_term is None:
                 os.environ.pop("TERM", None)
@@ -131,6 +144,45 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("COLORTERM", None)
             else:
                 os.environ["COLORTERM"] = previous_colorterm
+            if previous_color is None:
+                os.environ.pop("FALCON_COLOR", None)
+            else:
+                os.environ["FALCON_COLOR"] = previous_color
+
+    def test_lower_colour_fallbacks_are_explicit(self) -> None:
+        for mode, system in (
+            ("256", ColorSystem.EIGHT_BIT),
+            ("16", ColorSystem.STANDARD),
+        ):
+            with self.subTest(mode=mode):
+                app = FalconDashboard(DemoUsageCollector("mixed"), color_mode=mode)
+                self.assertEqual(app.color_mode, mode)
+                self.assertEqual(app.console._color_system, system)
+                rendered = Strip(
+                    [Segment("X", Style(color=PALETTE.accent))], cell_length=1
+                ).render(app.console)
+                self.assertNotIn("\x1b[38;2;86;180;233m", rendered)
+
+    def test_truecolor_clears_rich_style_quantization_cache(self) -> None:
+        fallback = FalconDashboard(DemoUsageCollector("mixed"), color_mode="256")
+        fallback.console._render_buffer(
+            list(fallback.console.render(Text("X", style=PALETTE.accent)))
+        )
+        truecolor = FalconDashboard(
+            DemoUsageCollector("mixed"), color_mode="truecolor"
+        )
+        rendered = truecolor.console._render_buffer(
+            list(truecolor.console.render(Text("X", style=PALETTE.accent)))
+        )
+        self.assertIn("\x1b[38;2;86;180;233m", rendered)
+        self.assertNotIn("\x1b[38;5;74m", rendered)
+
+    def test_colour_mode_log_reports_framework_and_rgb_triplet(self) -> None:
+        with self.assertLogs("falcon.tui.color", level="INFO") as captured:
+            FalconDashboard(DemoUsageCollector("mixed"), color_mode="truecolor")
+        self.assertIn("colour mode: truecolor", captured.output[0])
+        self.assertIn("framework=", captured.output[0])
+        self.assertIn("#56B4E9=rgb(86, 180, 233)", captured.output[0])
 
     async def test_completed_job_does_not_create_partial_resource_history(self) -> None:
         collector = DemoUsageCollector("mixed")

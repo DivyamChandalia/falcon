@@ -1144,6 +1144,7 @@ def run_dashboard(
     job: Optional[str] = None,
     config_file: Optional[str] = None,
     demo_state: Optional[str] = None,
+    color_mode: Optional[str] = None,
 ) -> None:
     namespace = namespace or config["cluster"]["namespace"]
     thresholds = {
@@ -1170,4 +1171,5 @@ def run_dashboard(
         sort_direction=dashboard.get("sort_direction", "desc"),
         persist_hidden_panes=lambda panes: save_hidden_panes(panes, config_file),
         persist_sort=lambda field, direction: save_dashboard_sort(field, direction, config_file),
+        color_mode=color_mode,
     ).run(mouse=True)

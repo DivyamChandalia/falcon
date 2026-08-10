@@ -53,7 +53,7 @@ from .theme import (
     RED,
     WHITE,
     YELLOW,
-    force_truecolor,
+    configure_color,
 )
 
 RESOURCE_VIEWS = ("nodes", "gpu-overview", "gpu-allocations")
@@ -309,9 +309,10 @@ class FalconResourcesApp(App[None]):
         persist_view: Optional[Callable[[str], object]] = None,
         telemetry_collector=None,
         telemetry_refresh_seconds: float = 5.0,
+        color_mode: Optional[str] = None,
     ) -> None:
         super().__init__()
-        force_truecolor(self.console)
+        self.color_mode = configure_color(self.console, color_mode)
         self.collector = collector
         self.refresh_seconds = refresh_seconds
         self.node_filter = (node_filter or "").lower()
