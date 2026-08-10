@@ -53,10 +53,10 @@ GPU Allocations is scheduler-facing allocation accounting from the same local
 resource snapshot as the other Resources views; it does not query or infer GPU
 compute utilization. The history is collected in the background, is process
 local, and is labeled `since launch` (up to 24 hours and 20,000 points). The
-The history graph and filled namespace pie use one shared left-side legend
-with percentages, so names are not repeated inside or below either graph. The
-pie shows the six largest visible namespaces, `Other`, and `System/hidden` when
-needed to reconcile totals. Both graphs switch bases together: percentages are
-exactly namespace requested GPU count divided by total requested GPU count in
-GPU mode, or namespace allocated VRAM divided by total allocated VRAM in VRAM
-mode.
+The history graph and filled namespace pie use one shared percentage legend,
+placed compactly above the lower-left pie so the history graph keeps the full
+width. Names are not repeated inside or below either graph. The pie shows the
+six largest visible namespaces, `Other`, and `System/hidden` when needed to
+reconcile totals. Both graphs switch bases together: percentages are exactly
+namespace requested GPU count divided by total requested GPU count in GPU mode,
+or namespace allocated VRAM divided by total allocated VRAM in VRAM mode.

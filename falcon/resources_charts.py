@@ -227,6 +227,7 @@ def render_allocation_legend(
     height: int,
     unit: str = "",
     colors: Mapping[str, str] | None = None,
+    columns: int = 1,
 ) -> Text:
     """Render the one namespace percentage legend shared by both charts."""
 
@@ -243,15 +244,53 @@ def render_allocation_legend(
     palette = dict(colors or allocation_colors(name for name, _ in values))
     if "System/hidden" in palette:
         palette["System/hidden"] = MUTED
-    lines = _legend_lines(
-        values,
-        total=total,
-        width=width,
-        colors=palette,
-        unit=unit,
-        max_rows=height,
-        include_total=False,
-    )
+    columns = max(1, min(int(columns), len(values)))
+    if columns == 1:
+        lines = _legend_lines(
+            values,
+            total=total,
+            width=width,
+            colors=palette,
+            unit=unit,
+            max_rows=height,
+            include_total=False,
+        )
+    else:
+        column_width = max(1, (width - columns + 1) // columns)
+        column_values = [
+            values[index::columns]
+            for index in range(columns)
+        ]
+        rendered_columns = [
+            _legend_lines(
+                column,
+                total=total,
+                width=column_width,
+                colors=palette,
+                unit=unit,
+                max_rows=height,
+                include_total=False,
+            )
+            for column in column_values
+        ]
+        rows = min(
+            height,
+            max((len(column) for column in rendered_columns), default=0),
+        )
+        lines = []
+        for row in range(rows):
+            line = Text()
+            for index, column in enumerate(rendered_columns):
+                if index:
+                    line.append(" ")
+                if row < len(column):
+                    line.append_text(column[row])
+                    padding = column_width - len(column[row].plain)
+                    if padding > 0:
+                        line.append(" " * padding)
+                else:
+                    line.append(" " * column_width)
+            lines.append(line)
     output = Text()
     for index, line in enumerate(lines):
         output.append_text(line)

@@ -8,6 +8,7 @@ from falcon.resources_charts import (
     _pie_dimensions,
     _series_colors,
     downsample_history,
+    render_allocation_legend,
     render_gpu_history,
     render_namespace_pie,
 )
@@ -76,6 +77,18 @@ class GPUHistoryRendererTests(unittest.TestCase):
 
 
 class NamespacePieRendererTests(unittest.TestCase):
+    def test_compact_shared_legend_keeps_all_categories(self) -> None:
+        categories = [(f"namespace-{index}", index + 1) for index in range(8)]
+        legend = render_allocation_legend(
+            categories,
+            width=40,
+            height=4,
+            columns=2,
+        )
+        self.assertEqual(len(legend.plain.splitlines()), 4)
+        for name, _ in categories:
+            self.assertIn(name, legend.plain)
+
     def test_empty_and_tiny_states_are_explicit(self) -> None:
         self.assertIn(
             "No GPU allocation",
