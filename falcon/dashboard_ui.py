@@ -47,6 +47,7 @@ from .theme import (
     MINIMUM_HEIGHT,
     MINIMUM_WIDTH,
     MUTED,
+    PALETTE,
     RED,
     WHITE,
     YELLOW,
@@ -160,6 +161,7 @@ def _spark(values: List[Optional[float]], width: int = 12) -> str:
 def _scaled_history(
     values: List[Optional[float]], width: int = 12, height: int = 3,
     samples_per_bar: int = 1, sample_period: int = 1,
+    color: Optional[str] = None,
 ) -> Text:
     """Render bottom-aligned history with an exact metric-sample scale."""
     partials = "▁▂▃▄▅▆▇"
@@ -205,10 +207,10 @@ def _scaled_history(
             scaled = max(0.125, min(100.0, numeric) / 100 * height)
             full, fraction = int(scaled), scaled - int(scaled)
             if level < full:
-                text.append("█", style=_metric_color(numeric))
+                text.append("█", style=color or _metric_color(numeric))
             elif level == full and fraction > 0:
                 index = min(6, max(0, round(fraction * 7) - 1))
-                text.append(partials[index], style=_metric_color(numeric))
+                text.append(partials[index], style=color or _metric_color(numeric))
             else:
                 text.append(" ")
         if level:
@@ -219,20 +221,20 @@ def _scaled_history(
 def _status_style(status: str) -> Tuple[str, str]:
     lowered = status.lower()
     if lowered == "running":
-        return ("●", CYAN_2)
+        return ("●", PALETTE.accent_soft)
     if lowered == "succeeded":
-        return ("✓", GREEN)
+        return ("✓", PALETTE.success)
     if lowered in {"failed", "unknown"}:
-        return ("✕", RED)
+        return ("✕", PALETTE.danger)
     if lowered in {"queued", "pending"}:
-        return ("●", WHITE)
-    return ("●", YELLOW)
+        return ("●", PALETTE.text)
+    return ("●", PALETTE.warning)
 
 
 def _job_status_display(row: JobUsage) -> Tuple[str, str, str]:
     """Return icon, label, and color for the Jobs-table status cell."""
     if row.at_risk:
-        return "●", "Eviction risk", YELLOW
+        return "●", "Eviction risk", PALETTE.warning
     icon, color = _status_style(row.status)
     return icon, row.status, color
 
@@ -1220,13 +1222,25 @@ class FalconDashboard(App):
         end = len(history) - self.state.resource_scroll_offset
         return history[max(0, end - width):max(0, end)]
 
-    def _metric_cell(self, label: str, current: Optional[float], values: List[Optional[float]], detail: str) -> Text:
-        color = _metric_color(current)
+    def _metric_cell(
+        self,
+        label: str,
+        current: Optional[float],
+        values: List[Optional[float]],
+        detail: str,
+        *,
+        terminal: bool = False,
+    ) -> Text:
+        color = MUTED if terminal else _metric_color(current)
         text = Text(label + "\n", style=f"bold {WHITE}")
         text.append("—" if current is None else f"{current:.0f}%", style=color)
         text.append("\n" + _spark(values, 24) + "\n", style=color)
         text.append(detail, style=GRAY)
         return text
+
+    @staticmethod
+    def _resource_metric_color(metric: Dict, value: Optional[float]) -> str:
+        return MUTED if metric.get("terminal") else _metric_color(value)
 
     @staticmethod
     def _device_value(value: Optional[float], suffix: str = "", precision: int = 0) -> str:
@@ -1253,6 +1267,7 @@ class FalconDashboard(App):
 
     def _resource_metrics(self, row: JobUsage, points: List[MetricPoint]) -> List[Dict]:
         last = points[-1]
+        terminal = row.status in {"Succeeded", "Failed"}
         gpu_capacity = last.gpu_capacity or float(row.gpu_count)
         vram_capacity = last.vram_capacity or row.gpu_memory_total_gib
         cpu_capacity = last.cpu_capacity or row.cpu_allocated or row.cpu_requested
@@ -1265,6 +1280,7 @@ class FalconDashboard(App):
             {
                 "label": "GPU", "values": [point.gpu for point in points],
                 "current": last.gpu, "capacity": gpu_capacity, "unit": "GPU",
+                "terminal": terminal,
                 "sample_period": 1,
                 "absolute": self._absolute_metric(
                     last.gpu, gpu_capacity, "GPU"
@@ -1273,6 +1289,7 @@ class FalconDashboard(App):
             {
                 "label": "VRAM", "values": [point.vram for point in points],
                 "current": last.vram, "capacity": vram_capacity, "unit": "GiB",
+                "terminal": terminal,
                 "sample_period": 1,
                 "absolute": self._absolute_metric(
                     last.vram, vram_capacity, "GiB"
@@ -1281,6 +1298,7 @@ class FalconDashboard(App):
             {
                 "label": "CPU", "values": [point.cpu for point in points],
                 "current": last.cpu, "capacity": cpu_capacity, "unit": "vCPU",
+                "terminal": terminal,
                 "sample_period": int(KUBERNETES_USAGE_SECONDS),
                 "absolute": self._absolute_metric(
                     last.cpu, cpu_capacity, "vCPU"
@@ -1289,6 +1307,7 @@ class FalconDashboard(App):
             {
                 "label": "RAM", "values": [point.ram for point in points],
                 "current": last.ram, "capacity": ram_capacity, "unit": "GiB",
+                "terminal": terminal,
                 "sample_period": int(KUBERNETES_USAGE_SECONDS),
                 "absolute": self._absolute_metric(
                     last.ram, ram_capacity, "GiB"
@@ -1319,22 +1338,24 @@ class FalconDashboard(App):
         values = metric["values"]
         valid = [value for value in values if value is not None]
         current = metric["current"]
+        color = self._resource_metric_color(metric, current)
         average = mean(valid) if valid else None
         peak = max(valid) if valid else None
         summary = Text()
         summary.append("Now      ", style=GRAY)
-        summary.append("—" if current is None else f"{current:.0f}%", style=f"bold {_metric_color(current)}")
+        summary.append("—" if current is None else f"{current:.0f}%", style=f"bold {color}")
         summary.append(f"  {metric['absolute']}\n", style=WHITE)
         summary.append("Average  ", style=GRAY)
-        summary.append("—" if average is None else f"{average:.0f}%", style=_metric_color(average))
+        summary.append("—" if average is None else f"{average:.0f}%", style=self._resource_metric_color(metric, average))
         summary.append("  " + self._absolute_metric(average, metric["capacity"], metric["unit"]) + "\n", style=WHITE)
         summary.append("Peak     ", style=GRAY)
-        summary.append("—" if peak is None else f"{peak:.0f}%", style=_metric_color(peak))
+        summary.append("—" if peak is None else f"{peak:.0f}%", style=self._resource_metric_color(metric, peak))
         summary.append("  " + self._absolute_metric(peak, metric["capacity"], metric["unit"]), style=WHITE)
         stats_width = max(len(line) for line in summary.plain.splitlines())
         history = _scaled_history(
             values, self._resource_history_width("wide", stats_width), self._resource_history_height("wide"),
             self.state.resource_zoom, metric["sample_period"],
+            self._resource_metric_color(metric, current) if metric.get("terminal") else None,
         )
         body = Table.grid(expand=True, padding=0)
         body.add_column(width=stats_width, justify="left")
@@ -1353,18 +1374,19 @@ class FalconDashboard(App):
         peak = max(valid) if valid else None
         stats = Text()
         stats.append("Now      ", style=GRAY)
-        stats.append("—" if current is None else f"{current:.0f}%", style=f"bold {_metric_color(current)}")
+        stats.append("—" if current is None else f"{current:.0f}%", style=f"bold {self._resource_metric_color(metric, current)}")
         stats.append("\nUsed     ", style=GRAY)
         stats.append(metric["absolute"], style=WHITE)
         stats.append("\nAverage  ", style=GRAY)
-        stats.append("—" if average is None else f"{average:.0f}%", style=_metric_color(average))
+        stats.append("—" if average is None else f"{average:.0f}%", style=self._resource_metric_color(metric, average))
         stats.append("\nPeak     ", style=GRAY)
-        stats.append("—" if peak is None else f"{peak:.0f}%", style=_metric_color(peak))
+        stats.append("—" if peak is None else f"{peak:.0f}%", style=self._resource_metric_color(metric, peak))
         layout = "collapsed" if collapsed else "compact"
         stats_width = max(len(line) for line in stats.plain.splitlines())
         history = _scaled_history(
             metric["values"], self._resource_history_width(layout, stats_width),
             self._resource_history_height(layout), self.state.resource_zoom, metric["sample_period"],
+            self._resource_metric_color(metric, current) if metric.get("terminal") else None,
         )
         body = Table.grid(expand=True, padding=0)
         body.add_column(width=stats_width, justify="left")
@@ -1459,7 +1481,10 @@ class FalconDashboard(App):
                 cells.append(Text(identity, style=WHITE, no_wrap=True, overflow="ellipsis"))
             cells.extend([
                 Text(memory, style=WHITE),
-                Text(self._device_value(device.utilization, "%"), style=_metric_color(device.utilization)),
+                Text(
+                    self._device_value(device.utilization, "%"),
+                    style=(MUTED if row.status in {"Succeeded", "Failed"} else _metric_color(device.utilization)),
+                ),
                 Text(self._device_value(device.temperature_c, "°C"), style=WHITE),
             ])
             if full:
@@ -1528,6 +1553,7 @@ class FalconDashboard(App):
                 metric["current"],
                 metric["values"],
                 metric["absolute"],
+                terminal=metric.get("terminal", False),
             )
             for metric in metrics
         ]

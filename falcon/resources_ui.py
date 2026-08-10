@@ -49,6 +49,7 @@ from .theme import (
     MINIMUM_HEIGHT,
     MINIMUM_WIDTH,
     MUTED,
+    PALETTE,
     RED,
     WHITE,
     YELLOW,
@@ -101,43 +102,43 @@ def _truncate(value: object, width: int) -> str:
 
 def _schedulable(node: NodeSnapshot) -> tuple[str, str]:
     if node.ready is False:
-        return "Not ready", RED
+        return "Not ready", PALETTE.danger
     if node.ready is None:
-        return "Unknown", YELLOW
+        return "Unknown", PALETTE.warning
     if not node.schedulable:
-        return "Cordoned", RED
-    return "Yes", GREEN
+        return "Cordoned", PALETTE.danger
+    return "Yes", PALETTE.success
 
 
 def _gpu_headroom_color(headroom: int, allocatable: int) -> str:
     if allocatable <= 0:
-        return MUTED
+        return PALETTE.muted
     remaining = max(0, headroom)
     if remaining == 0:
-        return RED
+        return PALETTE.danger
     # A single remaining GPU is not equally risky on every node: 1/2 and
     # 1/4 are cautionary, while 1/8 is already critical availability.
     if remaining * 4 < allocatable:
-        return RED
+        return PALETTE.danger
     if remaining == 1 or remaining * 2 < allocatable:
-        return YELLOW
-    return GREEN
+        return PALETTE.warning
+    return PALETTE.success
 
 
 def _resource_headroom_color(free: float, allocatable: float) -> str:
     """Color remaining scheduler headroom using the CPU/memory pressure scale."""
 
     if allocatable <= 0:
-        return MUTED
+        return PALETTE.muted
     percent_free = min(allocatable, max(0.0, free)) / allocatable * 100
     # These are the availability equivalents of the established request
     # pressure bands: >=80% requested is <=20% free, while <30% requested is
     # >70% free.
     if percent_free <= 20:
-        return RED
+        return PALETTE.danger
     if percent_free <= 70:
-        return YELLOW
-    return GREEN
+        return PALETTE.warning
+    return PALETTE.success
 
 
 @dataclass
@@ -455,26 +456,20 @@ class FalconResourcesApp(App[None]):
                 panel = "pressure"
         elif view == "gpu-allocations":
             history_height, _ = self._allocation_layout()
+            pane = self.query_one("#gpu-allocations-pane")
+            namespace_width = max(
+                22,
+                round(
+                    pane.content_size.width
+                    * (0.42 if self.size.width >= 120 else 0.38)
+                ),
+            )
             if y < history_height:
-                panel = "history"
+                # The shared legend belongs to the pie pane in the top-left
+                # cell; clicking it selects the pie for Enter expansion.
+                panel = "pie" if x < namespace_width else "history"
             else:
-                pane = self.query_one("#gpu-allocations-pane")
-                namespace_width = max(
-                    22,
-                    round(
-                        pane.content_size.width
-                        * (0.42 if self.size.width >= 120 else 0.38)
-                    ),
-                )
-                namespace_width = max(
-                    1,
-                    namespace_width,
-                )
-                panel = (
-                    "pie"
-                    if x < namespace_width
-                    else "pods"
-                )
+                panel = "pie" if x < namespace_width else "pods"
         self.state.selected_panels[view] = panel
         self._render_all()
 
@@ -1121,7 +1116,7 @@ class FalconResourcesApp(App[None]):
                 target.update(
                     Panel(
                         self._gpu_summary(width=width, height=max(5, height - 2)),
-                        title=Text(" GPU SUMMARY ", style=f"bold {CYAN_2}"),
+                        title=Text(" GPU SUMMARY ", style=f"bold {PALETTE.accent}"),
                         box=box.SQUARE,
                         border_style=BORDER,
                         height=height,
@@ -1155,7 +1150,7 @@ class FalconResourcesApp(App[None]):
             target.update(
                 Panel(
                     lines,
-                    title=Text(title, style=f"bold {CYAN_2}"),
+                    title=Text(title, style=f"bold {PALETTE.accent}"),
                     box=box.SQUARE,
                     border_style=BORDER,
                     height=height,
@@ -1201,14 +1196,14 @@ class FalconResourcesApp(App[None]):
         bars.add_row(
             Panel(
                 free_lines,
-                title=Text(" FREE GPUS PER NODE ", style=f"bold {CYAN_2}"),
+                title=Text(" FREE GPUS PER NODE ", style=f"bold {PALETTE.accent}"),
                 box=box.SQUARE,
                 border_style=free_border,
                 height=bars_height,
             ),
             Panel(
                 pressure_lines,
-                title=Text(" GPU REQUEST PRESSURE PER NODE ", style=f"bold {CYAN_2}"),
+                title=Text(" GPU REQUEST PRESSURE PER NODE ", style=f"bold {PALETTE.accent}"),
                 box=box.SQUARE,
                 border_style=pressure_border,
                 height=bars_height,
@@ -1352,18 +1347,6 @@ class FalconResourcesApp(App[None]):
         return min(40, max(20, round(max(1, width) * 0.28)))
 
     @staticmethod
-    def _allocation_legend_height(
-        categories: Sequence[tuple[str, float]],
-        bottom_height: int,
-    ) -> int:
-        """Fit a compact two-column legend above the namespace pie."""
-
-        visible = sum(1 for _, value in categories if value > 0)
-        rows = max(1, (visible + 1) // 2)
-        desired = rows + 2  # legend border
-        return max(3, min(desired, max(3, bottom_height - 5)))
-
-    @staticmethod
     def _allocation_colors(categories: Sequence[tuple[str, float]]) -> dict[str, str]:
         return allocation_colors(name for name, _ in categories)
 
@@ -1387,7 +1370,7 @@ class FalconResourcesApp(App[None]):
         )
         legend_panel = Panel(
             legend,
-            title=Text(" NAMESPACE LEGEND ", style=f"bold {CYAN_2}"),
+            title=Text(" NAMESPACE LEGEND ", style=f"bold {PALETTE.accent}"),
             subtitle=Text(
                 " VRAM % " if basis == "vram" else " GPU COUNT % ",
                 style=GRAY,
@@ -1448,7 +1431,7 @@ class FalconResourcesApp(App[None]):
                 target.update(
                     Panel(
                         content,
-                        title=Text(" ALLOCATION HISTORY ", style=f"bold {CYAN_2}"),
+                        title=Text(" ALLOCATION HISTORY ", style=f"bold {PALETTE.accent}"),
                         subtitle=Text(
                             " VRAM percentages · since launch "
                             if basis == "vram"
@@ -1467,7 +1450,7 @@ class FalconResourcesApp(App[None]):
                         self._gpu_pod_table(),
                         title=Text(
                             " GPU-REQUESTING PODS ",
-                            style=f"bold {CYAN_2}",
+                            style=f"bold {PALETTE.accent}",
                         ),
                         box=box.SQUARE,
                         border_style=BORDER,
@@ -1499,7 +1482,7 @@ class FalconResourcesApp(App[None]):
             target.update(
                 Panel(
                     content,
-                    title=Text(" ALLOCATION BY NAMESPACE ", style=f"bold {CYAN_2}"),
+                    title=Text(" ALLOCATION BY NAMESPACE ", style=f"bold {PALETTE.accent}"),
                     subtitle=Text(
                         " VRAM percentages " if basis == "vram" else " GPU count percentages ",
                         style=GRAY,
@@ -1511,10 +1494,13 @@ class FalconResourcesApp(App[None]):
             )
             return
         history_height, bottom_height = self._allocation_layout()
-        # The normal page gives the history chart the full row. The shared
-        # legend moves above the lower-left pie instead of consuming a tall
-        # side column, which leaves substantially more horizontal chart area.
-        chart_width = max(18, width - 2)
+        # The shared namespace legend sits above the pie in the left column;
+        # Allocation History and GPU-requesting Pods occupy the right column.
+        namespace_width = max(
+            22,
+            round(width * (0.42 if width >= 120 else 0.38)),
+        )
+        chart_width = max(18, width - namespace_width - 2)
         history_key = (
             tuple(self.history),
             categories,
@@ -1535,7 +1521,7 @@ class FalconResourcesApp(App[None]):
             )
         history_panel = Panel(
             self._history_cache,
-            title=Text(" ALLOCATION HISTORY ", style=f"bold {CYAN_2}"),
+            title=Text(" ALLOCATION HISTORY ", style=f"bold {PALETTE.accent}"),
             subtitle=Text(
                 " VRAM percentages · since launch (up to 24h) "
                 if basis == "vram"
@@ -1550,28 +1536,21 @@ class FalconResourcesApp(App[None]):
             ),
             height=history_height,
         )
-
-        namespace_width = max(
-            22,
-            round(width * (0.42 if width >= 120 else 0.38)),
-        )
         unit = "G" if basis == "vram" else ""
         empty_label = self._allocation_empty_label(basis)
-        legend_height = self._allocation_legend_height(categories, bottom_height)
-        pie_height = max(3, bottom_height - legend_height)
         pie_key = (
             categories,
             basis,
             empty_label,
             namespace_width,
-            pie_height,
+            bottom_height,
         )
         if pie_key != self._pie_cache_key or self._pie_cache is None:
             self._pie_cache_key = pie_key
             self._pie_cache = render_namespace_pie(
                 categories,
                 width=max(16, namespace_width - 4),
-                height=max(3, pie_height - 2),
+                height=max(3, bottom_height - 2),
                 unit=unit,
                 empty_label=empty_label,
                 colors=colors,
@@ -1580,55 +1559,50 @@ class FalconResourcesApp(App[None]):
         legend = render_allocation_legend(
             categories,
             width=max(16, namespace_width - 4),
-            height=max(1, legend_height - 2),
+            height=max(1, history_height - 2),
             unit=unit,
             colors=colors,
-            columns=2,
+            columns=1,
         )
         legend_panel = Panel(
             legend,
-            title=Text(" NAMESPACE LEGEND ", style=f"bold {CYAN_2}"),
+            title=Text(" NAMESPACE LEGEND ", style=f"bold {PALETTE.accent}"),
             subtitle=Text(
                 " VRAM % " if basis == "vram" else " GPU COUNT % ",
                 style=GRAY,
             ),
             box=box.SQUARE,
             border_style=BORDER,
-            height=legend_height,
+            height=history_height,
         )
-        namespace = Table.grid(expand=True)
-        namespace.add_column()
-        namespace.add_row(legend_panel)
-        namespace.add_row(
-            Panel(
-                self._pie_cache,
-                title=Text(
-                    " ALLOCATION BY NAMESPACE ",
-                    style=f"bold {CYAN_2}",
-                ),
-                subtitle=Text(
+        pie_panel = Panel(
+            self._pie_cache,
+            title=Text(
+                " ALLOCATION BY NAMESPACE ",
+                style=f"bold {PALETTE.accent}",
+            ),
+            subtitle=Text(
+                (
                     (
-                        (
-                            " VRAM percentages · "
-                            if basis == "vram"
-                            else " GPU count percentages · "
-                        )
-                        + (
-                            f"{self.gpu_telemetry.target_pods} Pods accounted "
-                            if self.gpu_telemetry.target_pods
-                            else "No GPU allocations "
-                        )
-                    ),
-                    style=RED if self.gpu_telemetry.stale else GRAY,
+                        " VRAM percentages · "
+                        if basis == "vram"
+                        else " GPU count percentages · "
+                    )
+                    + (
+                        f"{self.gpu_telemetry.target_pods} Pods accounted "
+                        if self.gpu_telemetry.target_pods
+                        else "No GPU allocations "
+                    )
                 ),
-                box=box.SQUARE,
-                border_style=(
-                    CYAN
-                    if self.state.selected_panels.get("gpu-allocations") == "pie"
-                    else BORDER
-                ),
-                height=pie_height,
-            )
+                style=RED if self.gpu_telemetry.stale else GRAY,
+            ),
+            box=box.SQUARE,
+            border_style=(
+                CYAN
+                if self.state.selected_panels.get("gpu-allocations") == "pie"
+                else BORDER
+            ),
+            height=bottom_height,
         )
         consumers = self._gpu_consumers()
         visible_requests = sum(
@@ -1638,7 +1612,7 @@ class FalconResourcesApp(App[None]):
         hidden = max(0, total_requested - visible_requests)
         pods = Panel(
             self._gpu_pod_table(),
-            title=Text(" GPU-REQUESTING PODS ", style=f"bold {CYAN_2}"),
+            title=Text(" GPU-REQUESTING PODS ", style=f"bold {PALETTE.accent}"),
             subtitle=(
                 Text(f" {visible_requests} visible + {hidden} system/hidden ", style=GRAY)
                 if hidden
@@ -1652,17 +1626,11 @@ class FalconResourcesApp(App[None]):
             ),
             height=bottom_height,
         )
-        bottom = Table.grid(expand=True, padding=(0, 1))
-        bottom.add_column(width=namespace_width)
-        bottom.add_column(ratio=1)
-        bottom.add_row(
-            namespace,
-            pods,
-        )
         content = Table.grid(expand=True)
-        content.add_column()
-        content.add_row(history_panel)
-        content.add_row(bottom)
+        content.add_column(width=namespace_width)
+        content.add_column(ratio=1)
+        content.add_row(legend_panel, history_panel)
+        content.add_row(pie_panel, pods)
         start = self.state.allocation_scroll
         visible = self._allocation_visible_rows()
         end = min(len(consumers), start + visible)

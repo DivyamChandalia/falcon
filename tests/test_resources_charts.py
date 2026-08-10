@@ -12,9 +12,20 @@ from falcon.resources_charts import (
     render_gpu_history,
     render_namespace_pie,
 )
+from falcon.theme import PALETTE
 
 
 class GPUHistoryRendererTests(unittest.TestCase):
+    def test_resources_series_use_the_shared_dashboard_palette(self) -> None:
+        self.assertIs(CHART_COLORS, PALETTE.series)
+        self.assertEqual(CHART_COLORS[:5], (
+            PALETTE.accent,
+            PALETTE.accent_soft,
+            PALETTE.success,
+            PALETTE.warning,
+            PALETTE.danger,
+        ))
+
     @staticmethod
     def points(count: int = 40):
         return [
@@ -72,8 +83,8 @@ class GPUHistoryRendererTests(unittest.TestCase):
     def test_node_series_use_the_expanded_palette_without_collisions(self) -> None:
         names = [f"gpu-node-{index:02d}" for index in range(20)]
         colors = _series_colors(names)
-        self.assertGreaterEqual(len(CHART_COLORS), 20)
-        self.assertEqual(len(set(colors.values())), len(names))
+        self.assertEqual(len(set(CHART_COLORS)), len(CHART_COLORS))
+        self.assertEqual(set(colors.values()), set(CHART_COLORS))
 
 
 class NamespacePieRendererTests(unittest.TestCase):

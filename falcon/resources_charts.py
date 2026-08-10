@@ -12,37 +12,20 @@ from typing import Iterable, Mapping, Sequence
 from rich.text import Text
 
 from .cluster import is_system_namespace, natural_name_key
-from .theme import CYAN, CYAN_2, GRAY, GREEN, MUTED, RED, WHITE, YELLOW
+from .theme import (
+    CYAN,
+    GRAY,
+    MUTED,
+    PALETTE,
+    WHITE,
+)
 
 HISTORY_SECONDS = 24 * 60 * 60
 HISTORY_LIMIT = 20_000
-TOTAL_COLOR = "#ff8700"
-CHART_COLORS = (
-    CYAN_2,
-    GREEN,
-    YELLOW,
-    "#af87ff",
-    "#5f87ff",
-    "#ff5f87",
-    "#5faf5f",
-    "#d7af00",
-    "#87d7ff",
-    "#ff875f",
-    "#87af5f",
-    "#d787ff",
-    "#5fd7d7",
-    "#ffaf5f",
-    "#8787ff",
-    "#d7d75f",
-    "#5fd787",
-    "#ff87d7",
-    "#87afff",
-    "#d75f5f",
-    "#afff87",
-    "#af87d7",
-    "#5fafd7",
-    "#ffafaf",
-)
+# Backwards-compatible names for callers importing the chart palette directly.
+# The source of truth is the same palette used by the Dashboard.
+TOTAL_COLOR = PALETTE.total
+CHART_COLORS = PALETTE.series
 
 
 @dataclass(frozen=True)
@@ -188,7 +171,7 @@ def _legend_lines(
         label_width = max(1, width - len(suffix) - 2)
         label = name if len(name) <= label_width else name[: max(1, label_width - 1)] + "…"
         line = Text()
-        line.append("█ ", style=f"bold {color}")
+        line.append("█ ", style=color)
         line.append(label.ljust(label_width), style=WHITE)
         line.append(suffix, style=GRAY)
         lines.append(line)
@@ -446,7 +429,7 @@ def render_gpu_history(
                 graph.append(" ")
             else:
                 glyph, color, priority = cell
-                graph.append(glyph, style=("bold " if priority == 2 else "") + color)
+                graph.append(glyph, style=color)
         graph.append("\n")
 
     first = datetime.fromtimestamp(sampled[0].timestamp).strftime("%H:%M")
@@ -596,7 +579,7 @@ def render_namespace_pie(
         if show_legend:
             output.append("  ")
         for glyph, color in canvas[y]:
-            output.append(glyph, style=f"bold {color}" if glyph != " " else WHITE)
+            output.append(glyph, style=color if glyph != " " else WHITE)
         if y != height - 1:
             output.append("\n")
     return output

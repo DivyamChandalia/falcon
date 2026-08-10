@@ -192,6 +192,28 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                     app._absolute_metric(80.0, ram_capacity, "GiB"),
                 ],
             )
+            terminal_metrics = app._resource_metrics(
+                completed, app._history_slice(row.uid)
+            )
+            self.assertTrue(all(metric["terminal"] for metric in terminal_metrics))
+            self.assertTrue(
+                all(
+                    app._resource_metric_color(metric, 80.0) == MUTED
+                    for metric in terminal_metrics
+                )
+            )
+            cpu_cell = app._metric_cell(
+                "CPU", 80.0, [80.0], "1.0 / 1.0 vCPU", terminal=True
+            )
+            cpu_offset = cpu_cell.plain.index("80%")
+            self.assertEqual(
+                next(
+                    span.style
+                    for span in cpu_cell.spans
+                    if span.start <= cpu_offset < span.end
+                ),
+                MUTED,
+            )
             self.assertIn("80%", app.export_screenshot(simplify=True))
             app.action_history_left()
             self.assertEqual(app._history_slice(row.uid)[-1].gpu, 10.0)
@@ -778,6 +800,8 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
 
             await pilot.press("right")
             await pilot.click("#gpu-allocations-pane", offset=(5, 2))
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "pie")
+            await pilot.click("#gpu-allocations-pane", offset=(95, 2))
             self.assertEqual(app.state.selected_panels["gpu-allocations"], "history")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
             await pilot.press("enter")

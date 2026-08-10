@@ -15,6 +15,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from .config import DEFAULT_DASHBOARD_EMA_ALPHA, save_dashboard_sort, save_hidden_panes
 from .resources import canonical_gpu, fetch_nodes
+from .theme import metric_color
 
 KUBERNETES_INVENTORY_SECONDS = 5.0
 KUBERNETES_USAGE_SECONDS = 5.0
@@ -301,13 +302,9 @@ def _short_memory(value: float) -> str:
 
 
 def _metric_color(value: Optional[float]) -> str:
-    if value is None:
-        return "#666666"
-    if value >= 80:
-        return "#FF5555"
-    if value >= 30:
-        return "#FFFF55"
-    return "#55FF55"
+    """Compatibility wrapper for the shared Dashboard/Resources palette."""
+
+    return metric_color(value)
 
 
 def _job_sort_key(row: JobUsage) -> Tuple[bool, bool, bool, str]:
