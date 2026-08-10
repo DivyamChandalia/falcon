@@ -10,6 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from textual import events
+from textual.strip import Strip
+from rich.color import ColorSystem
+from rich.segment import Segment
+from rich.style import Style
 
 # Golden rendering is intentionally truecolor and independent of the parent
 # test runner's NO_COLOR setting.
@@ -37,7 +41,7 @@ from falcon.resources_ui import (
     _resource_headroom_color,
     _short_cpu,
 )
-from falcon.theme import GRAY, GREEN, MUTED, RED, YELLOW
+from falcon.theme import GRAY, GREEN, MUTED, PALETTE, RED, YELLOW
 
 DIMENSIONS = (
     (60, 18),
@@ -102,6 +106,32 @@ def _seed_resources_history(app: FalconResourcesApp) -> None:
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def test_apps_force_direct_truecolor_even_when_tmux_advertises_256(self) -> None:
+        """Explicit Falcon hex colours must reach the terminal unchanged."""
+
+        previous_term = os.environ.get("TERM")
+        previous_colorterm = os.environ.get("COLORTERM")
+        try:
+            os.environ["TERM"] = "screen-256color"
+            os.environ.pop("COLORTERM", None)
+            dashboard = FalconDashboard(DemoUsageCollector("mixed"))
+            resources = FalconResourcesApp(DemoCollector())
+            for app in (dashboard, resources):
+                self.assertEqual(app.console._color_system, ColorSystem.TRUECOLOR)
+                rendered = Strip(
+                    [Segment("X", Style(color=PALETTE.accent))], cell_length=1
+                ).render(app.console)
+                self.assertIn("\x1b[38;2;61;175;194m", rendered)
+        finally:
+            if previous_term is None:
+                os.environ.pop("TERM", None)
+            else:
+                os.environ["TERM"] = previous_term
+            if previous_colorterm is None:
+                os.environ.pop("COLORTERM", None)
+            else:
+                os.environ["COLORTERM"] = previous_colorterm
+
     async def test_completed_job_does_not_create_partial_resource_history(self) -> None:
         collector = DemoUsageCollector("mixed")
         app = FalconDashboard(collector, refresh_seconds=999)

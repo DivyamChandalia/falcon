@@ -57,6 +57,9 @@ Dashboard and Resources screens share Falcon's true-colour semantic palette for
 status, pressure, accents, and totals. Namespace slices use the dedicated
 seven-colour colour-blind-friendly palette, with cyan reserved for accents and
 totals.
+Falcon pins the Rich console used by both apps to truecolour output. This is
+intentional for tmux: a `screen-256color` `$TERM` must not downgrade these
+explicit hex colours to xterm-256 or ANSI-16 values.
 The filled namespace pie and Allocation History use one shared percentage
 legend. The legend is a single vertical list in the left column beside
 Allocation History; the pie is below them with GPU-requesting Pods to its right.

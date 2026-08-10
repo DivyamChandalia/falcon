@@ -51,6 +51,7 @@ from .theme import (
     RED,
     WHITE,
     YELLOW,
+    force_truecolor,
 )
 
 
@@ -632,6 +633,7 @@ class FalconDashboard(App):
         clock: Optional[Callable[[], str]] = None,
     ):
         super().__init__()
+        force_truecolor(self.console)
         self.collector = collector
         self.refresh_seconds = refresh_seconds
         self.state = ViewState()

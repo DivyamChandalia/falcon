@@ -2,6 +2,9 @@
 
 from dataclasses import dataclass
 
+from rich.color import ColorSystem
+from rich.console import Console
+
 # Keep semantic colours shared by Dashboard and Resources.  These muted
 # values are intentionally terminal-true-colour rather than the old neon
 # defaults, so the two screens have the same visual language.
@@ -64,6 +67,23 @@ class FalconPalette:
 
 
 PALETTE = FalconPalette()
+
+
+def force_truecolor(console: Console) -> None:
+    """Pin Falcon's Rich/Textual output to direct 24-bit ANSI RGB.
+
+    Textual's default ``auto`` mode follows ``TERM``.  tmux commonly exposes
+    ``screen-256color`` even when the outer terminal (for example iTerm2)
+    supports truecolor, which makes Rich downgrade explicit hex colours to
+    the xterm-256 palette.  Falcon only uses explicit RGB colours, so make the
+    final renderer use ``38;2``/``48;2`` sequences regardless of ``TERM``.
+    """
+
+    # Rich has no public setter for the output colour system.  This is the
+    # Console instance Textual passes to every CompositorUpdate/Strip render;
+    # setting it before the first frame prevents any lower-colour cache from
+    # being populated.
+    console._color_system = ColorSystem.TRUECOLOR
 
 
 def metric_color(value: float | None) -> str:
