@@ -5,6 +5,7 @@ import unittest
 from falcon.resources_charts import (
     CHART_COLORS,
     GPUHistoryPoint,
+    allocation_colors,
     _pie_dimensions,
     _series_colors,
     downsample_history,
@@ -17,14 +18,21 @@ from falcon.theme import PALETTE
 
 class GPUHistoryRendererTests(unittest.TestCase):
     def test_resources_series_use_the_shared_dashboard_palette(self) -> None:
-        self.assertIs(CHART_COLORS, PALETTE.series)
-        self.assertEqual(CHART_COLORS[:5], (
-            PALETTE.accent,
-            PALETTE.accent_soft,
-            PALETTE.success,
-            PALETTE.warning,
-            PALETTE.danger,
+        self.assertIs(CHART_COLORS, PALETTE.pie)
+        self.assertEqual(CHART_COLORS, (
+            "#56B4E9",
+            "#E69F00",
+            "#009E73",
+            "#CC79A7",
+            "#F0E442",
+            "#0072B2",
+            "#D55E00",
         ))
+
+    def test_allocation_colors_use_the_requested_pie_palette(self) -> None:
+        categories = [("alpha", 1), ("beta", 2), ("gamma", 3)]
+        colors = allocation_colors(categories)
+        self.assertEqual(set(colors.values()), set(PALETTE.pie[:3]))
 
     @staticmethod
     def points(count: int = 40):

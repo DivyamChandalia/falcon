@@ -53,9 +53,10 @@ GPU Allocations is scheduler-facing allocation accounting from the same local
 resource snapshot as the other Resources views; it does not query or infer GPU
 compute utilization. The history is collected in the background, is process
 local, and is labeled `since launch` (up to 24 hours and 20,000 points). The
-Dashboard and Resources screens share Falcon's true-colour semantic and series
-palette, so pressure, status, and chart colours remain consistent between
-pages.
+Dashboard and Resources screens share Falcon's true-colour semantic palette for
+status, pressure, accents, and totals. Namespace slices use the dedicated
+seven-colour colour-blind-friendly palette, with cyan reserved for accents and
+totals.
 The filled namespace pie and Allocation History use one shared percentage
 legend. The legend is a single vertical list in the left column beside
 Allocation History; the pie is below them with GPU-requesting Pods to its right.

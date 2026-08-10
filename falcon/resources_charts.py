@@ -25,7 +25,7 @@ HISTORY_LIMIT = 20_000
 # Backwards-compatible names for callers importing the chart palette directly.
 # The source of truth is the same palette used by the Dashboard.
 TOTAL_COLOR = PALETTE.total
-CHART_COLORS = PALETTE.series
+CHART_COLORS = PALETTE.pie
 
 
 @dataclass(frozen=True)
@@ -130,10 +130,23 @@ def _series_colors(names: Iterable[str]) -> dict[str, str]:
     return colors
 
 
-def allocation_colors(names: Iterable[str]) -> dict[str, str]:
-    """Return stable, collision-free colors for shared allocation legends."""
+def allocation_colors(values: Iterable[tuple[str, float]]) -> dict[str, str]:
+    """Return stable namespace colours from the shared pie palette."""
 
-    return _series_colors(names)
+    entries = [(str(name), max(0.0, float(value))) for name, value in values]
+    ordered = sorted(entries, key=lambda item: natural_name_key(item[0]))
+    colors: dict[str, str] = {}
+    visible_index = 0
+    for name, _ in ordered:
+        if name == "System/hidden":
+            colors[name] = PALETTE.muted
+        else:
+            colors[name] = PALETTE.pie[visible_index % len(PALETTE.pie)]
+            visible_index += 1
+    return {
+        name: colors[name]
+        for name, _ in entries
+    }
 
 
 def _number(value: float, *, unit: str = "") -> str:
@@ -224,7 +237,7 @@ def render_allocation_legend(
     total = sum(value for _, value in values)
     if not total:
         return Text("No GPU allocation"[:width], style=MUTED)
-    palette = dict(colors or allocation_colors(name for name, _ in values))
+    palette = dict(colors or allocation_colors(values))
     if "System/hidden" in palette:
         palette["System/hidden"] = MUTED
     columns = max(1, min(int(columns), len(values)))
@@ -342,11 +355,17 @@ def render_gpu_history(
         names = [name for name, _ in categories if name in category_names]
     if not names:
         return Text("Collecting history"[:width], style=MUTED, justify="center")
-    colors = dict(colors or allocation_colors(names))
-    if "System/hidden" in colors:
-        colors["System/hidden"] = MUTED
     latest_values = selected[-1]
     latest_total = sum(latest_values.values())
+    colors = dict(
+        colors
+        or allocation_colors(
+            (name, latest_values.get(name, 0.0))
+            for name in names
+        )
+    )
+    if "System/hidden" in colors:
+        colors["System/hidden"] = MUTED
     unit = "G" if basis == "vram" else ""
     longest_label = max(
         len(name) + len(_number(latest_values.get(name, 0), unit=unit)) + 7
@@ -518,12 +537,11 @@ def render_namespace_pie(
     radius = max(2.0, min(pie_width / 2 - 0.5, height - 1.0))
     cumulative: list[tuple[float, str]] = []
     progress = 0.0
-    palette = dict(colors or allocation_colors(name for name, _ in values))
+    palette = dict(colors or allocation_colors(values))
     if "System/hidden" in palette:
         palette["System/hidden"] = MUTED
     slice_colors: dict[str, str] = {}
-    visible_color_index = 0
-    for name, value in values:
+    for index, (name, value) in enumerate(values):
         progress += value / total
         cumulative.append((progress, name))
         if name == "System/hidden":
@@ -531,9 +549,8 @@ def render_namespace_pie(
         else:
             slice_colors[name] = palette.get(
                 name,
-                CHART_COLORS[visible_color_index % len(CHART_COLORS)],
+                PALETTE.pie[index % len(PALETTE.pie)],
             )
-            visible_color_index += 1
 
     canvas: list[list[tuple[str, str]]] = [
         [(" ", WHITE) for _ in range(pie_width)] for _ in range(height)

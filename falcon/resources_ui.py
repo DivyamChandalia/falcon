@@ -1348,7 +1348,7 @@ class FalconResourcesApp(App[None]):
 
     @staticmethod
     def _allocation_colors(categories: Sequence[tuple[str, float]]) -> dict[str, str]:
-        return allocation_colors(name for name, _ in categories)
+        return allocation_colors(categories)
 
     def _allocation_chart_with_legend(
         self,

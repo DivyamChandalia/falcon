@@ -29,6 +29,17 @@ SERIES_COLORS = (
     MUTED,
 )
 
+# Color-blind-friendly true-colour palette for namespace allocation slices.
+PIE_COLORS = (
+    "#56B4E9",  # sky blue
+    "#E69F00",  # orange
+    "#009E73",  # bluish green
+    "#CC79A7",  # reddish purple
+    "#F0E442",  # yellow
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+)
+
 
 @dataclass(frozen=True)
 class FalconPalette:
@@ -45,6 +56,7 @@ class FalconPalette:
     border: str = BORDER
     background: str = BACKGROUND
     series: tuple[str, ...] = SERIES_COLORS
+    pie: tuple[str, ...] = PIE_COLORS
     total: str = CYAN
 
 
