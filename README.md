@@ -124,21 +124,17 @@ falcon resources
 <p align="center"><sub>Live cluster resource snapshot captured from Falcon.</sub></p>
 
 The resources dashboard reports request headroom—not guessed usage—and lets
-you cycle through three views with <kbd>←</kbd>/<kbd>→</kbd> (the view labels
+you cycle through two views with <kbd>←</kbd>/<kbd>→</kbd> (the view labels
 are clickable too). Falcon restores the last selected view on the next launch:
 
 - **Nodes** keeps the cluster inventory and expandable selected-node inspector.
-- **GPU Overview** shows allocatable GPUs, current scheduler requests, free
-  GPUs, request pressure, and synchronized per-node bars.
+  Compact terminals show free/allocatable GPU counts; wide terminals turn them
+  into requested/free bars in the cluster summary and each node row.
 - **GPU Allocations** keeps allocation history in the background as soon as the
   TUI launches, so namespace history is already present when you open the view.
   It also shows a filled namespace pie and the active Pods requesting GPUs.
   Press <kbd>v</kbd> to size the pie by allocated VRAM instead of requested GPU
   count.
-
-<p align="center">
-  <img src="assets/falcon-resources-overview.svg" alt="Falcon GPU request overview" width="100%">
-</p>
 
 <p align="center">
   <img src="assets/falcon-resources-allocations.svg" alt="Falcon GPU allocations and request history" width="100%">
@@ -153,7 +149,7 @@ Structured output retains `owner_identity` only when a reliable label or
 annotation provides one. GPU history is process-local, keeps at most 24 hours
 since launch. Namespace percentages are either requested GPU count divided by
 total requested GPU count, or allocated VRAM divided by total allocated VRAM.
-The overview cards and Pod table remain scheduler-facing allocation/request
+The responsive GPU bars and Pod table remain scheduler-facing allocation/request
 data; no GPU compute utilization is inferred.
 
 ## Coding agents

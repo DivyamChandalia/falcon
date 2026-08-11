@@ -785,7 +785,7 @@ class InspectionCliTests(CliHarness):
             namespace=None,
         )
         config = json.loads(json.dumps(DEFAULT_CONFIG))
-        config["resources"]["last_view"] = "gpu-overview"
+        config["resources"]["last_view"] = "gpu-allocations"
         with patch("falcon.cli.sys.stdout.isatty", return_value=True), patch(
             "falcon.cli._resource_snapshot", return_value=(collector, snapshot)
         ), patch("falcon.cli.FalconResourcesApp", App), patch(
@@ -794,7 +794,7 @@ class InspectionCliTests(CliHarness):
             code = _resources_command(args, config, "/tmp/falcon-test-config")
             captured["persist_view"]("gpu-allocations")
         self.assertEqual(code, 0)
-        self.assertEqual(captured["initial_view"], "gpu-overview")
+        self.assertEqual(captured["initial_view"], "gpu-allocations")
         self.assertTrue(captured["mouse"])
         save.assert_called_once_with(
             "gpu-allocations", "/tmp/falcon-test-config"
@@ -1061,12 +1061,24 @@ class SetupTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "resources.last_view"):
             save_resources_view("not-a-view", "/tmp/unused-falcon-config")
+        with self.assertRaisesRegex(ValueError, "resources.last_view"):
+            save_resources_view("gpu-overview", "/tmp/unused-falcon-config")
 
     def test_invalid_persisted_resources_view_falls_back_to_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / ".falconrc"
             target.write_text(
                 "version: 1\nresources:\n  last_view: retired-preview\n",
+                encoding="utf-8",
+            )
+            config = load_config(str(target))
+        self.assertEqual(config["resources"]["last_view"], "nodes")
+
+    def test_retired_gpu_overview_view_migrates_to_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            target.write_text(
+                "version: 1\nresources:\n  last_view: gpu-overview\n",
                 encoding="utf-8",
             )
             config = load_config(str(target))

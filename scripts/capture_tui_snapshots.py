@@ -213,50 +213,45 @@ async def capture() -> None:
         ("resources-80x22", "mixed", (80, 22), ()),
         ("resources-140x32", "mixed", (140, 32), ()),
         ("resources-200x50", "mixed", (200, 50), ()),
-        ("resources-gpu-overview-80x22", "mixed", (80, 22), ("right",)),
-        ("resources-gpu-overview-140x32", "mixed", (140, 32), ("right",)),
-        ("resources-gpu-overview-200x50", "mixed", (200, 50), ("right",)),
         (
             "resources-gpu-allocations-80x22",
             "mixed",
             (80, 22),
-            (seed_resources_history, "right", "right"),
+            (seed_resources_history, "right"),
         ),
         (
             "resources-gpu-allocations-140x32",
             "mixed",
             (140, 32),
-            (seed_resources_history, "right", "right"),
+            (seed_resources_history, "right"),
         ),
         (
             "resources-gpu-allocations-200x50",
             "mixed",
             (200, 50),
-            (seed_resources_history, "right", "right"),
+            (seed_resources_history, "right"),
         ),
         (
             "resources-gpu-allocations-vram-140x32",
             "mixed",
             (140, 32),
-            (seed_resources_history, "right", "right", "v"),
+            (seed_resources_history, "right", "v"),
         ),
         ("resources-node-expanded-80x22", "mixed", (80, 22), ("enter",)),
         ("resources-node-expanded-140x40", "mixed", (140, 40), ("enter",)),
         ("resources-stale", "stale", (120, 30), ()),
         ("resources-no-jobs", "no-jobs", (120, 30), ()),
-        ("resources-gpu-overview-stale", "stale", (140, 32), ("right",)),
         (
             "resources-gpu-allocations-stale",
             "stale",
             (140, 32),
-            (seed_resources_history, "right", "right"),
+            (seed_resources_history, "right"),
         ),
-        ("resources-gpu-overview-no-gpus", "no-gpus", (140, 32), ("right",)),
         (
             "resources-gpu-allocations-no-gpus",
             "no-gpus",
             (140, 32),
-            ("right", "right"),
+            ("right",),
         ),
     )
     for name, state, size, actions in resource_states:
@@ -273,21 +268,14 @@ async def capture() -> None:
     resources_asset, resources_digest = await resources_capture(
         "resources-asset", state="mixed", size=(140, 32)
     )
-    overview_asset, overview_digest = await resources_capture(
-        "resources-overview-asset",
-        state="mixed",
-        size=(140, 32),
-        actions=("right",),
-    )
     allocations_asset, allocations_digest = await resources_capture(
         "resources-allocations-asset",
         state="mixed",
         size=(140, 32),
-        actions=(seed_resources_history, "right", "right"),
+        actions=(seed_resources_history, "right"),
     )
     results[dashboard_asset] = dashboard_digest
     results[resources_asset] = resources_digest
-    results[overview_asset] = overview_digest
     results[allocations_asset] = allocations_digest
 
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
@@ -309,10 +297,6 @@ async def capture() -> None:
     )
     (ASSETS / "falcon-resources.svg").write_text(
         (ARTIFACTS / "resources-asset.svg").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (ASSETS / "falcon-resources-overview.svg").write_text(
-        (ARTIFACTS / "resources-overview-asset.svg").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     (ASSETS / "falcon-resources-allocations.svg").write_text(

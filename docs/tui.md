@@ -5,8 +5,8 @@ message. Layouts adapt from 80×22 through wide monitoring displays. Dashboard
 and Resources refresh on the same one-second cadence. Dashboard resource usage
 keeps a readable fixed height; at the shortest supported heights Events is
 temporarily hidden and returns automatically when space is available.
-The Resources summary uses the same two-row header rhythm and keeps nodes,
-running Jobs, CPU, memory, and GPU availability on one line.
+The Resources header keeps its view selector on the title row. The summary
+keeps nodes, running Jobs, GPU, CPU, and memory availability on one line.
 
 ## Jobs dashboard
 
@@ -30,18 +30,21 @@ page) resumes follow. Changing Jobs resets event position predictably.
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump
 - `Enter`: inspect the node and its consumers
 - `Esc`: return to node list
-- `←` / `→`: cycle Nodes, GPU Overview, and GPU Allocations (wraps)
+- `←` / `→`: cycle Nodes and GPU Allocations (wraps)
 - `v`: switch the namespace pie between requested GPU count and allocated VRAM
-- Click a GPU Overview or GPU Allocations sub-pane to select it; `Enter`
-  expands the selection and `Esc` restores it
+- Click a GPU Allocations sub-pane to select it; `Enter` expands the selection
+  and `Esc` restores it
 - `r`: refresh; `q`: quit
 
 The node list uses a single schedulability state (`Yes`, `Cordoned`,
 `Not ready`, or `Unknown`). Infrastructure Pods are omitted from consumer
 rows and Pod counts, while their requests remain included in headroom totals.
 The header marks stale snapshots while retaining their last valid values.
-GPU, CPU, memory, and Pod columns are compact and numeric values are
-right-aligned. CPU headroom is shown consistently in decimal cores. The node
+The selected node row is highlighted across its full width. Compact terminals
+show numeric GPU free/allocatable headroom; wide terminals show requested/free
+bars in the summary and node rows. GPU, CPU, memory, and Pod columns remain
+right-aligned, and inspector resources are ordered GPU, CPU, then memory. CPU
+headroom is shown consistently in decimal cores. The node
 inventory keeps a fixed height so every row gets priority; the selected-node
 panel expands or shrinks into the remaining space and is hidden only when it
 reaches its minimum height. `Enter` still opens the full inspector. Hover the

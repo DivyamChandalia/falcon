@@ -33,20 +33,20 @@
     }
 
     .terminal-ID-r1 { fill: #c5c8c6 }
-.terminal-ID-r2 { fill: #56b4e9;font-weight: bold }
-.terminal-ID-r3 { fill: #e6e6e6 }
+.terminal-ID-r2 { fill: #8afaff;font-weight: bold }
+.terminal-ID-r3 { fill: #ffffff }
 .terminal-ID-r4 { fill: #aaaaaa }
-.terminal-ID-r5 { fill: #56b4e9 }
-.terminal-ID-r6 { fill: #009e73;font-weight: bold }
-.terminal-ID-r7 { fill: #f0e442;font-weight: bold }
-.terminal-ID-r8 { fill: #d55e00;font-weight: bold }
-.terminal-ID-r9 { fill: #e6e6e6;font-weight: bold }
+.terminal-ID-r5 { fill: #8afaff }
+.terminal-ID-r6 { fill: #4fd874;font-weight: bold }
+.terminal-ID-r7 { fill: #fff87a;font-weight: bold }
+.terminal-ID-r8 { fill: #e35c5c;font-weight: bold }
+.terminal-ID-r9 { fill: #ffffff;font-weight: bold }
 .terminal-ID-r10 { fill: #aaaaaa;font-weight: bold }
 .terminal-ID-r11 { fill: #666666;font-weight: bold }
 .terminal-ID-r12 { fill: #555555 }
-.terminal-ID-r13 { fill: #f0e442 }
-.terminal-ID-r14 { fill: #d55e00 }
-.terminal-ID-r15 { fill: #009e73 }
+.terminal-ID-r13 { fill: #fff87a }
+.terminal-ID-r14 { fill: #e35c5c }
+.terminal-ID-r15 { fill: #4fd874 }
     </style>
 
     <defs>

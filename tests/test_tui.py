@@ -42,7 +42,7 @@ from falcon.resources_ui import (
     _resource_headroom_color,
     _short_cpu,
 )
-from falcon.theme import GRAY, GREEN, MUTED, PALETTE, RED, YELLOW
+from falcon.theme import BACKGROUND, CYAN, GRAY, GREEN, MUTED, PALETTE, RED, YELLOW
 
 DIMENSIONS = (
     (60, 18),
@@ -106,6 +106,11 @@ def _seed_resources_history(app: FalconResourcesApp) -> None:
     app._render_all()
 
 
+def _rgb_values(value: str) -> tuple[int, int, int]:
+    value = value.removeprefix("#")
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
+
+
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
     def test_apps_force_direct_truecolor_even_when_tmux_advertises_256(self) -> None:
         """Explicit Falcon hex colours must reach the terminal unchanged."""
@@ -134,7 +139,12 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     cell_length=1,
                 ).render(app.console)
-                self.assertIn("\x1b[38;2;86;180;233;48;2;0;158;115m", rendered)
+                accent = ";".join(map(str, _rgb_values(PALETTE.accent)))
+                success = ";".join(map(str, _rgb_values(PALETTE.success)))
+                self.assertIn(
+                    f"\x1b[38;2;{accent};48;2;{success}m",
+                    rendered,
+                )
         finally:
             if previous_term is None:
                 os.environ.pop("TERM", None)
@@ -161,7 +171,8 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 rendered = Strip(
                     [Segment("X", Style(color=PALETTE.accent))], cell_length=1
                 ).render(app.console)
-                self.assertNotIn("\x1b[38;2;86;180;233m", rendered)
+                accent = ";".join(map(str, _rgb_values(PALETTE.accent)))
+                self.assertNotIn(f"\x1b[38;2;{accent}m", rendered)
 
     def test_truecolor_clears_rich_style_quantization_cache(self) -> None:
         fallback = FalconDashboard(DemoUsageCollector("mixed"), color_mode="256")
@@ -174,15 +185,19 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
         rendered = truecolor.console._render_buffer(
             list(truecolor.console.render(Text("X", style=PALETTE.accent)))
         )
-        self.assertIn("\x1b[38;2;86;180;233m", rendered)
-        self.assertNotIn("\x1b[38;5;74m", rendered)
+        accent = ";".join(map(str, _rgb_values(PALETTE.accent)))
+        self.assertIn(f"\x1b[38;2;{accent}m", rendered)
+        self.assertNotIn("\x1b[38;5;", rendered)
 
     def test_colour_mode_log_reports_framework_and_rgb_triplet(self) -> None:
         with self.assertLogs("falcon.tui.color", level="INFO") as captured:
             FalconDashboard(DemoUsageCollector("mixed"), color_mode="truecolor")
         self.assertIn("colour mode: truecolor", captured.output[0])
         self.assertIn("framework=", captured.output[0])
-        self.assertIn("#56B4E9=rgb(86, 180, 233)", captured.output[0])
+        self.assertIn(
+            f"{PALETTE.accent}=rgb{_rgb_values(PALETTE.accent)}",
+            captured.output[0],
+        )
 
     async def test_completed_job_does_not_create_partial_resource_history(self) -> None:
         collector = DemoUsageCollector("mixed")
@@ -700,8 +715,8 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Falcon Resources", header.plain)
             self.assertIn("12:00:00  ◴", header.plain)
             self.assertNotIn("\n", overview.plain)
+            self.assertLess(overview.plain.index("GPU"), overview.plain.index("CPU"))
             self.assertLess(overview.plain.index("CPU"), overview.plain.index("MEM"))
-            self.assertLess(overview.plain.index("MEM"), overview.plain.index("GPU"))
             running_style = overview.get_style_at_offset(overview.plain.index("RUN"))
             self.assertTrue(running_style.bold)
             self.assertEqual(running_style.foreground.hex6, GREEN)
@@ -710,7 +725,54 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(label_style.bold)
                 self.assertEqual(label_style.foreground.hex6, GRAY)
 
-    async def test_three_views_wrap_restore_persist_and_support_clicks(self) -> None:
+    async def test_nodes_merge_responsive_gpu_bars_and_highlight_selection(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            compact = app.query_one("#cluster-overview").render().plain
+            self.assertRegex(compact, r"GPU \d+/\d+")
+            self.assertNotIn(" req ", compact)
+
+            table = vars(app.query_one("#nodes-pane"))["_Static__content"]
+            segments = list(
+                app.console.render(
+                    table,
+                    app.console.options.update(width=76, height=12),
+                )
+            )
+            selected = next(segment for segment in segments if "node-a-h100" in segment.text)
+            self.assertEqual(selected.style.color.name.upper(), BACKGROUND)
+            self.assertEqual(selected.style.bgcolor.name.upper(), CYAN)
+
+            await pilot.resize_terminal(140, 32)
+            await pilot.pause()
+            wide_overview = app.query_one("#cluster-overview").render().plain
+            self.assertIn(" req ", wide_overview)
+            self.assertIn(" free", wide_overview)
+            table = vars(app.query_one("#nodes-pane"))["_Static__content"]
+            wide_text = "".join(
+                segment.text
+                for segment in app.console.render(
+                    table,
+                    app.console.options.update(width=136, height=20),
+                )
+            )
+            self.assertIn("GPU REQUESTED / FREE", wide_text)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            inspector = vars(app.query_one("#node-pane"))["_Static__content"]
+            inspector_text = "".join(
+                segment.text
+                for segment in app.console.render(
+                    inspector,
+                    app.console.options.update(width=136, height=30),
+                )
+            )
+            self.assertLess(inspector_text.index("GPU model"), inspector_text.index("CPU capacity"))
+            self.assertLess(inspector_text.index("CPU capacity"), inspector_text.index("RAM capacity"))
+
+    async def test_two_views_wrap_restore_persist_and_support_clicks(self) -> None:
         saved = []
         app = FalconResourcesApp(
             DemoCollector("mixed"),
@@ -720,8 +782,8 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         )
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
-            self.assertEqual(app.state.view, "gpu-overview")
-            self.assertEqual(app.focused.id, "gpu-overview-pane")
+            self.assertEqual(app.state.view, "nodes")
+            self.assertEqual(app.focused.id, "nodes-pane")
 
             await pilot.press("right")
             self.assertEqual(app.state.view, "gpu-allocations")
@@ -747,11 +809,11 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
 
             app.persist_view = fail_to_save
             await pilot.press("right")
-            self.assertEqual(app.state.view, "gpu-overview")
+            self.assertEqual(app.state.view, "gpu-allocations")
 
         fallback = FalconResourcesApp(DemoCollector("mixed"), initial_view="invalid")
         self.assertEqual(fallback.state.view, "nodes")
-        self.assertEqual(RESOURCE_VIEWS, ("nodes", "gpu-overview", "gpu-allocations"))
+        self.assertEqual(RESOURCE_VIEWS, ("nodes", "gpu-allocations"))
 
     async def test_view_switching_preserves_each_scroll_and_node_state(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
@@ -798,8 +860,6 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             app.state.active_pane = "node"
 
             await pilot.press("right")
-            app.state.overview_scroll = 2
-            await pilot.press("right")
             app.state.allocation_scroll = 1
             await pilot.resize_terminal(140, 32)
             await pilot.press("right")
@@ -810,12 +870,10 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.consumer_scroll, 1)
             self.assertEqual(app.state.focused_panes["nodes"], "node")
 
-            await pilot.press("right", "right")
+            await pilot.press("right")
             self.assertEqual(app.state.allocation_scroll, 1)
-            await pilot.press("left")
-            self.assertEqual(app.state.overview_scroll, 2)
 
-    async def test_gpu_page_arrows_route_to_their_own_scroll_offsets(self) -> None:
+    async def test_gpu_allocation_arrows_use_their_own_scroll_offset(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
         source = snapshot.nodes[0]
         nodes = tuple(
@@ -832,17 +890,13 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = FalconResourcesApp(
-            Collector(), refresh_seconds=999, initial_view="gpu-overview"
+            Collector(), refresh_seconds=999, initial_view="gpu-allocations"
         )
         async with app.run_test(size=(80, 22)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("down", "down")
-            self.assertEqual(app.state.overview_scroll, 2)
-            self.assertEqual(app.state.node_scroll, 0)
-            await pilot.press("right")
-            await pilot.press("down")
             self.assertGreaterEqual(app.state.allocation_scroll, 1)
-            self.assertEqual(app.state.overview_scroll, 2)
+            self.assertEqual(app.state.node_scroll, 0)
 
     async def test_gpu_telemetry_collects_before_allocations_view_and_v_toggles_pie(self) -> None:
         app = FalconResourcesApp(
@@ -854,7 +908,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.view, "nodes")
             self.assertEqual(len(app.history), 1)
 
-            await pilot.press("right", "right")
+            await pilot.press("right")
             self.assertEqual(app.state.view, "gpu-allocations")
             self.assertEqual(app.state.namespace_basis, "gpu")
             await pilot.press("v")
@@ -868,19 +922,10 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         app = FalconResourcesApp(
             DemoCollector("mixed"),
             refresh_seconds=999,
-            initial_view="gpu-overview",
+            initial_view="gpu-allocations",
         )
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
-            await pilot.click("#gpu-overview-pane", offset=(5, 2))
-            self.assertEqual(app.state.selected_panels["gpu-overview"], "summary")
-            self.assertEqual(app.state.expanded_panels["gpu-overview"], "")
-            await pilot.press("enter")
-            self.assertEqual(app.state.expanded_panels["gpu-overview"], "summary")
-            await pilot.press("escape")
-            self.assertEqual(app.state.expanded_panels["gpu-overview"], "")
-
-            await pilot.press("right")
             await pilot.click("#gpu-allocations-pane", offset=(5, 2))
             self.assertEqual(app.state.selected_panels["gpu-allocations"], "pie")
             await pilot.click("#gpu-allocations-pane", offset=(95, 2))
@@ -919,8 +964,6 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history_renderer.call_count, 0)
                 self.assertEqual(pie_renderer.call_count, 0)
 
-                await pilot.press("right")
-                self.assertEqual(history_renderer.call_count, 0)
                 await pilot.press("right")
                 self.assertEqual(history_renderer.call_count, 1)
                 self.assertEqual(pie_renderer.call_count, 1)
@@ -1160,14 +1203,14 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.5)
             self.assertFalse(app._detail_auto_hidden)
             self.assertEqual(app.query_one("#nodes-pane").region.height, 15)
-            self.assertEqual(app.query_one("#node-pane").region.height, 6)
+            self.assertEqual(app.query_one("#node-pane").region.height, 7)
             await pilot.click("#node-pane", offset=(2, 2))
             self.assertEqual(app.state.active_pane, "node")
             await pilot.resize_terminal(140, 24)
             await pilot.pause()
             self.assertTrue(app._detail_auto_hidden)
             self.assertFalse(app.query_one("#node-pane").display)
-            self.assertEqual(app.query_one("#nodes-pane").region.height, 18)
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 19)
             self.assertEqual(app.state.active_pane, "nodes")
             self.assertIs(app.focused, app.query_one("#nodes-pane"))
 
@@ -1601,32 +1644,29 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             ("resources-80x22", "mixed", (80, 22), ()),
             ("resources-140x32", "mixed", (140, 32), ()),
             ("resources-200x50", "mixed", (200, 50), ()),
-            ("resources-gpu-overview-80x22", "mixed", (80, 22), ("right",)),
-            ("resources-gpu-overview-140x32", "mixed", (140, 32), ("right",)),
-            ("resources-gpu-overview-200x50", "mixed", (200, 50), ("right",)),
             (
                 "resources-gpu-allocations-80x22",
                 "mixed",
                 (80, 22),
-                (_seed_resources_history, "right", "right"),
+                (_seed_resources_history, "right"),
             ),
             (
                 "resources-gpu-allocations-140x32",
                 "mixed",
                 (140, 32),
-                (_seed_resources_history, "right", "right"),
+                (_seed_resources_history, "right"),
             ),
             (
                 "resources-gpu-allocations-200x50",
                 "mixed",
                 (200, 50),
-                (_seed_resources_history, "right", "right"),
+                (_seed_resources_history, "right"),
             ),
             (
                 "resources-gpu-allocations-vram-140x32",
                 "mixed",
                 (140, 32),
-                (_seed_resources_history, "right", "right", "v"),
+                (_seed_resources_history, "right", "v"),
             ),
             ("resources-node-expanded-80x22", "mixed", (80, 22), ("enter",)),
             (
@@ -1637,19 +1677,17 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("resources-stale", "stale", (120, 30), ()),
             ("resources-no-jobs", "no-jobs", (120, 30), ()),
-            ("resources-gpu-overview-stale", "stale", (140, 32), ("right",)),
             (
                 "resources-gpu-allocations-stale",
                 "stale",
                 (140, 32),
-                (_seed_resources_history, "right", "right"),
+                (_seed_resources_history, "right"),
             ),
-            ("resources-gpu-overview-no-gpus", "no-gpus", (140, 32), ("right",)),
             (
                 "resources-gpu-allocations-no-gpus",
                 "no-gpus",
                 (140, 32),
-                ("right", "right"),
+                ("right",),
             ),
         )
         for name, state, size, actions in resource_states:

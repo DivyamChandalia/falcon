@@ -159,14 +159,17 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         if key in raw:
             result[key] = copy.deepcopy(raw[key])
     resources = result.get("resources")
-    if isinstance(resources, dict) and resources.get("last_view", "nodes") not in {
-        "nodes",
-        "gpu-overview",
-        "gpu-allocations",
-    }:
-        # A display preference should never make Falcon unusable after a
-        # downgrade, hand edit, or retired preview value.
-        resources.pop("last_view", None)
+    if isinstance(resources, dict):
+        if resources.get("last_view") == "gpu-overview":
+            # GPU overview was folded into the responsive Nodes page.
+            resources["last_view"] = "nodes"
+        elif resources.get("last_view", "nodes") not in {
+            "nodes",
+            "gpu-allocations",
+        }:
+            # A display preference should never make Falcon unusable after a
+            # downgrade, hand edit, or retired preview value.
+            resources.pop("last_view", None)
     if isinstance(raw.get("cluster"), dict):
         result["cluster"] = {
             key: value for key, value in raw["cluster"].items()
@@ -281,9 +284,9 @@ def validate_config(config: Dict[str, Any]) -> None:
             "resources.shared_memory_percent must be between 0 and 100"
         )
     resources_view = config.get("resources", {}).get("last_view", "nodes")
-    if resources_view not in {"nodes", "gpu-overview", "gpu-allocations"}:
+    if resources_view not in {"nodes", "gpu-allocations"}:
         raise ValueError(
-            "resources.last_view must be nodes, gpu-overview, or gpu-allocations"
+            "resources.last_view must be nodes or gpu-allocations"
         )
     job = config.get("job", {})
     for key in ("backoff_limit", "ttl_seconds_after_finished"):
@@ -371,9 +374,9 @@ def save_dashboard_sort(
 def save_resources_view(view: str, path: Optional[str] = None) -> Path:
     """Atomically persist the last Resources TUI page."""
 
-    if view not in {"nodes", "gpu-overview", "gpu-allocations"}:
+    if view not in {"nodes", "gpu-allocations"}:
         raise ValueError(
-            "resources.last_view must be nodes, gpu-overview, or gpu-allocations"
+            "resources.last_view must be nodes or gpu-allocations"
         )
     target = config_path(path)
     if not target.exists():

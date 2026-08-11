@@ -16,12 +16,12 @@ _COLOR_LOGGER = logging.getLogger("falcon.tui.color")
 # Keep semantic colours shared by Dashboard and Resources.  These muted
 # values are intentionally terminal-true-colour rather than the old neon
 # defaults, so the two screens have the same visual language.
-CYAN = "#56B4E9"
+CYAN = "#8AFAFF"
 CYAN_2 = CYAN
-GREEN = "#009E73"
-YELLOW = "#F0E442"
-RED = "#D55E00"
-WHITE = "#E6E6E6"
+GREEN = "#4FD874"
+YELLOW = "#FFF87A"
+RED = "#E35C5C"
+WHITE = "#FFFFFF"
 GRAY = "#AAAAAA"
 MUTED = "#666666"
 BORDER = "#555555"

@@ -56,16 +56,18 @@ from .theme import (
     configure_color,
 )
 
-RESOURCE_VIEWS = ("nodes", "gpu-overview", "gpu-allocations")
+RESOURCE_VIEWS = ("nodes", "gpu-allocations")
 RESOURCE_VIEW_LABELS = {
     "nodes": "Nodes",
-    "gpu-overview": "GPU Overview",
     "gpu-allocations": "GPU Allocations",
 }
 
 
 def _valid_view(value: object) -> str:
     normalized = str(value or "")
+    if normalized == "gpu-overview":
+        # The retired overview is now represented responsively in Nodes.
+        return "nodes"
     return normalized if normalized in RESOURCE_VIEWS else "nodes"
 
 
@@ -151,25 +153,21 @@ class ResourcesViewState:
     selected_consumer: int = 0
     consumer_scroll: int = 0
     active_pane: str = "nodes"
-    overview_scroll: int = 0
     allocation_scroll: int = 0
     namespace_basis: str = "gpu"
     expanded_panels: dict[str, str] = field(
         default_factory=lambda: {
-            "gpu-overview": "",
             "gpu-allocations": "",
         }
     )
     selected_panels: dict[str, str] = field(
         default_factory=lambda: {
-            "gpu-overview": "summary",
             "gpu-allocations": "history",
         }
     )
     focused_panes: dict[str, str] = field(
         default_factory=lambda: {
             "nodes": "nodes",
-            "gpu-overview": "gpu-overview",
             "gpu-allocations": "gpu-allocations",
         }
     )
@@ -217,7 +215,7 @@ class ResourcesPane(Static):
     def on_click(self, event: events.Click) -> None:
         self._activate()
         self.app.set_focus(self, scroll_visible=False)
-        if self.id == "gpu-overview-pane" or self.id == "gpu-allocations-pane":
+        if self.id == "gpu-allocations-pane":
             callback = getattr(self.app, "gpu_panel_selected", None)
             if callback:
                 callback(
@@ -245,7 +243,18 @@ CSS = f"""
 Screen {{ background: {BACKGROUND}; color: {WHITE}; overflow: hidden; }}
 Static {{ background: {BACKGROUND}; }}
 #resources-header {{ height: 1; padding: 0 1; color: {WHITE}; }}
-#resources-views {{ height: 1; padding: 0 1; color: {GRAY}; }}
+# The view selector is an overlay on the header row. Its horizontal offset is
+# calculated from the terminal width in ``_render_views`` so the labels remain
+# centered without consuming a second layout row.
+#resources-views {{
+    position: absolute;
+    offset: 0 0;
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: {GRAY};
+    background: transparent;
+}}
 #cluster-overview {{ height: 2; border-bottom: solid {BORDER}; padding: 0 1; }}
 #resource-controls {{ height: 1; padding: 0 1; color: {GRAY}; }}
 ResourcesPane {{
@@ -257,7 +266,7 @@ ResourcesPane {{
 ResourcesPane:focus {{ border: solid {CYAN}; }}
 #nodes-pane {{ height: 1fr; min-height: 6; }}
 #node-pane {{ height: 9; min-height: 5; }}
-#gpu-overview-pane, #gpu-allocations-pane {{ height: 1fr; min-height: 8; }}
+#gpu-allocations-pane {{ height: 1fr; min-height: 8; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #resources-footer {{ height: 1; padding: 0 1; color: {GRAY}; }}
 """
@@ -266,11 +275,11 @@ ResourcesPane:focus {{ border: solid {CYAN}; }}
 class FalconResourcesApp(App[None]):
     """Keyboard-first realtime view of schedulable request headroom."""
 
-    # The fixed sections surrounding the two resource panes are one header,
-    # one view selector, two overview rows, one controls row, and one footer. The node
+    # The fixed sections surrounding the two resource panes are one combined
+    # header/view row, two overview rows, one controls row, and one footer. The node
     # table needs its top spacer, header, separator, and two pane borders. The
     # trailing Rich spacer can be clipped without hiding a data row.
-    _FIXED_LAYOUT_HEIGHT = 6
+    _FIXED_LAYOUT_HEIGHT = 5
     _NODE_TABLE_OVERHEAD = 5
     _DETAIL_MIN_HEIGHT = 5
 
@@ -324,7 +333,6 @@ class FalconResourcesApp(App[None]):
             view=view,
             active_pane={
                 "nodes": "nodes",
-                "gpu-overview": "gpu-overview",
                 "gpu-allocations": "gpu-allocations",
             }[view],
         )
@@ -356,7 +364,6 @@ class FalconResourcesApp(App[None]):
         yield Static(id="resource-controls")
         yield ResourcesPane(id="nodes-pane")
         yield ResourcesPane(id="node-pane")
-        yield ResourcesPane(id="gpu-overview-pane")
         yield ResourcesPane(id="gpu-allocations-pane")
         yield Static(id="resize-message")
         yield Static(id="resources-footer")
@@ -410,7 +417,6 @@ class FalconResourcesApp(App[None]):
     def pane_focused(self, pane: str) -> None:
         valid = {
             "nodes": {"nodes", "node"},
-            "gpu-overview": {"gpu-overview"},
             "gpu-allocations": {"gpu-allocations"},
         }
         if pane not in valid[self.state.view]:
@@ -448,16 +454,7 @@ class FalconResourcesApp(App[None]):
             return
         x, y = max(0, int(offset.x)), max(0, int(offset.y))
         panel = ""
-        if view == "gpu-overview":
-            pane = self.query_one("#gpu-overview-pane")
-            summary_height = 3 if self.size.width < 120 else 5
-            if y < summary_height:
-                panel = "summary"
-            elif x < max(1, pane.content_size.width // 2):
-                panel = "free"
-            else:
-                panel = "pressure"
-        elif view == "gpu-allocations":
+        if view == "gpu-allocations":
             history_height, _ = self._allocation_layout()
             pane = self.query_one("#gpu-allocations-pane")
             namespace_width = max(
@@ -728,13 +725,6 @@ class FalconResourcesApp(App[None]):
     def _ensure_visible(self) -> None:
         if not self.is_mounted:
             return
-        if self.state.view == "gpu-overview":
-            visible = self._overview_visible_rows()
-            self.state.overview_scroll = min(
-                max(0, len(self._gpu_nodes()) - visible),
-                max(0, self.state.overview_scroll),
-            )
-            return
         if self.state.view == "gpu-allocations":
             visible = self._allocation_visible_rows()
             self.state.allocation_scroll = min(
@@ -769,11 +759,6 @@ class FalconResourcesApp(App[None]):
             max(0, self.state.consumer_scroll),
         )
 
-    def _overview_visible_rows(self) -> int:
-        pane = self.query_one("#gpu-overview-pane")
-        summary_height = 3 if self.size.width < 120 else 5
-        return max(1, pane.content_size.height - summary_height - 2)
-
     def _allocation_layout(self) -> tuple[int, int]:
         pane = self.query_one("#gpu-allocations-pane")
         content_height = max(10, pane.content_size.height)
@@ -804,7 +789,6 @@ class FalconResourcesApp(App[None]):
             "resource-controls",
             "nodes-pane",
             "node-pane",
-            "gpu-overview-pane",
             "gpu-allocations-pane",
         )
         if small:
@@ -913,7 +897,8 @@ class FalconResourcesApp(App[None]):
         labels = [RESOURCE_VIEW_LABELS[view] for view in RESOURCE_VIEWS]
         total_width = sum(len(label) + 2 for label in labels) + 3 * (len(labels) - 1)
         offset = max(0, (available - total_width) // 2)
-        line = Text(" " * offset)
+        target.styles.offset = (offset, 0)
+        line = Text()
         hitboxes: list[tuple[int, int, str]] = []
         for index, view in enumerate(RESOURCE_VIEWS):
             if index:
@@ -932,7 +917,6 @@ class FalconResourcesApp(App[None]):
         titles = {
             "nodes": ("nodes-pane", "NODES"),
             "node": ("node-pane", "SELECTED NODE"),
-            "gpu-overview": ("gpu-overview-pane", "GPU OVERVIEW"),
             "gpu-allocations": ("gpu-allocations-pane", "GPU ALLOCATIONS"),
         }
         for pane, (identifier, base) in titles.items():
@@ -958,6 +942,24 @@ class FalconResourcesApp(App[None]):
             f"{snapshot.running_jobs} {'RUNNING' if self.size.width >= 100 else 'RUN'}  ",
             style=f"bold {GREEN}",
         )
+        gpu_allocatable, gpu_requested, gpu_free, _ = _gpu_totals(self._gpu_nodes())
+        text.append("GPU ", style=f"bold {GRAY}")
+        if self.size.width >= 130 and gpu_allocatable:
+            text.append_text(
+                self._gpu_request_bar(
+                    allocatable=gpu_allocatable,
+                    requested=gpu_requested,
+                    width=min(34, max(24, self.size.width // 4)),
+                )
+            )
+            text.append("  ")
+        elif gpu_allocatable:
+            text.append(
+                f"{gpu_free}/{gpu_allocatable}  ",
+                style=f"bold {_gpu_headroom_color(gpu_free, gpu_allocatable)}",
+            )
+        else:
+            text.append("-  ", style=f"bold {MUTED}")
         cpu_color = _resource_headroom_color(
             headroom.cpu_cores,
             snapshot.allocatable.cpu_cores,
@@ -978,32 +980,6 @@ class FalconResourcesApp(App[None]):
             f"{_short_memory(snapshot.allocatable.memory_bytes)}",
             style=f"bold {memory_color}",
         )
-        gpu = Text("GPU  ", style=f"bold {GRAY}")
-        if snapshot.gpu_availability:
-            for index, availability in enumerate(snapshot.gpu_availability.values()):
-                if index:
-                    gpu.append("   ")
-                gpu.append(
-                    f"{availability.model} "
-                    f"{availability.request_headroom}/{availability.allocatable}",
-                    style="bold "
-                    + _gpu_headroom_color(
-                        availability.request_headroom,
-                        availability.allocatable,
-                    ),
-                )
-        else:
-            gpu.append("-", style=f"bold {MUTED}")
-        available_width = max(1, self.size.width - 2)
-        if len(text.plain) + len(gpu.plain) + 2 <= available_width:
-            text.append(" " * max(2, available_width - len(text.plain) - len(gpu.plain)))
-            text.append_text(gpu)
-        else:
-            # Keep the overview a single row even when several long GPU model
-            # names cannot fit. Rich's no-wrap ellipsis then clips only the
-            # overflowing tail instead of moving CPU/memory to another row.
-            text.append("  ")
-            text.append_text(gpu)
         self.query_one("#cluster-overview", Static).update(text)
 
     def _render_controls(self) -> None:
@@ -1022,209 +998,40 @@ class FalconResourcesApp(App[None]):
         )
 
     @staticmethod
-    def _gpu_bar(
-        node: NodeSnapshot,
+    def _gpu_request_bar(
         *,
+        allocatable: int,
+        requested: int,
         width: int,
-        pressure: bool,
+        label: str = "",
+        eligible: bool = True,
     ) -> Text:
-        allocatable = max(0, node.allocatable.gpu_count)
-        requested = max(0, node.requested.gpu_count)
+        """Render scheduler GPU requests and remaining allocatable GPUs."""
+
+        width = max(1, int(width))
+        allocatable = max(0, int(allocatable))
+        requested = max(0, int(requested))
         free = max(0, allocatable - requested)
-        eligible = _eligible(node)
-        value = requested if pressure else free
-        ratio = (
-            min(1.0, value / allocatable)
-            if eligible and allocatable
-            else 0.0
-        )
-        suffix = (
-            f"{requested}/{allocatable}"
-            if pressure
-            else f"{free}/{allocatable}"
-        )
-        if not eligible:
-            suffix = "excluded"
-        label_width = max(8, min(24, width // 3))
-        bar_width = max(3, width - label_width - len(suffix) - 4)
-        label = f"{node.name} · {node.gpu_model or 'GPU'}"
-        label = _truncate(label, label_width).ljust(label_width)
-        filled = min(bar_width, round(ratio * bar_width))
+        if not allocatable:
+            return Text("-", style=MUTED)
+        suffix = f"{requested} req {free} free"
+        prefix = ""
+        if label:
+            label_width = min(7, max(3, width - len(suffix) - 6))
+            prefix = _truncate(label, label_width).ljust(label_width) + " "
+        bar_width = max(3, width - len(prefix) - len(suffix) - 1)
+        filled = min(bar_width, round(min(1.0, requested / allocatable) * bar_width))
         color = _gpu_headroom_color(free, allocatable) if eligible else RED
         line = Text()
-        line.append(label, style=WHITE if eligible else MUTED)
-        line.append("  ")
+        line.append(prefix, style=WHITE if eligible else MUTED)
         line.append("█" * filled, style=color)
         line.append("·" * (bar_width - filled), style=BORDER)
-        line.append(f"  {suffix}", style=color if eligible else RED)
+        line.append(" ")
+        line.append(str(requested), style=color)
+        line.append(" req ", style=GRAY)
+        line.append(str(free), style=color)
+        line.append(" free", style=GRAY)
         return line
-
-    def _gpu_summary(self, *, width: int, height: int):
-        allocatable, requested, free, pressure = _gpu_totals(self._gpu_nodes())
-        color = _gpu_headroom_color(free, allocatable)
-        selected = self.state.selected_panels.get("gpu-overview") == "summary"
-        summary_border = CYAN if selected else BORDER
-        if self.size.width < 120:
-            line = Text(justify="center")
-            values = (
-                ("ALLOCATABLE", str(allocatable), CYAN),
-                ("REQUESTED", str(requested), color),
-                ("FREE", str(free), color),
-                ("PRESSURE", f"{pressure:.0f}%", color),
-            )
-            for index, (label, value, value_color) in enumerate(values):
-                if index:
-                    line.append("   ", style=BORDER)
-                line.append(f"{label} ", style=GRAY)
-                line.append(value, style=f"bold {value_color}")
-            return Panel(
-                line,
-                box=box.SQUARE,
-                border_style=summary_border,
-                height=height,
-            )
-
-        cards = Table.grid(expand=True, padding=(0, 1))
-        for _ in range(4):
-            cards.add_column(ratio=1)
-        card_values = (
-            ("ALLOCATABLE GPUS", str(allocatable), CYAN),
-            ("REQUESTED NOW", str(requested), color),
-            ("FREE GPUS", str(free), color),
-            ("REQUEST PRESSURE", f"{pressure:.1f}%", color),
-        )
-        cards.add_row(
-            *(
-                Panel(
-                    Align.center(Text(value, style=f"bold {value_color}"), vertical="middle"),
-                    title=Text(f" {label} ", style=f"bold {GRAY}"),
-                    box=box.SQUARE,
-                    border_style=summary_border,
-                    height=height,
-                )
-                for label, value, value_color in card_values
-            )
-        )
-        return cards
-
-    def _render_gpu_overview(self) -> None:
-        target = self.query_one("#gpu-overview-pane", ResourcesPane)
-        width = max(20, target.content_size.width)
-        height = max(8, target.content_size.height)
-        expanded = self.state.expanded_panels["gpu-overview"]
-        summary_height = 3 if self.size.width < 120 else 5
-        if expanded:
-            if expanded == "summary":
-                target.border_subtitle = " Enter expand selected · Esc restore "
-                target.update(
-                    Panel(
-                        self._gpu_summary(width=width, height=max(5, height - 2)),
-                        title=Text(" GPU SUMMARY ", style=f"bold {PALETTE.accent}"),
-                        box=box.SQUARE,
-                        border_style=BORDER,
-                        height=height,
-                    )
-                )
-                return
-            nodes = self._gpu_nodes()
-            visible = max(1, height - 3)
-            start = self.state.overview_scroll
-            shown = nodes[start : start + visible]
-            lines = Text()
-            if shown:
-                for index, node in enumerate(shown):
-                    lines.append_text(
-                        self._gpu_bar(
-                            node,
-                            width=max(12, width - 6),
-                            pressure=expanded == "pressure",
-                        )
-                    )
-                    if index != len(shown) - 1:
-                        lines.append("\n")
-            else:
-                lines.append("No GPU nodes match the active filters.", style=MUTED)
-            title = (
-                " FREE GPUS PER NODE "
-                if expanded == "free"
-                else " GPU REQUEST PRESSURE PER NODE "
-            )
-            target.border_subtitle = " Enter expand selected · Esc restore "
-            target.update(
-                Panel(
-                    lines,
-                    title=Text(title, style=f"bold {PALETTE.accent}"),
-                    box=box.SQUARE,
-                    border_style=BORDER,
-                    height=height,
-                )
-            )
-            return
-        bars_height = max(5, height - summary_height)
-        visible = self._overview_visible_rows()
-        nodes = self._gpu_nodes()
-        start = self.state.overview_scroll
-        shown = nodes[start : start + visible]
-        column_width = max(12, (width - 3) // 2)
-        free_lines = Text()
-        pressure_lines = Text()
-        if shown:
-            for index, node in enumerate(shown):
-                free_lines.append_text(
-                    self._gpu_bar(node, width=column_width - 4, pressure=False)
-                )
-                pressure_lines.append_text(
-                    self._gpu_bar(node, width=column_width - 4, pressure=True)
-                )
-                if index != len(shown) - 1:
-                    free_lines.append("\n")
-                    pressure_lines.append("\n")
-        else:
-            message = "No GPU nodes match the active filters."
-            free_lines.append(message, style=MUTED)
-            pressure_lines.append(message, style=MUTED)
-        bars = Table.grid(expand=True, padding=(0, 1))
-        bars.add_column(ratio=1)
-        bars.add_column(ratio=1)
-        free_border = (
-            CYAN
-            if self.state.selected_panels.get("gpu-overview") == "free"
-            else BORDER
-        )
-        pressure_border = (
-            CYAN
-            if self.state.selected_panels.get("gpu-overview") == "pressure"
-            else BORDER
-        )
-        bars.add_row(
-            Panel(
-                free_lines,
-                title=Text(" FREE GPUS PER NODE ", style=f"bold {PALETTE.accent}"),
-                box=box.SQUARE,
-                border_style=free_border,
-                height=bars_height,
-            ),
-            Panel(
-                pressure_lines,
-                title=Text(" GPU REQUEST PRESSURE PER NODE ", style=f"bold {PALETTE.accent}"),
-                box=box.SQUARE,
-                border_style=pressure_border,
-                height=bars_height,
-            ),
-        )
-        content = Table.grid(expand=True)
-        content.add_column()
-        content.add_row(self._gpu_summary(width=width, height=summary_height))
-        content.add_row(bars)
-        end = min(len(nodes), start + visible)
-        excluded = sum(not _eligible(node) for node in nodes)
-        subtitle = ""
-        if len(nodes) > visible:
-            subtitle += f" nodes {start + 1}-{end}/{len(nodes)} "
-        if excluded:
-            subtitle += f" · {excluded} excluded from totals "
-        target.border_subtitle = subtitle
-        target.update(content)
 
     def _gpu_consumers(self) -> list[WorkloadConsumer]:
         consumers = [
@@ -1475,7 +1282,7 @@ class FalconResourcesApp(App[None]):
                     show_legend=False,
                 )
             content = self._allocation_chart_with_legend(
-                self._pie_cache,
+                Align.center(self._pie_cache, vertical="middle"),
                 categories,
                 basis=basis,
                 width=width,
@@ -1579,7 +1386,7 @@ class FalconResourcesApp(App[None]):
             height=history_height,
         )
         pie_panel = Panel(
-            self._pie_cache,
+            Align.center(self._pie_cache, vertical="middle"),
             title=Text(
                 " ALLOCATION BY NAMESPACE ",
                 style=f"bold {PALETTE.accent}",
@@ -1655,6 +1462,7 @@ class FalconResourcesApp(App[None]):
             target.update(Align.center(message, vertical="middle"))
             return
         width = self.size.width
+        wide_gpu_bar = width >= 130
         table = Table(
             box=box.SIMPLE_HEAD,
             expand=True,
@@ -1670,7 +1478,12 @@ class FalconResourcesApp(App[None]):
         )
         table.add_column("SCHED" if width < 100 else "SCHEDULABLE", width=9 if width < 100 else 11)
         table.add_column("", ratio=1)
-        table.add_column("GPU", width=12 if width < 100 else 13, justify="right", no_wrap=True)
+        table.add_column(
+            "GPU REQUESTED / FREE" if wide_gpu_bar else "GPU",
+            width=32 if wide_gpu_bar else (12 if width < 100 else 13),
+            justify="right",
+            no_wrap=True,
+        )
         table.add_column("VRAM", width=5 if width < 100 else 7, justify="right", no_wrap=True)
         table.add_column("CPU", width=9 if width < 100 else 11, justify="right", no_wrap=True)
         table.add_column("MEM", width=10 if width < 100 else 11, justify="right", no_wrap=True)
@@ -1699,20 +1512,31 @@ class FalconResourcesApp(App[None]):
                 Text(sched, style=sched_color),
                 Text(""),
             ]
+            gpu_cell = (
+                self._gpu_request_bar(
+                    allocatable=node.allocatable.gpu_count,
+                    requested=node.requested.gpu_count,
+                    width=32,
+                    label=node.gpu_model or "GPU",
+                    eligible=_eligible(node),
+                )
+                if wide_gpu_bar
+                else Text(
+                    (
+                        f"{node.gpu_model} "
+                        f"{node.gpu_free}/{node.allocatable.gpu_count}"
+                        if node.allocatable.gpu_count
+                        else "-"
+                    ),
+                    style=_gpu_headroom_color(
+                        node.gpu_free,
+                        node.allocatable.gpu_count,
+                    ),
+                )
+            )
             cells.extend(
                 [
-                    Text(
-                        (
-                            f"{node.gpu_model} "
-                            f"{node.gpu_free}/{node.allocatable.gpu_count}"
-                            if node.allocatable.gpu_count
-                            else "-"
-                        ),
-                        style=_gpu_headroom_color(
-                            node.gpu_free,
-                            node.allocatable.gpu_count,
-                        ),
-                    ),
+                    gpu_cell,
                     Text(
                         (
                             _short_memory(node.gpu_memory_bytes_per_device)
@@ -1740,7 +1564,18 @@ class FalconResourcesApp(App[None]):
                 ]
             )
             cells.append(Text(str(node.workload_count), style=WHITE))
-            table.add_row(*cells)
+            if selection_active:
+                for cell in cells:
+                    if len(cell):
+                        cell.stylize(BACKGROUND, 0, len(cell))
+            table.add_row(
+                *cells,
+                style=(
+                    f"on {CYAN}"
+                    if selection_active
+                    else (f"on {BORDER}" if selected else None)
+                ),
+            )
         end = min(len(self.nodes), start + count)
         target.border_subtitle = (
             f" {start + 1}-{end}/{len(self.nodes)} "
@@ -1777,6 +1612,11 @@ class FalconResourcesApp(App[None]):
         consumers = visible_consumers[start : start + visible]
         for absolute, consumer in enumerate(consumers, start=start):
             selected = expanded and absolute == self.state.selected_consumer
+            selection_active = (
+                selected
+                and self.app_focus
+                and self.state.active_pane == "node"
+            )
             identity = f"{consumer.namespace}/{consumer.display_workload}"
             cells = [
                 Text(
@@ -1813,7 +1653,18 @@ class FalconResourcesApp(App[None]):
             )
             if width >= 115:
                 cells.append(Text(_short_memory(vector.memory_bytes), style=WHITE))
-            table.add_row(*cells)
+            if selection_active:
+                for cell in cells:
+                    if len(cell):
+                        cell.stylize(BACKGROUND, 0, len(cell))
+            table.add_row(
+                *cells,
+                style=(
+                    f"on {CYAN}"
+                    if selection_active
+                    else (f"on {BORDER}" if selected else None)
+                ),
+            )
         if not visible_consumers:
             table.add_row(Text("No active workloads", style=MUTED))
         return table
@@ -1897,7 +1748,6 @@ class FalconResourcesApp(App[None]):
             node_value = Text(_truncate(node.name, 35), style=WHITE)
             node_value.append(" · ", style=GRAY)
             node_value.append(sched, style=sched_color)
-            facts.add_row("Node", node_value)
             gpu_value = Text(
                 f"{node.gpu_model or '-'}  "
                 f"{node.gpu_free}/{node.allocatable.gpu_count}",
@@ -1938,23 +1788,12 @@ class FalconResourcesApp(App[None]):
                     ),
                 ),
             )
+            facts.add_row("Node", node_value)
             facts.add_row("Taints", _truncate(taints, 48))
             facts.add_row("Labels", _truncate(labels, 48))
         else:
             facts.add_column(style=GRAY, width=18)
             facts.add_column(style=WHITE, ratio=1)
-            facts.add_row(
-                "Node",
-                node.name,
-                "Schedulable",
-                Text(sched, style=sched_color),
-            )
-            facts.add_row(
-                "Visible workloads",
-                str(node.workload_count),
-                "System Pods",
-                "Hidden",
-            )
             facts.add_row(
                 "GPU model",
                 node.gpu_model or "-",
@@ -1996,6 +1835,18 @@ class FalconResourcesApp(App[None]):
                         node.allocatable.memory_bytes,
                     ),
                 ),
+            )
+            facts.add_row(
+                "Node",
+                node.name,
+                "Schedulable",
+                Text(sched, style=sched_color),
+            )
+            facts.add_row(
+                "Visible workloads",
+                str(node.workload_count),
+                "System Pods",
+                "Hidden",
             )
             facts.add_row(
                 "Taints",
@@ -2041,10 +1892,6 @@ class FalconResourcesApp(App[None]):
     def _render_footer(self) -> None:
         if self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT:
             value = "q Quit   r Retry"
-        elif self.state.view == "gpu-overview" and self.state.expanded_panels["gpu-overview"]:
-            value = "Enter expand selected   Esc restore   ←/→ Views   ↑/↓ Scroll   r Refresh   q Quit"
-        elif self.state.view == "gpu-overview":
-            value = "←/→ Views   ↑/↓ Scroll nodes   Enter Expand selected   r Refresh   q Quit"
         elif self.state.view == "gpu-allocations":
             expanded_panel = self.state.expanded_panels["gpu-allocations"]
             value = (
@@ -2070,8 +1917,6 @@ class FalconResourcesApp(App[None]):
                 self._render_controls()
                 self._render_nodes()
                 self._render_node()
-            elif self.state.view == "gpu-overview":
-                self._render_gpu_overview()
             else:
                 self._render_gpu_allocations()
         self._render_footer()
@@ -2093,14 +1938,6 @@ class FalconResourcesApp(App[None]):
             self._render_all()
 
     def _move(self, amount: int) -> None:
-        if self.state.view == "gpu-overview":
-            maximum = max(0, len(self._gpu_nodes()) - self._overview_visible_rows())
-            self.state.overview_scroll = min(
-                maximum,
-                max(0, self.state.overview_scroll + amount),
-            )
-            self._render_gpu_overview()
-            return
         if self.state.view == "gpu-allocations":
             maximum = max(0, len(self._gpu_consumers()) - self._allocation_visible_rows())
             self.state.allocation_scroll = min(
@@ -2152,9 +1989,6 @@ class FalconResourcesApp(App[None]):
         self._render_node()
 
     def action_page_up(self) -> None:
-        if self.state.view == "gpu-overview":
-            self._move(-self._overview_visible_rows())
-            return
         if self.state.view == "gpu-allocations":
             self._move(-self._allocation_visible_rows())
             return
@@ -2163,9 +1997,6 @@ class FalconResourcesApp(App[None]):
         )
 
     def action_page_down(self) -> None:
-        if self.state.view == "gpu-overview":
-            self._move(self._overview_visible_rows())
-            return
         if self.state.view == "gpu-allocations":
             self._move(self._allocation_visible_rows())
             return
@@ -2174,9 +2005,7 @@ class FalconResourcesApp(App[None]):
         )
 
     def action_home(self) -> None:
-        if self.state.view == "gpu-overview":
-            self.state.overview_scroll = 0
-        elif self.state.view == "gpu-allocations":
+        if self.state.view == "gpu-allocations":
             self.state.allocation_scroll = 0
         elif self.state.expanded:
             self.state.selected_consumer = 0
@@ -2186,11 +2015,7 @@ class FalconResourcesApp(App[None]):
         self._render_all()
 
     def action_end(self) -> None:
-        if self.state.view == "gpu-overview":
-            self.state.overview_scroll = max(
-                0, len(self._gpu_nodes()) - self._overview_visible_rows()
-            )
-        elif self.state.view == "gpu-allocations":
+        if self.state.view == "gpu-allocations":
             self.state.allocation_scroll = max(
                 0, len(self._gpu_consumers()) - self._allocation_visible_rows()
             )
