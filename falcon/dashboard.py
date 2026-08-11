@@ -11,8 +11,9 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Tuple
 
+from .coder import CoderClient, CoderError, resolve_connection
 from .config import DEFAULT_DASHBOARD_EMA_ALPHA, save_dashboard_sort, save_hidden_panes
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
@@ -1138,6 +1139,41 @@ class DemoUsageCollector:
         self.source.close()
 
 
+def _coder_workspace_action(
+    config: Mapping[str, object],
+    job_name: str,
+    action: str,
+) -> None:
+    """Run a dashboard action through the owning Coder control plane."""
+
+    if action not in {"delete", "restart"}:
+        raise CoderError(f"unsupported dashboard Coder action {action!r}")
+    url, token = resolve_connection(config)
+    coder_config = config.get("coder", {})
+    timeout = float(
+        coder_config.get("wait_timeout_seconds", 600)
+        if isinstance(coder_config, Mapping)
+        else 600
+    )
+    with CoderClient(url, token) as client:
+        user = client.current_user()
+        username = str(user.get("username") or user.get("name") or "")
+        if not username:
+            raise CoderError("Coder did not return the current username")
+        workspace = client.workspace_for_job(job_name, username=username)
+        name = str(workspace.get("name") or "")
+        if not name:
+            raise CoderError("Coder workspace response is missing its name")
+        if action == "delete":
+            client.delete_workspace(workspace)
+        else:
+            client.restart_workspace(
+                "me",
+                name,
+                timeout=timeout,
+            )
+
+
 def run_dashboard(
     config: Dict,
     namespace: Optional[str] = None,
@@ -1164,6 +1200,7 @@ def run_dashboard(
             risk_average_samples=RISK_AVERAGE_SAMPLES,
         )
     )
+
     FalconDashboard(
         collector,
         hidden_panes=dashboard.get("hidden_panes", []),
@@ -1171,5 +1208,12 @@ def run_dashboard(
         sort_direction=dashboard.get("sort_direction", "desc"),
         persist_hidden_panes=lambda panes: save_hidden_panes(panes, config_file),
         persist_sort=lambda field, direction: save_dashboard_sort(field, direction, config_file),
+        coder_workspace_action=(
+            None
+            if demo_state
+            else lambda job_name, action: _coder_workspace_action(
+                config, job_name, action
+            )
+        ),
         color_mode=color_mode,
     ).run(mouse=True)

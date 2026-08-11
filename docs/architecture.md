@@ -33,6 +33,8 @@ Major components:
   RBAC, then emits the same `ClusterSnapshot` used by API collection.
 - `dashboard.py` / `dashboard_ui.py`: Job telemetry and the Jobs TUI.
 - `resources_ui.py`: cluster/node TUI using the same cluster models.
+- `coder.py`: authenticated Coder workspace creation and lifecycle actions, rich-parameter mapping,
+  readiness polling, and application-link construction.
 - `output.py`: the `falcon/v1` machine-output envelope.
 - `agent_skills.py`: safe skill detection, installation, update, and removal.
 

@@ -20,6 +20,7 @@ BASE_COMMANDS = [
     "clean",
     "dashboard",
     "resources",
+    "coder",
     "setup",
     "config",
     "completion",
@@ -66,6 +67,10 @@ OPTIONS: Dict[str, List[str]] = {
         "--output", "--node", "--gpu", "--limit", "--consumer-limit", "--demo",
         "--namespace", "--color",
     ],
+    "coder": [
+        "-c", "--cpu", "-m", "--memory", "-j", "--name", "--template", "--url",
+        "--parameter", "--access", "--timeout",
+    ],
     "setup": [
         "--force", "--non-interactive", "--no-shell", "--install-skills",
         "--skip-skills", "--uninstall-skills",
@@ -110,6 +115,12 @@ def candidates(
         return job_names(config["cluster"]["namespace"])
     if kind == "options":
         command = COMMAND_ALIASES.get(command, command)
+        if command == "coder":
+            return (
+                preset_tokens(config)
+                + counted_preset_tokens(config)
+                + OPTIONS[command]
+            )
         if command in OPTIONS:
             return OPTIONS[command]
         if any(
@@ -200,6 +211,12 @@ _falcon_native() {{
         return
       fi
     done
+  elif [[ "$subject" == coder ]]; then
+    values=()
+    local value
+    while IFS= read -r value; do
+      [[ -n "$value" && "$value" != "<none>" ]] && values+=("$value")
+    done < <(command kubectl get jobs.batch -n {namespace} --selector app.kubernetes.io/managed-by=coder --output 'custom-columns=WORKSPACE:.metadata.labels.coder\\.workspace' --no-headers 2>/dev/null)
   elif (( CURRENT == 3 )) && [[ "$subject" == get || "$subject" == logs || "$subject" == events || "$subject" == kill || "$subject" == attach || "$subject" == top || "$subject" == metrics ]]; then
     values=("${{(@f)$(command kubectl get jobs.batch -n {namespace} -o name 2>/dev/null)}}")
     values=("${{values[@]#job.batch/}}")
@@ -249,6 +266,12 @@ _falcon_native() {{
         fi
       done
     fi
+  elif [[ "$subject" == coder ]]; then
+    values=()
+    local value
+    while IFS= read -r value; do
+      [[ -n "$value" && "$value" != "<none>" ]] && values+=("$value")
+    done < <(command kubectl get jobs.batch -n {namespace} --selector app.kubernetes.io/managed-by=coder --output 'custom-columns=WORKSPACE:.metadata.labels.coder\\.workspace' --no-headers 2>/dev/null)
   elif [[ $COMP_CWORD -eq 2 ]] && [[ "$subject" =~ ^(get|logs|events|kill|attach|top|metrics)$ ]]; then
     values=()
     local value

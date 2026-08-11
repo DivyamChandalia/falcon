@@ -626,8 +626,10 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             app.action_kill()
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "KillDialog")
+            self.assertEqual(app.screen.actions, ["job", "restart"])
             svg = app.export_screenshot(simplify=True)
             self.assertIn("Job&#160;Actions", svg)
+            self.assertNotIn("Delete&#160;active&#160;pod", svg)
             await pilot.press("escape")
             self.assertFalse(app.state.kill_dialog["isOpen"])
 
@@ -635,6 +637,36 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "CleanupDialog")
             await pilot.press("escape")
+
+    async def test_coder_kill_and_restart_use_coder_instead_of_kubectl(self) -> None:
+        actions = []
+        app = FalconDashboard(
+            DemoUsageCollector("mixed"),
+            refresh_seconds=999,
+            coder_workspace_action=lambda job, action: actions.append(
+                (job, action)
+            ),
+        )
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause(0.5)
+            row = replace(
+                app.rows[0],
+                job="coder-divyam.c-falcon",
+            )
+            with patch("falcon.dashboard_ui.subprocess.run") as kubectl:
+                app._job_action_confirmed(("restart", [row]))
+                await pilot.pause(0.2)
+                app._job_action_confirmed(("job", [row]))
+                await pilot.pause(0.2)
+
+            self.assertEqual(
+                actions,
+                [
+                    ("coder-divyam.c-falcon", "restart"),
+                    ("coder-divyam.c-falcon", "delete"),
+                ],
+            )
+            kubectl.assert_not_called()
 
     def test_restart_manifest_removes_controller_owned_fields(self) -> None:
         source = {

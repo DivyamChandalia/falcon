@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import shlex
 import sys
 import time
@@ -36,6 +37,21 @@ from .config import (
     run_setup,
     save_resources_view,
 )
+from .coder import (
+    CoderAuthenticationRequired,
+    CoderClient,
+    CoderError,
+    build_access_links,
+    build_parameter_values,
+    generate_workspace_name,
+    parse_parameter_overrides,
+    resolve_connection,
+    resolve_template,
+    select_access_links,
+    save_connection,
+    validate_workspace_name,
+    workspace_job_name,
+)
 from .dashboard import UsageCollector, run_dashboard
 from .demo import DemoCollector
 from .kubernetes import KubernetesClient, KubernetesError
@@ -56,6 +72,7 @@ EXIT_USAGE = 2
 EXIT_KUBERNETES = 3
 EXIT_NOT_FOUND = 4
 EXIT_CONFLICT = 5
+EXIT_CODER = 6
 
 _LAUNCH_SENTINEL = "__falcon_launch__"
 
@@ -267,7 +284,9 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
 
-    killer = sub.add_parser("kill", help="Kill one or more Jobs")
+    killer = sub.add_parser(
+        "kill", help="Kill Jobs or remove Coder-owned workspaces"
+    )
     killer.add_argument("jobs", nargs="*")
     _namespace(killer)
     _output(killer)
@@ -306,6 +325,60 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     _color(resources)
     _namespace(resources)
     _output(resources)
+
+    coder = sub.add_parser(
+        "coder", help="Create a sized Coder workspace and print access links"
+    )
+    coder.add_argument(
+        "preset",
+        nargs="?",
+        metavar="PRESET_OR_WORKSPACE",
+        help=(
+            "GPU preset to create, or an existing workspace/Job name whose "
+            "access links should be printed"
+        ),
+    )
+    coder.add_argument(
+        "--cpu", "-c",
+        help="CPU request[:limit], or a GPU-preset sizing override",
+    )
+    coder.add_argument(
+        "--memory", "-m",
+        help="RAM request[:limit], or a GPU-preset sizing override",
+    )
+    coder.add_argument(
+        "--name", "-j",
+        help="Workspace name (default: random color-animal-number)",
+    )
+    coder.add_argument(
+        "--template",
+        help="Coder template name or ID (default: coder.template, IDEs)",
+    )
+    coder.add_argument(
+        "--url", help="Coder deployment URL (overrides CODER_URL and config)"
+    )
+    coder.add_argument(
+        "--parameter",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Additional Coder template parameter (repeatable)",
+    )
+    coder.add_argument(
+        "--access",
+        default="all",
+        metavar="APP",
+        help=(
+            "Links to print: all (default), terminal, vscode, cursor, "
+            "jupyter, antigravity, Antigravity 2.0, Antigravity 2.0 IDE, "
+            "or an app slug"
+        ),
+    )
+    coder.add_argument(
+        "--timeout",
+        type=float,
+        help="Seconds to wait for the Coder agent (default: config, 600)",
+    )
 
     setup = sub.add_parser(
         "setup", help="Create config, completion, and optional agent skills"
@@ -367,7 +440,7 @@ def _rewrite_shorthand(
         return argv
     public_commands = {
         "jobs", "get", "events", "logs", "attach", "top", "metrics",
-        "kill", "clean", "dashboard", "resources", "setup",
+        "kill", "clean", "dashboard", "resources", "coder", "setup",
         "completion", "config", "shell-init",
     }
     # Falcon 0.1 installed this command in shell startup files. Keep a hidden,
@@ -1107,6 +1180,287 @@ def _metrics_command(
     return 0
 
 
+def _terminal_hyperlink(label: str, target: str) -> str:
+    """Render an OSC 8 link without allowing terminal-control injection."""
+
+    if any(ord(character) < 32 or ord(character) == 127 for character in target):
+        raise CoderError("Coder returned an unsafe application URL")
+    if not sys.stdout.isatty():
+        return target
+    return f"\033]8;;{target}\033\\{label}\033]8;;\033\\"
+
+
+def _interactive_coder_login(url: str) -> str:
+    login_url = f"{url.rstrip('/')}/cli-auth"
+    print("Coder authentication is required.")
+    print("Open this login page, sign in, and copy the session token:")
+    print(f"  {_terminal_hyperlink('Open Coder login', login_url)}")
+    try:
+        token = getpass.getpass("Paste Coder session token: ").strip()
+    except EOFError as exc:
+        raise CoderError("no Coder session token was entered") from exc
+    if not token:
+        raise CoderError("no Coder session token was entered")
+
+    # Never persist an unverified credential. A bad paste therefore leaves any
+    # existing Coder CLI session untouched.
+    try:
+        with CoderClient(url, token) as client:
+            user = client.current_user()
+    except CoderError as exc:
+        if exc.status_code in {401, 403}:
+            raise CoderError(
+                "Coder rejected that session token; open the login page and try again",
+                status_code=exc.status_code,
+            ) from exc
+        raise
+    username = str(user.get("username") or user.get("name") or "current user")
+    session_path = save_connection(url, token)
+    print(f"Coder login saved for {username}: {session_path}")
+    return token
+
+
+def _kill_command(
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+) -> int:
+    """Delete Coder Jobs through Coder and ordinary Jobs through Kubernetes."""
+
+    targets = list(args.jobs) or [target_job(None)]
+    coder_jobs = [target for target in targets if target.startswith("coder-")]
+    ordinary_jobs = [target for target in targets if not target.startswith("coder-")]
+    deleted_workspaces: List[Tuple[str, str]] = []
+
+    if coder_jobs:
+        try:
+            url, token = resolve_connection(config)
+        except CoderAuthenticationRequired as exc:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise
+            url = exc.url
+            token = _interactive_coder_login(url)
+
+        with CoderClient(url, token) as client:
+            user = client.current_user()
+            username = str(user.get("username") or user.get("name") or "")
+            if not username:
+                raise CoderError("Coder did not return the current username")
+            owned_workspaces = client.workspaces()
+            workspaces: List[Tuple[str, str, Mapping[str, Any]]] = []
+            for job in coder_jobs:
+                workspace = client.workspace_for_job(
+                    job,
+                    username=username,
+                    workspaces=owned_workspaces,
+                )
+                name = validate_workspace_name(str(workspace.get("name") or ""))
+                workspaces.append((name, job, workspace))
+            for name, job, workspace in workspaces:
+                client.delete_workspace(workspace)
+                deleted_workspaces.append((name, job))
+
+    if ordinary_jobs:
+        kill(_namespace_value(args, config), ordinary_jobs)
+
+    if args.output == "json":
+        print(dumps("KillResult", {"jobs": targets, "killed": True}))
+    else:
+        if deleted_workspaces:
+            rendered = ", ".join(
+                f"{name} ({job})" for name, job in deleted_workspaces
+            )
+            print(
+                "Deleting "
+                f"{len(deleted_workspaces)} Coder workspace(s) through Coder: "
+                f"{rendered}"
+            )
+        if ordinary_jobs:
+            print(
+                f"Killed {len(ordinary_jobs)} Job(s): "
+                f"{', '.join(ordinary_jobs)}"
+            )
+    return 0
+
+
+def _coder_command(
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+) -> int:
+    resolved_preset = resolve_preset(args.preset, config) if args.preset else None
+    existing_reference = args.preset if args.preset and resolved_preset is None else None
+    if existing_reference is not None:
+        create_options = any(
+            (
+                args.cpu,
+                args.memory,
+                args.name,
+                args.template,
+                args.parameter,
+            )
+        )
+        if create_options:
+            raise CoderError(
+                "an existing Coder workspace reference cannot be combined with "
+                "--cpu, --memory, --name, --template, or --parameter"
+            )
+        plan = None
+    elif resolved_preset is not None:
+        preset_name, gpu_count = resolved_preset
+        preset = config.get("presets", {}).get(preset_name, {})
+        if not isinstance(preset, Mapping):
+            raise CoderError(f"invalid Falcon preset {preset_name!r}")
+        gpu_type = canonical_gpu(str(preset.get("gpu_type") or preset_name))
+        namespace = str(config.get("cluster", {}).get("namespace") or "")
+        nodes = _planning_nodes(config, KubernetesClient(namespace))
+        shared_memory_percent = preset.get(
+            "shared_memory_percent",
+            config.get("resources", {}).get("shared_memory_percent", 15),
+        )
+        plan = plan_resources(
+            nodes,
+            preset_name,
+            gpu_type,
+            gpu_count,
+            cpu_override=args.cpu,
+            memory_override=args.memory,
+            shared_memory_percent=shared_memory_percent,
+        )
+    else:
+        if not args.cpu or not args.memory:
+            raise CoderError(
+                "falcon coder requires a GPU preset or both --cpu and --memory"
+            )
+        plan = plan_cpu_resources(args.cpu, args.memory)
+    coder_config = config.get("coder", {})
+    if not isinstance(coder_config, Mapping):
+        raise CoderError("coder must be a YAML mapping")
+    timeout = (
+        args.timeout
+        if args.timeout is not None
+        else float(coder_config.get("wait_timeout_seconds", 600))
+    )
+    if not 1 <= timeout <= 3600:
+        raise CoderError("--timeout must be between 1 and 3600 seconds")
+    try:
+        url, token = resolve_connection(config, url_override=args.url)
+    except CoderAuthenticationRequired as exc:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise
+        url = exc.url
+        token = _interactive_coder_login(url)
+    overrides = parse_parameter_overrides(args.parameter)
+    requested_template = args.template or coder_config.get("template")
+    requested_name = validate_workspace_name(args.name) if args.name else None
+
+    with CoderClient(url, token) as client:
+        user = client.current_user()
+        username = str(user.get("username") or user.get("name") or "")
+        if not username:
+            raise CoderError("Coder did not return the current username")
+        workspace: Mapping[str, Any]
+        if existing_reference is not None:
+            if existing_reference.startswith("coder-"):
+                workspace = client.workspace_for_job(
+                    existing_reference,
+                    username=username,
+                )
+                name = validate_workspace_name(
+                    str(workspace.get("name") or "")
+                )
+            else:
+                name = validate_workspace_name(existing_reference)
+                workspace = client.workspace(username, name)
+            print(f"Connecting to existing Coder workspace {name}...")
+        else:
+            template = resolve_template(
+                client.templates(),
+                str(requested_template) if requested_template else None,
+            )
+            template_id = str(template.get("id") or "")
+            template_version_id = str(template.get("active_version_id") or "")
+            if not template_id or not template_version_id:
+                raise CoderError("the selected Coder template has no active version")
+            rich_parameters = client.rich_parameters(template_version_id)
+            parameters = build_parameter_values(
+                rich_parameters,
+                plan,
+                configured=(
+                    coder_config.get("parameters")
+                    if isinstance(coder_config.get("parameters"), Mapping)
+                    else None
+                ),
+                overrides=overrides,
+            )
+
+            name = requested_name or generate_workspace_name()
+            for attempt in range(10):
+                gpu_summary = (
+                    f" · GPU {plan.gpu.model}x{plan.gpu.count}"
+                    if plan.gpu is not None
+                    else ""
+                )
+                print(
+                    f"Creating Coder workspace {name} · CPU {plan.compute.cpu} · "
+                    f"RAM {plan.compute.memory}{gpu_summary} · "
+                    f"template {template.get('name') or template_id}..."
+                )
+                try:
+                    workspace = client.create_workspace(
+                        "me",
+                        template_id=template_id,
+                        name=name,
+                        parameters=parameters,
+                    )
+                    break
+                except CoderError as exc:
+                    if requested_name and exc.status_code == 409:
+                        print(
+                            f"Coder workspace {name} already exists; "
+                            "using its current resources."
+                        )
+                        workspace = client.workspace(username, name)
+                        break
+                    if exc.status_code != 409 or attempt == 9:
+                        raise
+                    name = generate_workspace_name()
+            else:  # pragma: no cover - the loop either breaks or raises
+                raise CoderError("could not allocate a unique Coder workspace name")
+
+        print(f"Waiting for Coder agent {name}...")
+        workspace = client.wait_until_ready(
+            username,
+            name,
+            timeout=timeout,
+        )
+        workspace_url, links = build_access_links(
+            workspace,
+            url,
+            folder=str(Path.cwd()),
+        )
+        selected = select_access_links(links, args.access)
+        interactive = sys.stdout.isatty()
+        if interactive and any(link.requires_token for link in selected):
+            app_token = client.create_app_token()
+            selected = tuple(
+                link.with_token(app_token) if link.requires_token else link
+                for link in selected
+            )
+
+    print(f"Workspace ready: {_terminal_hyperlink(name, workspace_url)}")
+    job = workspace_job_name(workspace)
+    if job:
+        print(f"Kubernetes Job: {job}")
+    print("Access:")
+    for link in selected:
+        if link.requires_token:
+            # Piped output and logs must never receive a session credential.
+            rendered = f"open from {workspace_url} in a terminal"
+        else:
+            rendered = _terminal_hyperlink("Open", link.target)
+        print(f"  {link.label:<20} {rendered}")
+    return 0
+
+
 def _resource_snapshot(
     args: argparse.Namespace,
     config: Mapping[str, Any],
@@ -1328,13 +1682,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return top(_namespace_value(args, config), args.job)
         if args.command_name == "metrics":
             return _metrics_command(args, config)
+        if args.command_name == "coder":
+            return _coder_command(args, config)
         if args.command_name == "kill":
-            targets = kill(_namespace_value(args, config), args.jobs)
-            if args.output == "json":
-                print(dumps("KillResult", {"jobs": targets, "killed": True}))
-            else:
-                print(f"Killed {len(targets)} Job(s): {', '.join(targets)}")
-            return 0
+            return _kill_command(args, config)
         if args.command_name == "clean":
             return clean(_namespace_value(args, config))
         if args.command_name == "dashboard":
@@ -1385,6 +1736,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         code = EXIT_NOT_FOUND if exc.not_found else EXIT_KUBERNETES
         print(f"falcon: {exc}", file=sys.stderr)
         return code
+    except CoderError as exc:
+        print(f"falcon: {exc}", file=sys.stderr)
+        return EXIT_CODER
     except CliError as exc:
         print(f"falcon: {exc}", file=sys.stderr)
         return exc.code

@@ -321,7 +321,7 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
     def __init__(self, rows: List[JobUsage]):
         super().__init__()
         self.rows = rows
-        self.actions = ["job", "restart"] if all(row.status == "Succeeded" for row in rows) else ["job", "pod", "restart"]
+        self.actions = ["job", "restart"]
         self.action = "job"
         self.stage = 0
 
@@ -337,6 +337,7 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
         self._render_dialog()
 
     def _render_dialog(self) -> None:
+        coder_rows = [row for row in self.rows if row.job.startswith("coder-")]
         names = "\n".join(f"  {row.job}" for row in self.rows[:12])
         if len(self.rows) > 12:
             names += f"\n  … and {len(self.rows) - 12} more"
@@ -352,7 +353,6 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
         text.append("Action\n", style=GRAY)
         action_labels = {
             "job": "Delete Job and managed pods",
-            "pod": "Delete active pod only",
             "restart": "Restart Job with the same name",
         }
         for action in self.actions:
@@ -361,10 +361,19 @@ class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
                 f"  {marker} {action_labels[action]}\n",
                 style=CYAN if self.action == action else WHITE,
             )
-        if self.action == "pod":
-            text.append("\nThe Job controller may create another pod.\n", style=YELLOW)
-        elif self.action == "restart":
-            text.append("\nThe current Job will be deleted and recreated with the same name.\n", style=YELLOW)
+        if self.action == "restart":
+            if coder_rows:
+                text.append(
+                    "\nCoder-owned Jobs use Coder's native workspace restart.\n",
+                    style=YELLOW,
+                )
+            else:
+                text.append("\nThe current Job will be deleted and recreated with the same name.\n", style=YELLOW)
+        elif coder_rows:
+            text.append(
+                "\nCoder-owned Jobs are deleted as workspaces through Coder.\n",
+                style=YELLOW,
+            )
         text.append("\n" + prompt, style=GRAY)
         self.query_one("#kill-text", Static).update(text)
 
@@ -630,6 +639,7 @@ class FalconDashboard(App):
         sort_field: str = "Age", sort_direction: str = "desc",
         persist_hidden_panes: Optional[Callable[[Set[str]], None]] = None,
         persist_sort: Optional[Callable[[str, str], None]] = None,
+        coder_workspace_action: Optional[Callable[[str, str], None]] = None,
         clock: Optional[Callable[[], str]] = None,
         color_mode: Optional[str] = None,
     ):
@@ -645,6 +655,7 @@ class FalconDashboard(App):
             self.state.sort_direction = "asc"
         self._persist_hidden_panes = persist_hidden_panes
         self._persist_sort = persist_sort
+        self._coder_workspace_action = coder_workspace_action
         self._clock = clock or (lambda: datetime.now().strftime("%H:%M:%S"))
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
@@ -2104,7 +2115,26 @@ class FalconDashboard(App):
 
         def apply_action() -> None:
             succeeded = 0
+            coder_succeeded = 0
+            failures: List[str] = []
             for row in rows:
+                if row.job.startswith("coder-") and action in {"job", "restart"}:
+                    if self._coder_workspace_action is None:
+                        failures.append(
+                            f"{row.job}: Coder workspace actions are unavailable"
+                        )
+                        continue
+                    try:
+                        self._coder_workspace_action(
+                            row.job,
+                            "delete" if action == "job" else "restart",
+                        )
+                        succeeded += 1
+                        coder_succeeded += 1
+                    except Exception as exc:
+                        detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                        failures.append(f"{row.job}: {detail}")
+                    continue
                 if action == "restart":
                     try:
                         fetched = subprocess.run(
@@ -2112,6 +2142,7 @@ class FalconDashboard(App):
                             capture_output=True, text=True, timeout=20,
                         )
                         if fetched.returncode != 0:
+                            failures.append(f"{row.job}: could not read Job manifest")
                             continue
                         manifest = _restart_job_manifest(json.loads(fetched.stdout), row.job, self.collector.namespace)
                         deleted = subprocess.run(
@@ -2123,6 +2154,7 @@ class FalconDashboard(App):
                             capture_output=True, text=True, timeout=40,
                         )
                         if deleted.returncode != 0:
+                            failures.append(f"{row.job}: Kubernetes deletion failed")
                             continue
                         created = subprocess.run(
                             ["kubectl", "create", "-f", "-", "--namespace", self.collector.namespace],
@@ -2130,37 +2162,41 @@ class FalconDashboard(App):
                         )
                         if created.returncode == 0:
                             succeeded += 1
-                    except (OSError, ValueError, subprocess.SubprocessError):
-                        pass
+                        else:
+                            failures.append(f"{row.job}: Kubernetes creation failed")
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        failures.append(f"{row.job}: {exc}")
                     continue
-                if action == "pod":
-                    if not row.active_pod:
-                        continue
-                    command = [
-                        "kubectl", "delete", "pod", row.active_pod, "--wait=false",
-                        "--namespace", self.collector.namespace,
-                    ]
-                else:
-                    command = [
-                        "kubectl", "delete", "job", row.job, "--wait=false",
-                        "--namespace", self.collector.namespace,
-                    ]
+                command = [
+                    "kubectl", "delete", "job", row.job, "--wait=false",
+                    "--namespace", self.collector.namespace,
+                ]
                 try:
                     result = subprocess.run(command, capture_output=True, text=True, timeout=20)
                     succeeded += int(result.returncode == 0)
-                except (OSError, subprocess.SubprocessError):
-                    pass
+                    if result.returncode != 0:
+                        failures.append(f"{row.job}: Kubernetes deletion failed")
+                except (OSError, subprocess.SubprocessError) as exc:
+                    failures.append(f"{row.job}: {exc}")
             def finish() -> None:
                 if action == "restart":
                     if succeeded == len(rows):
                         detail = f" {rows[0].job}" if succeeded == 1 else ""
                         self.notify(f"Restarted {succeeded} Job{'s' if succeeded != 1 else ''}{detail}")
                     else:
-                        self.notify(f"Restarted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
+                        detail = f" · {failures[0]}" if failures else ""
+                        self.notify(f"Restarted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed{detail}", severity="error")
                 elif succeeded == len(rows):
-                    self.notify(f"Deleted {succeeded} Job{'s' if succeeded != 1 else ''}")
+                    if coder_succeeded == len(rows):
+                        self.notify(
+                            f"Deleting {succeeded} Coder workspace"
+                            f"{'s' if succeeded != 1 else ''} through Coder"
+                        )
+                    else:
+                        self.notify(f"Deleted {succeeded} Job{'s' if succeeded != 1 else ''}")
                 else:
-                    self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed", severity="error")
+                    detail = f" · {failures[0]}" if failures else ""
+                    self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed{detail}", severity="error")
                 invalidate = getattr(self.collector, "invalidate", None)
                 if invalidate:
                     invalidate()

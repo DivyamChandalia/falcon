@@ -22,3 +22,4 @@ Call `falcon` directly. Use the same commands a human uses; never wrap Falcon in
 - Eviction policy uses average GPU utilization: H100 must stay at or above 90%; A6000 and 2080Ti must stay at or above 30%.
 - Falcon automatically leaves a 1 GiB memory safety buffer. Use `-m` only when the user explicitly requests a memory value or the workload demonstrably needs it.
 - For status, events, manifests, scheduling details, or anything outside launch/log/metrics/kill, use one targeted `kubectl` command.
+- Coder-owned names (`coder-<user>-<workspace>`) are lifecycle-managed by Coder: `falcon kill` and dashboard Delete remove the workspace through Coder, while dashboard Restart uses Coder's stop/start lifecycle. Never delete their Jobs directly with `kubectl`.

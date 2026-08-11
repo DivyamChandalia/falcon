@@ -14,6 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -74,6 +75,20 @@ USER_DEFAULTS: Dict[str, Any] = {
         "ema_alpha": DEFAULT_DASHBOARD_EMA_ALPHA,
         "sort_field": "Age",
         "sort_direction": "desc",
+    },
+    "coder": {
+        "url": "https://coder.yoda.hyperverge.org",
+        "template": "IDEs",
+        "wait_timeout_seconds": 600,
+        # Null means auto-detect the conventional rich-parameter name.
+        "parameters": {
+            "cpu": None,
+            "cpu_limit": None,
+            "memory": None,
+            "memory_limit": None,
+            "gpu_type": None,
+            "gpu_count": None,
+        },
     },
 }
 
@@ -202,6 +217,12 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
                 result["dashboard"].pop("ema_alpha", None)
         except (TypeError, ValueError):
             pass
+    if isinstance(raw.get("coder"), dict):
+        result["coder"] = {
+            key: copy.deepcopy(value)
+            for key, value in raw["coder"].items()
+            if key in {"url", "template", "wait_timeout_seconds", "parameters"}
+        }
     return result
 
 
@@ -323,6 +344,40 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("dashboard.sort_field must be Age, Name, or Status")
     if dashboard.get("sort_direction", "desc") not in {"asc", "desc"}:
         raise ValueError("dashboard.sort_direction must be asc or desc")
+    coder = config.get("coder", {})
+    if not isinstance(coder, dict):
+        raise ValueError("coder must be a YAML mapping")
+    coder_url = coder.get("url")
+    parsed_coder_url = urlsplit(str(coder_url or ""))
+    if (
+        not coder_url
+        or parsed_coder_url.scheme not in {"http", "https"}
+        or not parsed_coder_url.netloc
+    ):
+        raise ValueError("coder.url must be an http or https URL")
+    template = coder.get("template")
+    if template is not None and (not isinstance(template, str) or not template.strip()):
+        raise ValueError("coder.template must be a non-empty string or null")
+    wait_timeout = coder.get("wait_timeout_seconds", 600)
+    if (
+        isinstance(wait_timeout, bool)
+        or not isinstance(wait_timeout, (int, float))
+        or not 1 <= float(wait_timeout) <= 3600
+    ):
+        raise ValueError("coder.wait_timeout_seconds must be between 1 and 3600")
+    parameter_names = coder.get("parameters", {})
+    allowed_parameters = {
+        "cpu", "cpu_limit", "memory", "memory_limit", "gpu_type", "gpu_count",
+    }
+    if not isinstance(parameter_names, dict) or any(
+        key not in allowed_parameters
+        or (value is not None and (not isinstance(value, str) or not value.strip()))
+        for key, value in parameter_names.items()
+    ):
+        raise ValueError(
+            "coder.parameters may contain only cpu, cpu_limit, memory, "
+            "memory_limit, gpu_type, and gpu_count string values or null"
+        )
 
 
 def _save_dashboard_settings(

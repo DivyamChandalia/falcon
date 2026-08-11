@@ -68,6 +68,53 @@ falcon kill JOB [JOB...]
 falcon clean
 ```
 
+`falcon kill` recognizes Coder-owned Job names in the form
+`coder-<current-user>-<workspace>`. It submits Coder's native workspace delete
+transition instead of deleting the Kubernetes Job underneath Coder, so the
+workspace record and template resources are cleaned up together. This also
+works when that Job has already disappeared. Other Job names retain the normal
+Kubernetes deletion path, including when both kinds are supplied together.
+The dashboard applies the same ownership rule: deleting a Coder Job deletes
+the workspace through Coder, while Restart uses Coder's native stop/start
+lifecycle and waits for its agent to reconnect. The dashboard intentionally
+offers no pod-only deletion action; its guarded operations are whole-Job
+Delete and Restart.
+
+## Coder workspaces
+
+```text
+falcon coder [GPU_PRESET] [-c CPU[:LIMIT]] [-m MEMORY[:LIMIT]]
+             [--template NAME] [--name NAME]
+             [--access all|terminal|vscode|cursor|jupyter|APP]
+             [--parameter NAME=VALUE] [--timeout SECONDS]
+falcon coder WORKSPACE_OR_JOB [--access APP]
+```
+
+Coder owns the Kubernetes Job and agent credential; Falcon calls its workspace
+API, maps normalized CPU/RAM values to the template's rich parameters, waits
+for the agent, and prints OSC 8 editor and terminal links. Generated workspace
+names use `color-animal-number`, matching the Coder dashboard. VS Code,
+Antigravity, and Cursor links open the directory from which `falcon coder` was
+invoked. Use
+`--access terminal` when only the web terminal is wanted. Extra template
+parameters are repeatable. Antigravity 2.0 is printed only as an
+`Antigravity 2.0 IDE` link using the `antigravity-ide` URL scheme. When an interactive run has no
+credential, Falcon prints a clickable `/cli-auth` link, reads the pasted token
+without echoing it, validates it, and saves it as the standard Coder CLI
+session. Non-interactive runs use `CODER_SESSION_TOKEN` or an existing Coder
+CLI login and never prompt.
+Template-managed JupyterLab apps are included through Coder's authenticated
+workspace-app proxy; `--access jupyter` and `--access notebook` select that link.
+
+GPU presets use the same cluster-aware proportional CPU/RAM sizing as ordinary
+Falcon Jobs and populate the template's GPU model and count parameters. For
+example, `falcon coder 2080ti -j falcon` creates workspace `falcon`; Coder names
+its Kubernetes Job `coder-<user>-falcon`.
+
+Passing a non-preset positional value reconnects without creating anything.
+Both `falcon coder falcon` and `falcon coder coder-<user>-falcon` wait for the
+existing agent and print fresh links for the invocation directory.
+
 ## TUI
 
 ```text
@@ -95,8 +142,8 @@ falcon config
 ```
 
 Exit codes are `0` success, `2` input/config error, `3` Kubernetes unavailable
-or operation failure, `4` object not found, `5` safe-install conflict, and
-`130` interrupted.
+or operation failure, `4` object not found, `5` safe-install conflict, `6`
+Coder API/configuration failure, and `130` interrupted.
 
 ## Short aliases
 
@@ -104,5 +151,7 @@ or operation failure, `4` object not found, `5` safe-install conflict, and
 `k` kill, `c` clean, `d` dashboard, `r` resources, and `s` setup. Completion
 shows base GPU presets first; after `falcon h100`, `falcon a6000`, or
 `falcon 2080ti`, the next Tab completes same-token forms such as
-`2080tix2`. One-letter aliases remain accepted but are intentionally omitted
-from completion suggestions.
+`2080tix2`. `falcon coder <Tab>` lists only short workspace names read from
+live Coder Job labels—for example, `falcon` or `lime-gull-30`—and no presets or
+options. One-letter aliases remain accepted but are intentionally omitted from
+completion suggestions.

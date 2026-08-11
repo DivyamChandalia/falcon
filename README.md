@@ -50,6 +50,7 @@ falcon h<TAB>              h100
 falcon h100<TAB>           h100x2, h100x3, …, h100x8
 falcon h100x2 --<TAB>      launch options
 falcon logs <TAB>          current Kubernetes Job names
+falcon coder <TAB>         current Coder workspace names only
 falcon resources --<TAB>   resource filters and output options
 ```
 
@@ -60,7 +61,9 @@ eval "$(falcon completion zsh)"   # use bash for Bash
 ```
 
 Job-name completion queries Kubernetes directly so newly created Jobs appear
-without waiting for a local cache to expire.
+without waiting for a local cache to expire. Coder completion reads the
+`coder.workspace` label and offers only short workspace names such as `falcon`
+and `lime-gull-30`.
 
 ## Run a Job
 
@@ -152,6 +155,49 @@ total requested GPU count, or allocated VRAM divided by total allocated VRAM.
 The responsive GPU bars and Pod table remain scheduler-facing allocation/request
 data; no GPU compute utilization is inferred.
 
+## Create a Coder workspace
+
+```console
+falcon coder -c 4:4 -m 8Gi:8Gi
+falcon coder -c 4:4 -m 8Gi:8Gi --access terminal
+falcon coder 2080ti -j falcon
+falcon coder falcon
+```
+
+Falcon asks the configured Coder deployment to create the workspace, waits for
+its agent, and prints clickable VS Code, Antigravity, Antigravity 2.0 IDE,
+Cursor, JupyterLab, and web-terminal links when those
+applications are exposed by the template. Editor links open the directory where
+`falcon coder` was invoked inside the workspace. The IDE variant uses the
+`antigravity-ide` URL scheme; JupyterLab uses Coder's authenticated workspace-app
+proxy rather than exposing its localhost port.
+The default name has the same shape as the Coder dashboard—`color-animal-number`—so
+the Kubernetes Job remains `coder-<user>-<color>-<animal>-<number>`.
+GPU presets reuse Falcon's cluster-aware proportional CPU/RAM sizing and pass
+the selected GPU model/count to the Coder template. With `-j falcon`, the
+workspace is `falcon` and its Job is `coder-<user>-falcon`.
+Passing an existing workspace name—or its full `coder-<user>-<workspace>` Job
+name—skips creation and prints fresh access links for that running session.
+
+Coder must create this Job itself because it owns the workspace build and agent
+credential. On the first interactive run, Falcon prints a clickable Coder login
+link, accepts the pasted session token without echoing it, validates it, and
+saves it to Coder's standard `~/.config/coderv2/session` file for future Falcon
+and Coder CLI runs. `CODER_SESSION_TOKEN` remains available for ephemeral and
+non-interactive use. Falcon never stores the token in `.falconrc`. The `IDEs`
+template is selected by default; configure `coder.template` or pass `--template`
+to override it.
+
+Use the full Job name to remove a Coder workspace, for example
+`falcon kill coder-divyam.c-falcon`. Falcon detects the Coder-owned name and
+requests Coder's native delete transition, rather than deleting its Kubernetes
+Job behind the control plane. The same command repairs the cleanup path when
+the underlying Job is already missing; ordinary Falcon Jobs still use direct
+Kubernetes deletion.
+The dashboard's `k`/`F9` actions follow the same rule. Delete goes through
+Coder, Restart performs a Coder-managed stop/start and waits for the agent to
+become ready. The dashboard offers only whole-Job Delete and Restart actions.
+
 ## Coding agents
 
 Agents use the same small command surface as humans:
@@ -202,6 +248,7 @@ falcon metrics JOB --interval 60   return allocation-scoped JSON metrics
 falcon kill JOB                    kill a Job
 falcon dashboard                   open the Jobs TUI
 falcon resources                   open the node/resource TUI
+falcon coder [GPU] -c CPU -m RAM  create a Coder development workspace
 falcon setup                       configure Falcon and agent skills
 ```
 

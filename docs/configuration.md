@@ -39,6 +39,17 @@ dashboard:
   ema_alpha: 0.1
   sort_field: Age
   sort_direction: desc
+coder:
+  url: https://coder.yoda.hyperverge.org
+  template: IDEs
+  wait_timeout_seconds: 600
+  parameters:
+    cpu: null
+    cpu_limit: null
+    memory: null
+    memory_limit: null
+    gpu_type: null
+    gpu_count: null
 ```
 
 Volume strings are `HOST_PATH[:MOUNT_PATH]`; paths must be absolute. Dict
@@ -71,3 +82,14 @@ GPU plans derived automatically from node capacity subtract 1 GiB from the
 calculated memory request as a safety buffer. An explicit launch-time `-m`
 value replaces that automatic memory calculation. Falcon normalizes generated
 memory and shared-memory values to integral Kubernetes byte quantities.
+
+`falcon coder` uses the `IDEs` template by default and auto-detects conventional
+`cpu`, `cpu_limit`, `memory`, `memory_limit`, `gpu_type`, and `gpu_count`
+rich-parameter names. Set a mapping above only when a template
+uses a different name. Null limit mappings are optional because many templates
+expose one CPU parameter and one RAM parameter, then apply each value to both
+the Kubernetes request and limit. Coder credentials are read from
+`CODER_SESSION_TOKEN` or the Coder CLI session file and are never stored in
+Falcon configuration. If neither exists, an interactive `falcon coder` run
+guides login and saves the validated token to the Coder CLI session file with
+owner-only permissions.

@@ -28,6 +28,7 @@ dependencies = [
     "PyYAML>=6.0",
     "httpx>=0.23.0",
     "textual>=2.0,<8",
+    "unique-names-generator>=1.0.2,<2",
 ]
 
 [project.urls]

@@ -118,6 +118,10 @@ class ParserTests(CliHarness):
             "--consumer-limit",
             candidates("options", DEFAULT_CONFIG, "r"),
         )
+        coder_options = candidates("options", DEFAULT_CONFIG, "coder")
+        self.assertIn("2080ti", coder_options)
+        self.assertIn("2080tix2", coder_options)
+        self.assertIn("-j", coder_options)
 
     def test_bash_completion_offers_base_preset_then_gpu_counts(self) -> None:
         executable = shutil.which("bash")
@@ -172,6 +176,45 @@ class ParserTests(CliHarness):
             self.assertNotIn("_falcon_job_cache", script)
             self.assertNotIn("_falcon_refresh_jobs", script)
             self.assertIn("kubectl get jobs.batch", script)
+            self.assertIn("app.kubernetes.io/managed-by=coder", script)
+            self.assertIn("coder\\.workspace", script)
+
+    def test_bash_coder_completion_includes_only_workspace_names(self) -> None:
+        executable = shutil.which("bash")
+        if executable is None:
+            self.skipTest("bash is unavailable")
+        script = shell_script("bash", config=DEFAULT_CONFIG)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            kubectl = Path(temporary) / "kubectl"
+            kubectl.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' falcon lime-gull-30 '<none>'\n",
+                encoding="utf-8",
+            )
+            kubectl.chmod(0o755)
+            command = (
+                "source /dev/stdin; "
+                "COMP_WORDS=(falcon coder ''); COMP_CWORD=2; "
+                "_falcon_native; printf '%s\\n' \"${COMPREPLY[@]}\""
+            )
+            completed = subprocess.run(
+                [executable, "--noprofile", "--norc", "-c", command],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "PATH": f"{temporary}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        values = completed.stdout.splitlines()
+        self.assertEqual(values, ["falcon", "lime-gull-30"])
+        self.assertNotIn("2080ti", values)
+        self.assertNotIn("--access", values)
 
     def test_legacy_shell_init_keeps_completion_registered_after_upgrade(self) -> None:
         for shell in ("bash", "zsh"):
