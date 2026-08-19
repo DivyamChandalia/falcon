@@ -17,6 +17,11 @@ replaces the buffered automatic memory value. `--environment auto` honors
 `VIRTUAL_ENV` before `CONDA_PREFIX`;
 `--environment none` disables environment mounting; a path selects explicitly.
 
+A memory value containing only a number is treated as GiB, so `-m 5` means
+`-m 5Gi`. The same applies independently to request/limit pairs: `-m 5:8`
+means `5Gi:8Gi`. Explicit Kubernetes quantities such as `512Mi`, `5Gi`, and
+`6G` keep their stated units.
+
 `--dry-run` performs no create operation. With `--output json`, it emits the
 request, resource plan, and manifest as structured data.
 

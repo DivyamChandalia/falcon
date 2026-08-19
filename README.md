@@ -166,6 +166,10 @@ falcon -c 8 -m 32Gi -- python preprocess.py
 falcon 2080ti
 ```
 
+Bare memory numbers are interpreted as GiB: `-m 5` is equivalent to
+`-m 5Gi`. Explicit Kubernetes units remain supported, and the rule applies to
+both sides of a request/limit pair (`-m 5:8` means `5Gi:8Gi`).
+
 The interactive shell opens in your current working directory and is removed
 when you exit.
 

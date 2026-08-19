@@ -379,6 +379,19 @@ class SubmissionCliTests(CliHarness):
         self.assertEqual(value["kind"], "JobDryRun")
         self.assertEqual(value["data"]["manifest"]["kind"], "Job")
 
+    def test_bare_cli_memory_is_interpreted_as_gibibytes(self) -> None:
+        code, stdout, stderr = self.invoke(
+            "-c", "2", "-m", "5",
+            "--environment", "none", "--name", "bare-memory",
+            "--dry-run", "--output", "json", "--", "python", "work.py",
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        container = json.loads(stdout)["data"]["manifest"]["spec"]["template"][
+            "spec"
+        ]["containers"][0]
+        self.assertEqual(container["resources"]["requests"]["memory"], "5Gi")
+        self.assertEqual(container["resources"]["limits"]["memory"], "5Gi")
+
     def test_gpu_dry_run_with_planned_node(self) -> None:
         from falcon.models import NodeResources
 

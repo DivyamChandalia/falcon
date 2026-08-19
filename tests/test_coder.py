@@ -783,7 +783,7 @@ class CoderCliTests(unittest.TestCase):
             "falcon.cli.generate_workspace_name", return_value="lime-gull-30"
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = main([
-                "coder", "-c", "4:4", "-m", "8Gi:8Gi",
+                "coder", "-c", "4:4", "-m", "8:8",
                 "--access", "terminal",
             ])
         self.assertEqual((code, stderr.getvalue()), (0, ""))

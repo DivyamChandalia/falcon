@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import re
 import shlex
 import sys
 import time
@@ -515,6 +516,22 @@ def _namespace_value(args: argparse.Namespace, config: Mapping[str, Any]) -> str
     return args.namespace or str(config["cluster"]["namespace"])
 
 
+_BARE_MEMORY = re.compile(r"^[+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")
+
+
+def _cli_memory(value: str) -> str:
+    """Interpret bare CLI memory numbers as GiB while preserving quantities."""
+
+    request, separator, limit = value.partition(":")
+
+    def with_default_unit(part: str) -> str:
+        part = part.strip()
+        return f"{part}Gi" if _BARE_MEMORY.fullmatch(part) else part
+
+    request = with_default_unit(request)
+    return f"{request}:{with_default_unit(limit)}" if separator else request
+
+
 def _parse_env(values: Iterable[str]) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for value in values:
@@ -635,12 +652,13 @@ def _submit_command(
         if args.shm_percent is not None
         else config.get("resources", {}).get("shared_memory_percent", 15)
     )
+    memory = _cli_memory(args.memory) if args.memory else None
     if gpu is None:
-        if not args.cpu or not args.memory:
+        if not args.cpu or not memory:
             raise CliError("CPU-only Jobs require both --cpu and --memory")
         plan = plan_cpu_resources(
             args.cpu,
-            args.memory,
+            memory,
             shared_memory=args.shm_size,
             shared_memory_percent=percent,
         )
@@ -653,7 +671,7 @@ def _submit_command(
             gpu.model,
             gpu.count,
             cpu_override=args.cpu,
-            memory_override=args.memory,
+            memory_override=memory,
             maximize=args.maximize,
             shared_memory=args.shm_size,
             shared_memory_percent=percent,
@@ -1411,6 +1429,7 @@ def _coder_command(
     args: argparse.Namespace,
     config: Mapping[str, Any],
 ) -> int:
+    memory = _cli_memory(args.memory) if args.memory else None
     resolved_preset = resolve_preset(args.preset, config) if args.preset else None
     existing_reference = args.preset if args.preset and resolved_preset is None else None
     if existing_reference is not None:
@@ -1447,15 +1466,15 @@ def _coder_command(
             gpu_type,
             gpu_count,
             cpu_override=args.cpu,
-            memory_override=args.memory,
+            memory_override=memory,
             shared_memory_percent=shared_memory_percent,
         )
     else:
-        if not args.cpu or not args.memory:
+        if not args.cpu or not memory:
             raise CoderError(
                 "falcon coder requires a GPU preset or both --cpu and --memory"
             )
-        plan = plan_cpu_resources(args.cpu, args.memory)
+        plan = plan_cpu_resources(args.cpu, memory)
     coder_config = config.get("coder", {})
     if not isinstance(coder_config, Mapping):
         raise CoderError("coder must be a YAML mapping")
