@@ -409,7 +409,11 @@ class CoderClient:
         return value
 
     def delete_workspace(
-        self, workspace: Mapping[str, Any]
+        self,
+        workspace: Mapping[str, Any],
+        *,
+        timeout: Optional[float] = None,
+        interval: float = 2.0,
     ) -> Mapping[str, Any]:
         """Submit Coder's native delete build for one workspace.
 
@@ -418,7 +422,56 @@ class CoderClient:
         resources and update its own state as one lifecycle action.
         """
 
-        return self.create_workspace_build(workspace, "delete")
+        build = self.create_workspace_build(workspace, "delete")
+        if timeout is not None:
+            self.wait_until_deleted(
+                workspace,
+                timeout=timeout,
+                interval=interval,
+            )
+        return build
+
+    def wait_until_deleted(
+        self,
+        workspace: Mapping[str, Any],
+        *,
+        timeout: float,
+        interval: float = 2.0,
+    ) -> None:
+        """Wait for a Coder delete build to finish, surfacing build failures."""
+
+        workspace_id = str(workspace.get("id") or "")
+        name = str(workspace.get("name") or workspace_id)
+        if not workspace_id:
+            raise CoderError("Coder workspace response is missing its ID")
+        deadline = time.monotonic() + timeout
+        path = f"/api/v2/workspaces/{quote(workspace_id, safe='')}"
+        while True:
+            try:
+                current = self._request("GET", path)
+            except CoderError as exc:
+                if exc.status_code == 404:
+                    return
+                raise
+            if not isinstance(current, Mapping):
+                raise CoderError("Coder returned an invalid workspace response")
+            build = current.get("latest_build", {})
+            status = str(build.get("status") or "").lower()
+            if status == "deleted":
+                return
+            if status in {"failed", "canceled"}:
+                job = build.get("job", {})
+                detail = job.get("error") if isinstance(job, Mapping) else None
+                raise CoderError(
+                    f"Coder workspace delete {status}"
+                    + (f": {detail}" if detail else "")
+                )
+            if time.monotonic() >= deadline:
+                raise CoderError(
+                    f"timed out after {timeout:g}s deleting workspace {name}; "
+                    f"its current build status is {status or 'unknown'}"
+                )
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
     def restart_workspace(
         self,

@@ -43,7 +43,7 @@ from .coder import (
     validate_workspace_name,
     workspace_job_name,
 )
-from .commands import attach, clean, kill, remember_job, target_job, top
+from .commands import attach, kill, remember_job, target_job, top
 from .completion import COMMAND_ALIASES, shell_script
 from .config import (
     config_path,
@@ -1288,19 +1288,25 @@ def _authenticated_coder_connection(
     return url, token
 
 
-def _kill_command(
-    args: argparse.Namespace,
+def _delete_job_targets(
+    targets: Sequence[str],
+    namespace: str,
     config: Mapping[str, Any],
-) -> int:
-    """Delete Coder Jobs through Coder and ordinary Jobs through Kubernetes."""
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Delete Jobs through their owning control plane."""
 
-    targets = list(args.jobs) or [target_job(None)]
     coder_jobs = [target for target in targets if target.startswith("coder-")]
     ordinary_jobs = [target for target in targets if not target.startswith("coder-")]
     deleted_workspaces: List[Tuple[str, str]] = []
 
     if coder_jobs:
         url, token = _authenticated_coder_connection(config)
+        coder_config = config.get("coder", {})
+        timeout = float(
+            coder_config.get("wait_timeout_seconds", 600)
+            if isinstance(coder_config, Mapping)
+            else 600
+        )
 
         with CoderClient(url, token) as client:
             user = client.current_user()
@@ -1318,11 +1324,27 @@ def _kill_command(
                 name = validate_workspace_name(str(workspace.get("name") or ""))
                 workspaces.append((name, job, workspace))
             for name, job, workspace in workspaces:
-                client.delete_workspace(workspace)
+                client.delete_workspace(workspace, timeout=timeout)
                 deleted_workspaces.append((name, job))
 
     if ordinary_jobs:
-        kill(_namespace_value(args, config), ordinary_jobs)
+        kill(namespace, ordinary_jobs)
+
+    return deleted_workspaces, ordinary_jobs
+
+
+def _kill_command(
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+) -> int:
+    """Delete Coder Jobs through Coder and ordinary Jobs through Kubernetes."""
+
+    targets = list(args.jobs) or [target_job(None)]
+    deleted_workspaces, ordinary_jobs = _delete_job_targets(
+        targets,
+        _namespace_value(args, config),
+        config,
+    )
 
     if args.output == "json":
         print(dumps("KillResult", {"jobs": targets, "killed": True}))
@@ -1341,6 +1363,47 @@ def _kill_command(
                 f"Killed {len(ordinary_jobs)} Job(s): "
                 f"{', '.join(ordinary_jobs)}"
             )
+    return 0
+
+
+def _clean_command(
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+) -> int:
+    """Delete succeeded Jobs through their owning control plane."""
+
+    namespace = _namespace_value(args, config)
+    payload = KubernetesClient(namespace).list_jobs()
+    completed = [
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in payload.get("items", [])
+        if not (item.get("status") or {}).get("active")
+        and (item.get("status") or {}).get("succeeded")
+    ]
+    completed = [name for name in completed if name]
+    if not completed:
+        print("No succeeded Jobs to clean.")
+        return 0
+
+    deleted_workspaces, ordinary_jobs = _delete_job_targets(
+        completed,
+        namespace,
+        config,
+    )
+    if deleted_workspaces:
+        rendered = ", ".join(
+            f"{name} ({job})" for name, job in deleted_workspaces
+        )
+        print(
+            "Deleting "
+            f"{len(deleted_workspaces)} succeeded Coder workspace(s) through Coder: "
+            f"{rendered}"
+        )
+    if ordinary_jobs:
+        print(
+            f"Deleted {len(ordinary_jobs)} succeeded Job(s): "
+            f"{', '.join(ordinary_jobs)}"
+        )
     return 0
 
 
@@ -1797,7 +1860,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command_name == "kill":
             return _kill_command(args, config)
         if args.command_name == "clean":
-            return clean(_namespace_value(args, config))
+            return _clean_command(args, config)
         if args.command_name == "dashboard":
             if not sys.stdout.isatty():
                 raise CliError(

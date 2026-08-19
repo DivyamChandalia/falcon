@@ -18,6 +18,8 @@ keeps nodes, running Jobs, and free GPU/CPU/memory headroom on one line.
 - `Enter` or `z`: expand; `Esc`: restore
 - `/`: search; `f`: filters; `s`: sort
 - `Space`: mark; `a`: mark all; `A`: clear marks
+- `k` / `F9`: kill the marked Jobs, or the selected Job when none are marked
+- `c`: clean succeeded Jobs within the marked set; with no marks, clean all succeeded Jobs
 - `v`: choose visible panes
 - `r`: refresh; `q`: quit
 

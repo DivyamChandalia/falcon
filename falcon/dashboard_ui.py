@@ -432,18 +432,38 @@ class CleanupDialog(ModalScreen[bool]):
         Binding("shift+y", "confirm", "Clean", show=False, priority=True),
     ]
 
-    def __init__(self, rows: List[JobUsage]):
+    def __init__(
+        self,
+        rows: List[JobUsage],
+        *,
+        marked: bool = False,
+        excluded_marked: int = 0,
+    ):
         super().__init__()
         self.rows = rows
+        self.marked = marked
+        self.excluded_marked = excluded_marked
 
     def compose(self) -> ComposeResult:
         names = "\n".join(f"  {row.job}" for row in self.rows[:16])
         if len(self.rows) > 16:
             names += f"\n  … and {len(self.rows) - 16} more"
-        text = Text("CLEAN SUCCEEDED JOBS\n\n", style=f"bold {YELLOW}")
-        text.append(f"Delete {len(self.rows)} succeeded Job{'s' if len(self.rows) != 1 else ''}?\n\n", style=WHITE)
+        title = "CLEAN MARKED SUCCEEDED JOBS" if self.marked else "CLEAN SUCCEEDED JOBS"
+        scope = "marked succeeded" if self.marked else "succeeded"
+        text = Text(f"{title}\n\n", style=f"bold {YELLOW}")
+        text.append(
+            f"Delete {len(self.rows)} {scope} Job{'s' if len(self.rows) != 1 else ''}?\n\n",
+            style=WHITE,
+        )
         text.append(names, style=GRAY)
-        text.append("\n\nRunning and failed Jobs will not be touched.\n", style=GREEN)
+        if self.marked and self.excluded_marked:
+            text.append(
+                f"\n\n{self.excluded_marked} marked running or failed "
+                f"Job{'s' if self.excluded_marked != 1 else ''} will not be touched.\n",
+                style=GREEN,
+            )
+        else:
+            text.append("\n\nRunning and failed Jobs will not be touched.\n", style=GREEN)
         text.append("\nEnter/y Clean    Esc Cancel", style=GRAY)
         with Container(id="cleanup-box"):
             yield Static(text, id="cleanup-text")
@@ -1655,31 +1675,44 @@ class FalconDashboard(App):
             self.query_one("#falcon-footer", Static).update(Text("q Quit   r Retry after resizing", style=GRAY))
             return
         marked = len(self.state.marked_job_uids)
+        pane_action = (
+            "Esc Restore"
+            if self.state.expanded_pane == self.state.focused_pane
+            else "Enter Expand"
+        )
         if self.state.focused_pane == "jobs":
-            value = (
-                "↑/↓ Jobs  Enter Expand  Tab  / Search  f Filter  "
-                "c Clean  r Refresh  q Quit"
-                if self.size.width < 160
-                else "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   "
-                "k/F9 Actions   c Clean   Enter Expand   Tab Next pane   "
-                "/ Search   r Refresh   q Quit"
-            )
-            if marked:
-                value += f"      {marked} marked"
+            mark_label = f"Space Mark ({marked})" if marked else "Space Mark"
+            clean_label = "c Clean marked" if marked else "c Clean succeeded"
+            if self.size.width < 140:
+                value = (
+                    f"s Sort  {mark_label}  k Kill  c Clean  {pane_action}  "
+                    "Tab Next pane  q Quit"
+                )
+            elif self.size.width < 160:
+                value = (
+                    f"↑/↓ Jobs  s Sort  {mark_label}  k/F9 Kill  {clean_label}  "
+                    f"f Filter  / Search  {pane_action}  Tab Next pane  r Refresh  q Quit"
+                )
+            else:
+                value = (
+                    f"↑/↓ Navigate   s Sort   {mark_label}   f Filters   v Panes   "
+                    f"k/F9 Kill   {clean_label}   {pane_action}   Tab Next pane   "
+                    "/ Search   r Refresh   q Quit"
+                )
         elif self.state.focused_pane == "selected":
             value = (
-                "↑/↓ Command   PgUp/PgDn Page   Home/End   Tab Next pane   Esc Restore   r Refresh   q Quit"
+                "↑/↓ Command   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
                 if self.state.expanded_pane == "selected"
-                else "↑/↓ Change Job   v Panes   Enter Expand   Tab Next pane   r Refresh   q Quit"
+                else f"↑/↓ Change Job   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
             )
         elif self.state.focused_pane == "resources":
             zoom = round(100 / self.state.resource_zoom)
             if self.state.expanded_pane == "resources":
-                value = f"←/→ History   R Range   +/- Zoom {zoom}%   Z Cycle   r Refresh   Tab Next pane   Esc Restore   q Quit"
+                value = f"←/→ History   R Range   +/- Zoom {zoom}%   Z Cycle   Esc Restore   Tab Next pane   r Refresh   q Quit"
             else:
-                value = f"←/→ History   Home/End Range   +/- Zoom {zoom}%   v Panes   Enter Expand   Tab Next pane   r Refresh   q Quit"
+                value = f"←/→ History   Home/End Range   +/- Zoom {zoom}%   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
         else:
-            value = "↑/↓ Scroll   PgUp/PgDn Page   Home Oldest   End Newest   / Search   v Panes   Enter Expand   Tab Next pane   q Quit"
+            value = f"↑/↓ Scroll   PgUp/PgDn Page   Home Oldest   End Newest   / Search   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
         self.query_one("#falcon-footer", Static).update(Text(value, style=GRAY))
 
     def _render_all(self) -> None:
@@ -2081,7 +2114,7 @@ class FalconDashboard(App):
         self._request_update()
 
     def action_help(self) -> None:
-        self.notify("Tab panes · v show/hide panes · 1/2/3 focus · Space mark · k/F9 actions · c clean succeeded · / search · z expand · r refresh · q quit", timeout=8)
+        self.notify("Tab panes · v show/hide panes · 1/2/3 focus · Space mark · k/F9 kill marked · c clean succeeded Jobs within marked set · / search · z expand · r refresh · q quit", timeout=8)
 
     def action_panes(self) -> None:
         self.push_screen(PaneVisibilityDialog(self.state.hidden_panes), self._panes_selected)
@@ -2105,11 +2138,21 @@ class FalconDashboard(App):
                 self.notify(f"Could not save pane visibility: {exc}", severity="error")
 
     def action_cleanup(self) -> None:
-        targets = [row for row in self.rows if row.status == "Succeeded"]
+        marked_rows = [row for row in self.rows if row.uid in self.state.marked_job_uids]
+        candidates = marked_rows or self.rows
+        targets = [row for row in candidates if row.status == "Succeeded"]
         if not targets:
-            self.notify("No succeeded Jobs to clean")
+            message = "No marked succeeded Jobs to clean" if marked_rows else "No succeeded Jobs to clean"
+            self.notify(message)
             return
-        self.push_screen(CleanupDialog(targets), lambda confirmed: self._cleanup_confirmed(confirmed, targets))
+        self.push_screen(
+            CleanupDialog(
+                targets,
+                marked=bool(marked_rows),
+                excluded_marked=len(marked_rows) - len(targets),
+            ),
+            lambda confirmed: self._cleanup_confirmed(confirmed, targets),
+        )
 
     def _cleanup_confirmed(self, confirmed: bool, targets: List[JobUsage]) -> None:
         if confirmed:

@@ -666,7 +666,65 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             app.action_cleanup()
             await pilot.pause()
             self.assertEqual(type(app.screen).__name__, "CleanupDialog")
+            self.assertFalse(app.screen.marked)
+            self.assertTrue(all(row.status == "Succeeded" for row in app.screen.rows))
+            self.assertFalse(app.state.marked_job_uids)
             await pilot.press("escape")
+
+            marked_targets = [
+                next(row for row in app.rows if row.status == "Running"),
+                next(row for row in app.rows if row.status == "Failed"),
+                next(row for row in app.rows if row.status == "Succeeded"),
+            ]
+            app.state.marked_job_uids.update(row.uid for row in marked_targets)
+            app.action_cleanup()
+            await pilot.pause()
+            self.assertEqual(type(app.screen).__name__, "CleanupDialog")
+            self.assertTrue(app.screen.marked)
+            self.assertEqual(app.screen.excluded_marked, 2)
+            self.assertEqual(
+                {row.uid for row in app.screen.rows},
+                {row.uid for row in marked_targets if row.status == "Succeeded"},
+            )
+            dialog = app.export_screenshot(simplify=True)
+            self.assertIn("CLEAN&#160;MARKED&#160;SUCCEEDED&#160;JOBS", dialog)
+            self.assertIn("2&#160;marked&#160;running&#160;or&#160;failed", dialog)
+            await pilot.press("escape")
+
+    async def test_jobs_footer_advertises_mark_kill_and_contextual_clean(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            footer = app.query_one("#falcon-footer").render().plain
+            self.assertIn("Space Mark", footer)
+            self.assertIn("k Kill", footer)
+            self.assertIn("c Clean", footer)
+            self.assertIn("s Sort", footer)
+            self.assertIn("Tab Next pane", footer)
+
+            app.action_toggle_mark()
+            footer = app.query_one("#falcon-footer").render().plain
+            self.assertIn("Space Mark (1)", footer)
+
+    async def test_dashboard_footer_uses_consistent_pane_actions(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 32)) as pilot:
+            await pilot.pause(0.5)
+            for pane in ("jobs", "selected", "resources", "events"):
+                app.state.focused_pane = pane
+                app.state.expanded_pane = None
+                app._render_footer()
+                footer = app.query_one("#falcon-footer").render().plain
+                self.assertIn("Enter Expand", footer)
+                self.assertIn("Tab Next pane", footer)
+                self.assertIn("r Refresh", footer)
+                self.assertIn("q Quit", footer)
+
+                app.state.expanded_pane = pane
+                app._render_footer()
+                footer = app.query_one("#falcon-footer").render().plain
+                self.assertIn("Esc Restore", footer)
+                self.assertIn("Tab Next pane", footer)
 
     async def test_coder_kill_and_restart_use_coder_instead_of_kubectl(self) -> None:
         actions = []

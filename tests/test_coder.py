@@ -295,6 +295,54 @@ class CoderClientTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_delete_workspace_wait_surfaces_failed_delete_build(self) -> None:
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.method == "POST":
+                return httpx.Response(
+                    201,
+                    json={"id": "delete-build", "transition": "delete"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "workspace-id",
+                    "name": "lime-gull-30",
+                    "latest_build": {
+                        "status": "failed",
+                        "job": {"error": "terraform apply: exit status 1"},
+                    },
+                },
+            )
+
+        client = CoderClient(
+            "https://coder.example.test",
+            "session-token",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with self.assertRaisesRegex(
+                CoderError,
+                "workspace delete failed: terraform apply: exit status 1",
+            ):
+                client.delete_workspace(
+                    {"id": "workspace-id", "name": "lime-gull-30"},
+                    timeout=600,
+                    interval=0,
+                )
+        finally:
+            client.close()
+
+        self.assertEqual(
+            requests,
+            [
+                ("POST", "/api/v2/workspaces/workspace-id/builds"),
+                ("GET", "/api/v2/workspaces/workspace-id"),
+            ],
+        )
+
     def test_restart_workspace_uses_stop_then_start_and_waits_until_ready(self) -> None:
         running = ready_workspace("falcon")
         running["id"] = "workspace-id"
@@ -567,6 +615,60 @@ class CoderLinkTests(unittest.TestCase):
 
 
 class CoderCliTests(unittest.TestCase):
+    def test_clean_routes_succeeded_coder_jobs_through_workspace_delete(self) -> None:
+        coder = MagicMock()
+        coder.__enter__.return_value = coder
+        coder.current_user.return_value = {"username": "divyamc"}
+        workspace = {"id": "workspace-id", "name": "lime-gull-30"}
+        coder.workspaces.return_value = (workspace,)
+        coder.workspace_for_job.return_value = workspace
+
+        kubernetes = MagicMock()
+        kubernetes.list_jobs.return_value = {
+            "items": [
+                {
+                    "metadata": {"name": "coder-divyam.c-lime-gull-30"},
+                    "status": {"succeeded": 1},
+                },
+                {
+                    "metadata": {"name": "finished-training"},
+                    "status": {"succeeded": 1},
+                },
+                {
+                    "metadata": {"name": "coder-divyam.c-running"},
+                    "status": {"active": 1},
+                },
+            ]
+        }
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("falcon.cli.load_config", return_value=DEFAULT_CONFIG), patch(
+            "falcon.cli.KubernetesClient", return_value=kubernetes
+        ), patch(
+            "falcon.cli.CoderClient", return_value=coder
+        ), patch(
+            "falcon.cli.resolve_connection",
+            return_value=("https://coder.example.test", "session"),
+        ), patch("falcon.cli.kill") as kubernetes_kill, contextlib.redirect_stdout(
+            stdout
+        ), contextlib.redirect_stderr(stderr):
+            code = main(["clean"])
+
+        self.assertEqual((code, stderr.getvalue()), (0, ""))
+        coder.workspace_for_job.assert_called_once_with(
+            "coder-divyam.c-lime-gull-30",
+            username="divyamc",
+            workspaces=(workspace,),
+        )
+        coder.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
+        kubernetes_kill.assert_called_once_with(
+            DEFAULT_CONFIG["cluster"]["namespace"],
+            ["finished-training"],
+        )
+        self.assertIn("succeeded Coder workspace(s) through Coder", stdout.getvalue())
+        self.assertIn("Deleted 1 succeeded Job(s): finished-training", stdout.getvalue())
+
     def test_kill_routes_coder_job_through_workspace_delete(self) -> None:
         client = MagicMock()
         client.__enter__.return_value = client
@@ -593,7 +695,7 @@ class CoderCliTests(unittest.TestCase):
             username="divyamc",
             workspaces=(workspace,),
         )
-        client.delete_workspace.assert_called_once_with(workspace)
+        client.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
         kubernetes_kill.assert_not_called()
         self.assertIn("Deleting 1 Coder workspace", stdout.getvalue())
         self.assertIn("falcon (coder-divyam.c-falcon)", stdout.getvalue())
@@ -623,7 +725,7 @@ class CoderCliTests(unittest.TestCase):
             ])
 
         self.assertEqual((code, stderr.getvalue()), (0, ""))
-        client.delete_workspace.assert_called_once()
+        client.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
         self.assertEqual(kubernetes_kill.call_args.args[1], ["training"])
         self.assertIn("Deleting 1 Coder workspace", stdout.getvalue())
         self.assertIn("Killed 1 Job(s): training", stdout.getvalue())

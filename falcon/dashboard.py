@@ -1165,7 +1165,7 @@ def _coder_workspace_action(
         if not name:
             raise CoderError("Coder workspace response is missing its name")
         if action == "delete":
-            client.delete_workspace(workspace)
+            client.delete_workspace(workspace, timeout=timeout)
         else:
             client.restart_workspace(
                 "me",
