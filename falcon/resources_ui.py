@@ -30,6 +30,7 @@ from .cluster import (
     is_system_namespace,
     natural_name_key,
 )
+from .planning import gpu_model_order_key
 from .resources_charts import (
     HISTORY_LIMIT,
     HISTORY_SECONDS,
@@ -39,7 +40,6 @@ from .resources_charts import (
     render_gpu_history,
     render_namespace_pie,
 )
-from .planning import gpu_model_order_key
 from .resources_telemetry import GpuTelemetrySnapshot, allocation_snapshot
 from .theme import (
     BACKGROUND,

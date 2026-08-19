@@ -28,6 +28,21 @@ from .cluster import (
     build_job_snapshot,
     build_job_snapshots,
 )
+from .coder import (
+    CoderAuthenticationRequired,
+    CoderClient,
+    CoderError,
+    build_access_links,
+    build_parameter_values,
+    generate_workspace_name,
+    parse_parameter_overrides,
+    resolve_connection,
+    resolve_template,
+    save_connection,
+    select_access_links,
+    validate_workspace_name,
+    workspace_job_name,
+)
 from .commands import attach, clean, kill, remember_job, target_job, top
 from .completion import COMMAND_ALIASES, shell_script
 from .config import (
@@ -39,21 +54,6 @@ from .config import (
     run_setup,
     save_resources_consumer_sort,
     save_resources_view,
-)
-from .coder import (
-    CoderAuthenticationRequired,
-    CoderClient,
-    CoderError,
-    build_access_links,
-    build_parameter_values,
-    generate_workspace_name,
-    parse_parameter_overrides,
-    resolve_connection,
-    resolve_template,
-    select_access_links,
-    save_connection,
-    validate_workspace_name,
-    workspace_job_name,
 )
 from .dashboard import UsageCollector, run_dashboard
 from .demo import DemoCollector
@@ -1569,10 +1569,13 @@ def _resources_command(
                 ensure_history_collector(config, config_file=config_file)
             except OSError as exc:
                 history_warning = f"Could not start Resources history collector: {exc}"
-            loader = lambda: store.load(
-                node_filter=args.node or "",
-                gpu_filter=args.gpu or "",
-            )
+            def load_history():
+                return store.load(
+                    node_filter=args.node or "",
+                    gpu_filter=args.gpu or "",
+                )
+
+            loader = load_history
         app = FalconResourcesApp(
             collector,
             node_filter=args.node,

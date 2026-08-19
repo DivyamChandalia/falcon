@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import hashlib
 import json
@@ -176,7 +177,7 @@ def seed_resources_history(app: FalconResourcesApp) -> None:
     app._render_all()
 
 
-async def capture() -> None:
+async def capture(*, update_assets: bool = True) -> None:
     results: Dict[str, str] = {}
 
     for width, height in DIMENSIONS:
@@ -290,19 +291,22 @@ async def capture() -> None:
         encoding="utf-8",
     )
 
-    ASSETS.mkdir(parents=True, exist_ok=True)
-    (ASSETS / "falcon-dashboard.svg").write_text(
-        (ARTIFACTS / "dashboard-asset.svg").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (ASSETS / "falcon-resources.svg").write_text(
-        (ARTIFACTS / "resources-asset.svg").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (ASSETS / "falcon-resources-allocations.svg").write_text(
-        (ARTIFACTS / "resources-allocations-asset.svg").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
+    if update_assets:
+        ASSETS.mkdir(parents=True, exist_ok=True)
+        (ASSETS / "falcon-dashboard.svg").write_text(
+            (ARTIFACTS / "dashboard-asset.svg").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (ASSETS / "falcon-resources.svg").write_text(
+            (ARTIFACTS / "resources-asset.svg").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (ASSETS / "falcon-resources-allocations.svg").write_text(
+            (ARTIFACTS / "resources-allocations-asset.svg").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
     print(
         f"captured {len(results)} deterministic states in {ARTIFACTS}\n"
         f"golden manifest: {SNAPSHOTS / 'tui_manifest.json'}"
@@ -310,4 +314,13 @@ async def capture() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(capture())
+    parser = argparse.ArgumentParser(
+        description="Generate deterministic Falcon TUI snapshots."
+    )
+    parser.add_argument(
+        "--goldens-only",
+        action="store_true",
+        help="update test goldens without replacing the live README assets",
+    )
+    options = parser.parse_args()
+    asyncio.run(capture(update_assets=not options.goldens_only))

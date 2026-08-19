@@ -35,20 +35,17 @@ from falcon.resources_charts import (
 from falcon.resources_telemetry import GpuTelemetrySnapshot
 from falcon.resources_ui import (
     CONSUMER_SORTS,
-    FalconResourcesApp,
     RESOURCE_VIEWS,
+    FalconResourcesApp,
     ResourcesPane,
-    _gpu_totals,
     _gpu_headroom_color,
+    _gpu_totals,
     _request_pressure_color,
     _resource_headroom_color,
     _short_cpu,
 )
 from falcon.theme import (
-    BACKGROUND,
-    BORDER,
     CYAN,
-    GRAY,
     GREEN,
     MUTED,
     PALETTE,

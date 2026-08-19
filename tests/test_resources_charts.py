@@ -5,9 +5,9 @@ import unittest
 from falcon.resources_charts import (
     CHART_COLORS,
     GPUHistoryPoint,
-    allocation_colors,
     _pie_dimensions,
     _series_colors,
+    allocation_colors,
     downsample_history,
     render_allocation_legend,
     render_gpu_history,

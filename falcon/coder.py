@@ -812,7 +812,6 @@ def workspace_job_name(workspace: Mapping[str, Any]) -> str:
         for resource in resources:
             if not isinstance(resource, Mapping):
                 continue
-            resource_type = str(resource.get("type") or "").lower()
             name = str(resource.get("name") or "")
             if name.startswith("coder-"):
                 return name

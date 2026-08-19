@@ -9,8 +9,8 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
