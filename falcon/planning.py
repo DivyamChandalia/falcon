@@ -20,6 +20,12 @@ from .quantities import (
 
 DEFAULT_SHARED_MEMORY_PERCENT = Decimal("15")
 AUTO_MEMORY_BUFFER_GIB = 1.0
+GPU_MODEL_DISPLAY_ORDER = (
+    ("2080ti", "2080Ti"),
+    ("a6000", "A6000"),
+    ("pro6000", "PRO6000"),
+    ("h100", "H100"),
+)
 
 
 def canonical_gpu(product: str) -> str:
@@ -36,6 +42,17 @@ def canonical_gpu(product: str) -> str:
     if "pro6000" in compact:
         return "pro6000"
     return compact
+
+
+def gpu_model_order_key(product: str) -> Tuple[int, str]:
+    """Keep known GPU models in Falcon's shared dashboard display order."""
+
+    canonical = canonical_gpu(product)
+    known = {
+        model: index
+        for index, (model, _) in enumerate(GPU_MODEL_DISPLAY_ORDER)
+    }
+    return known.get(canonical, len(known)), canonical
 
 
 def plan_cpu_resources(

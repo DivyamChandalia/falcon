@@ -39,6 +39,7 @@ from .resources_charts import (
     render_gpu_history,
     render_namespace_pie,
 )
+from .planning import gpu_model_order_key
 from .resources_telemetry import GpuTelemetrySnapshot, allocation_snapshot
 from .theme import (
     BACKGROUND,
@@ -1399,7 +1400,10 @@ class FalconResourcesApp(App[None]):
             "GPU AVAILABLE  " if self.size.width >= 130 else "",
             style=f"bold {GRAY}",
         )
-        availability = list(snapshot.gpu_availability.values())
+        availability = sorted(
+            snapshot.gpu_availability.values(),
+            key=lambda item: gpu_model_order_key(item.model),
+        )
         for item in availability:
             if right:
                 right.append("  ")

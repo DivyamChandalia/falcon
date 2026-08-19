@@ -37,6 +37,7 @@ from .dashboard import (
     _short_memory,
     _timestamp,
 )
+from .planning import GPU_MODEL_DISPLAY_ORDER
 from .theme import (
     BACKGROUND,
     BORDER,
@@ -1003,7 +1004,7 @@ class FalconDashboard(App):
             left.append(f"{value} {label}", style=f"bold {color}")
 
         right = Text("RESOURCES AVAILABLE  " if width >= 130 else "", style=f"bold {GRAY}")
-        for gpu_type, label in (("2080ti", "2080Ti"), ("a6000", "A6000"), ("h100", "H100")):
+        for gpu_type, label in GPU_MODEL_DISPLAY_ORDER:
             if right and not right.plain.endswith("  "):
                 right.append("   ")
             free_total = self.state.gpu_availability.get(gpu_type)

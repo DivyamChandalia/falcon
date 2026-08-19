@@ -187,6 +187,25 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 accent = ";".join(map(str, _rgb_values(PALETTE.accent)))
                 self.assertNotIn(f"\x1b[38;2;{accent}m", rendered)
 
+    async def test_dashboard_gpu_summary_includes_shared_model_order(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 32)) as pilot:
+            await pilot.pause(0.5)
+            app.state.gpu_availability = {
+                "h100": (1, 4),
+                "pro6000": (1, 2),
+                "a6000": (2, 4),
+                "2080ti": (6, 8),
+            }
+            app._render_summary()
+            summary = app.query_one("#summary").render().plain
+            positions = [
+                summary.index(model)
+                for model in ("2080Ti", "A6000", "PRO6000", "H100")
+            ]
+            self.assertEqual(positions, sorted(positions))
+            self.assertIn("PRO6000 1/2", summary)
+
     def test_truecolor_clears_rich_style_quantization_cache(self) -> None:
         fallback = FalconDashboard(DemoUsageCollector("mixed"), color_mode="256")
         fallback.console._render_buffer(
@@ -779,6 +798,35 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(model_style.bold)
                 self.assertEqual(model_style.foreground.hex6, YELLOW)
+
+    async def test_resources_gpu_summary_uses_shared_model_order(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 32)) as pilot:
+            await pilot.pause(0.5)
+            base = next(node for node in app.nodes if node.gpu_model == "H100")
+
+            def model_node(model: str, name: str):
+                return replace(
+                    base,
+                    name=name,
+                    capacity=replace(base.capacity, gpu_model=model),
+                    allocatable=replace(base.allocatable, gpu_model=model),
+                    requested=replace(base.requested, gpu_model=model),
+                )
+
+            app.nodes = [
+                model_node("H100", "node-h100"),
+                model_node("PRO6000", "node-pro6000"),
+                model_node("A6000", "node-a6000"),
+                model_node("2080Ti", "node-2080ti"),
+            ]
+            app._render_overview()
+            overview = app.query_one("#cluster-overview").render().plain
+            positions = [
+                overview.index(model)
+                for model in ("2080Ti", "A6000", "PRO6000", "H100")
+            ]
+            self.assertEqual(positions, sorted(positions))
 
     async def test_selected_node_jobs_have_explicit_resources_and_cycle_sort(self) -> None:
         persisted = []
