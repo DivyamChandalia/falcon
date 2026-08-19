@@ -5,9 +5,98 @@ Run Kubernetes jobs and Coder workspaces from your terminal.
 Falcon handles GPU selection, CPU and memory sizing, manifests, logs, cleanup,
 and cluster monitoring so you can focus on the command you want to run.
 
+## Why Falcon
+
+Without Falcon, starting one experiment can mean writing Job YAML, GPU
+resources, node selectors, mounts, shared memory, environment plumbing, and
+cleanup rules.
+
+With Falcon, the request is one line:
+
 ```console
 falcon h100x2 -- python train.py
 ```
+
+Falcon discovers cluster capacity, creates the Job directly, preserves the
+current Python environment when requested, and keeps request history correct
+after Pods disappear.
+
+The equivalent legacy `jet` command requires those choices up front:
+
+```console
+jet launch job train \
+  --image YOUR_RUNTIME_IMAGE \
+  --command "python train.py" \
+  --gpu 2 \
+  --gpu-type h100 \
+  --cpu REQUEST:LIMIT \
+  --memory REQUEST:LIMIT \
+  --shm-size SIZE \
+  --pyenv "$CONDA_PREFIX" \
+  --volume "$PWD:$PWD" \
+  --working-dir "$PWD"
+```
+
+Falcon derives the CPU, memory, and shared-memory values from live capacity;
+the corresponding manual Kubernetes manifest therefore needs concrete values.
+
+<details>
+<summary>Show a representative Kubernetes Job YAML</summary>
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train
+  namespace: research
+spec:
+  template:
+    spec:
+      schedulerName: kai-scheduler
+      restartPolicy: Never
+      nodeSelector:
+        gpu-type: h100
+      containers:
+        - name: train
+          image: your-runtime-image
+          command: ["/bin/bash", "-lc", "python train.py"]
+          workingDir: /workspace
+          env:
+            - name: PATH
+              value: /opt/python-env/bin:/usr/local/bin:/usr/bin:/bin
+          resources:
+            requests:
+              cpu: "24"
+              memory: 192Gi
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "24"
+              memory: 192Gi
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: python-env
+              mountPath: /opt/python-env
+            - name: shared-memory
+              mountPath: /dev/shm
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /path/to/project
+        - name: python-env
+          hostPath:
+            path: /path/to/python-environment
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 29Gi
+```
+
+The image, namespace, scheduler, resource sizes, and host paths above are
+examples; they must match your cluster.
+
+</details>
 
 <p align="center">
   <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
@@ -18,12 +107,13 @@ falcon h100x2 -- python train.py
 Falcon requires Python 3.10+, `kubectl`, and access to a Kubernetes cluster.
 
 ```console
-python -m pip install .
+python -m pip install --user git+https://github.com/DivyamChandalia/falcon.git
 falcon setup
 ```
 
-`falcon setup` creates `~/.falconrc` and installs shell completion. Open a new
-shell after setup, then launch a workload:
+This installs Falcon directly from GitHub—no clone is required. `falcon setup`
+creates `~/.falconrc` and installs shell completion. Open a new shell after
+setup, then launch a workload:
 
 ```console
 # One GPU
