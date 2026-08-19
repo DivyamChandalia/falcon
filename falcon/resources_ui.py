@@ -336,7 +336,11 @@ ResourcesPane:focus {{ border: solid {CYAN}; }}
 #node-pane {{ height: 9; min-height: 5; }}
 #gpu-allocations-pane {{ height: 1fr; min-height: 8; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
-#resources-footer {{ dock: bottom; height: 1; padding: 0 1; color: {GRAY}; }}
+# Keep the footer in normal document flow. Docking it leaves a stale one-row
+# virtual overflow after tmux briefly reports a shorter terminal on reattach,
+# which lets the Resources screen scroll even though every pane is clipped.
+# This mirrors Dashboard's footer layout.
+#resources-footer {{ height: 1; padding: 0 1; color: {GRAY}; }}
 """
 
 
@@ -545,13 +549,39 @@ class FalconResourcesApp(App[None]):
             close()
 
     def on_resize(self, event: events.Resize) -> None:
+        # Textual dispatches Resize before the App's ``size`` property has
+        # been committed on some terminal backends (notably after tmux
+        # reattach). Applying our height calculations against that stale size
+        # leaves a one-row virtual overflow until the polling fallback runs.
+        # Defer the layout pass until the next refresh, when ``self.size`` and
+        # the widget regions agree.
+        self._last_terminal_size = (-1, -1)
+        self.call_after_refresh(self._apply_resized_layout)
+
+    def _apply_resized_layout(self) -> None:
+        if not self.is_mounted:
+            return
         self._last_terminal_size = (self.size.width, self.size.height)
         try:
+            self.screen.scroll_to(y=0, animate=False)
             self._apply_layout(recompute_detail=True)
+            # Setting pane heights invalidates their content geometry. Wait
+            # for Textual to commit those heights before calculating visible
+            # rows; doing it in this same callback reuses the previous size
+            # and can leave selection or colour-bar rows clipped after resize.
+            self.call_after_refresh(self._finish_resized_layout)
+        except NoMatches:
+            # Resize events can arrive as Textual is tearing down the screen.
+            return
+
+    def _finish_resized_layout(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.screen.scroll_to(y=0, animate=False)
             self._ensure_visible()
             self._render_all()
         except NoMatches:
-            # Resize events can arrive as Textual is tearing down the screen.
             return
 
     def _check_terminal_size(self) -> None:
@@ -560,9 +590,9 @@ class FalconResourcesApp(App[None]):
             return
         self._last_terminal_size = current
         try:
+            self.screen.scroll_to(y=0, animate=False)
             self._apply_layout(recompute_detail=True)
-            self._ensure_visible()
-            self._render_all()
+            self.call_after_refresh(self._finish_resized_layout)
         except NoMatches:
             # The polling timer may tick after the default screen unmounts.
             return
@@ -592,6 +622,12 @@ class FalconResourcesApp(App[None]):
         if not self.is_mounted:
             return
         try:
+            if focused:
+                # A terminal reattach can restore the Screen with the
+                # previous scroll offset even though Resources has no root
+                # scrollable content. Always return the application viewport
+                # to its origin before restoring pane emphasis.
+                self.screen.scroll_to(y=0, animate=False)
             self._set_titles()
             if self.state.view == "nodes":
                 self._render_nodes()
@@ -1197,7 +1233,11 @@ class FalconResourcesApp(App[None]):
             identifier = f"{self.state.view}-pane"
             target = self.query_one(f"#{identifier}", ResourcesPane)
             target.display = True
-            target.styles.height = "1fr"
+            # Header (1), overview (2), and footer (1) are the only rows
+            # outside this pane. An explicit height avoids Textual retaining
+            # the hidden Nodes control row in the previous ``1fr`` layout,
+            # which otherwise leaves a blank terminal row below the footer.
+            target.styles.height = max(1, self.size.height - 4)
             self.state.active_pane = self.state.focused_panes[self.state.view]
             if self.app_focus and self.focused is not target:
                 self.set_focus(target, scroll_visible=False)

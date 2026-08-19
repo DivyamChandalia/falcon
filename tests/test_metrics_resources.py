@@ -72,6 +72,17 @@ kube_job_status_failed{{namespace="team-a",job_name="train"}} 0
 kube_job_created{{namespace="team-a",job_name="train"}} 1699999900
 """
 
+PRO6000_METRICS = f"""
+kube_node_status_capacity{{node="node5",resource="cpu",unit="core"}} 64
+kube_node_status_capacity{{node="node5",resource="memory",unit="byte"}} {256 * GIB}
+kube_node_status_capacity{{node="node5",resource="nvidia_com_gpu",unit="integer"}} 2
+kube_node_status_allocatable{{node="node5",resource="cpu",unit="core"}} 64
+kube_node_status_allocatable{{node="node5",resource="memory",unit="byte"}} {256 * GIB}
+kube_node_status_allocatable{{node="node5",resource="nvidia_com_gpu",unit="integer"}} 2
+kube_node_status_condition{{condition="Ready",node="node5",status="true"}} 1
+kube_node_labels{{node="node5",label_gpu_type="pro6000"}} 1
+"""
+
 
 class MetricsResourceTests(unittest.TestCase):
     def test_cluster_snapshot_parses_metrics_once(self) -> None:
@@ -79,6 +90,15 @@ class MetricsResourceTests(unittest.TestCase):
             snapshot = cluster_snapshot_from_metrics(METRICS)
         self.assertTrue(snapshot.nodes)
         parser.assert_called_once()
+
+    def test_scheduler_gpu_label_discovers_and_displays_pro6000(self) -> None:
+        snapshot = cluster_snapshot_from_metrics(PRO6000_METRICS)
+        node = snapshot.nodes[0]
+        self.assertEqual(node.name, "node5")
+        self.assertEqual(node.gpu_model, "PRO6000")
+        self.assertEqual(set(snapshot.gpu_availability), {"PRO6000"})
+        availability = snapshot.gpu_availability["PRO6000"]
+        self.assertEqual((availability.request_headroom, availability.allocatable), (2, 2))
 
     def test_old_resource_semantics_are_available_without_node_rbac(self) -> None:
         snapshot = cluster_snapshot_from_metrics(METRICS, collected_at=12.0)

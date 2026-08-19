@@ -17,10 +17,10 @@ python scripts/capture_live_resources.py
 The matrix covers 60×18, 79×21, 80×22, 80×24, 80×30, 90×22,
 100×24, 100×30, 120×30, 140×32, 160×40, and 200×50, plus navigation,
 expanded panes, filters/dialogs, stale state, long content, and node drill-in.
-The deterministic capture updates both README UI images on a shared 140×32
-canvas. The live resources capture additionally requires the configured
-metrics endpoint and can replace `assets/falcon-resources.svg` with an actual
-cluster snapshot.
+The deterministic capture updates the review goldens on a shared 140×32
+canvas. The live Resources capture additionally requires the configured
+metrics endpoint and replaces both Resources README assets with the actual
+cluster snapshot and persisted allocation history.
 
 Release validation:
 

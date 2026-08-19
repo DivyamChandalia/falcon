@@ -50,6 +50,6 @@ cluster-wide Node and Pod reads. This preserves the proven request-accounting
 behavior of the earlier resource command without retaining its package or CLI.
 
 The deterministic fixtures in `demo.py` are shared by tests, `--demo`, visual
-captures, and the dashboard README asset. The resources README asset is
+captures, and the dashboard README asset. Both Resources README assets are
 captured from the current cluster by `scripts/capture_live_resources.py`.
 Both paths render the real Falcon UI rather than maintaining mock artwork.

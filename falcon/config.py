@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 import yaml
@@ -21,6 +21,7 @@ import yaml
 CONFIG_VERSION = 1
 DEFAULT_DASHBOARD_EMA_ALPHA = 0.1
 LEGACY_DASHBOARD_EMA_ALPHAS = {0.02, 0.08, 0.25}
+DEFAULT_GPU_PRESET_MAX_COUNT = 8
 
 # Deployment defaults can be overridden during setup or in ``~/.falconrc``.
 INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
@@ -71,9 +72,26 @@ USER_DEFAULTS: Dict[str, Any] = {
     },
     "job": {"backoff_limit": None, "ttl_seconds_after_finished": None},
     "presets": {
-        "h100": {"gpu_type": "h100", "minimum_utilization": 90},
-        "a6000": {"gpu_type": "a6000", "minimum_utilization": 30},
-        "2080ti": {"gpu_type": "2080ti", "minimum_utilization": 30},
+        "h100": {
+            "gpu_type": "h100",
+            "minimum_utilization": 90,
+            "max_count": 8,
+        },
+        "a6000": {
+            "gpu_type": "a6000",
+            "minimum_utilization": 30,
+            "max_count": 2,
+        },
+        "2080ti": {
+            "gpu_type": "2080ti",
+            "minimum_utilization": 30,
+            "max_count": 4,
+        },
+        "pro6000": {
+            "gpu_type": "pro6000",
+            "minimum_utilization": 30,
+            "max_count": 2,
+        },
     },
     "dashboard": {
         "ema_alpha": DEFAULT_DASHBOARD_EMA_ALPHA,
@@ -126,6 +144,26 @@ def logname() -> str:
 def namespace_from_logname(value: Optional[str] = None) -> str:
     """Retain the inexpensive legacy namespace convention as a setup hint."""
     return f"{(value or _identity()).replace('.', '')}-dev"
+
+
+def gpu_preset_max_count(preset: Any) -> int:
+    """Return the maximum count allowed by a GPU preset.
+
+    Config validation rejects malformed values.  The defensive fallback keeps
+    completion and callers handling an externally supplied mapping compatible
+    with older configs that did not have ``max_count``.
+    """
+
+    if not isinstance(preset, Mapping):
+        return DEFAULT_GPU_PRESET_MAX_COUNT
+    value = preset.get("max_count", DEFAULT_GPU_PRESET_MAX_COUNT)
+    if isinstance(value, bool):
+        return DEFAULT_GPU_PRESET_MAX_COUNT
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_GPU_PRESET_MAX_COUNT
+    return count if count > 0 else DEFAULT_GPU_PRESET_MAX_COUNT
 
 
 def _kubectl_namespace() -> Optional[str]:
@@ -358,6 +396,15 @@ def validate_config(config: Dict[str, Any]) -> None:
     for name, preset in presets.items():
         if not isinstance(preset, dict) or not preset.get("gpu_type"):
             raise ValueError(f"presets.{name}.gpu_type is required")
+        max_count = preset.get("max_count", DEFAULT_GPU_PRESET_MAX_COUNT)
+        if (
+            isinstance(max_count, bool)
+            or not isinstance(max_count, int)
+            or max_count < 1
+        ):
+            raise ValueError(
+                f"presets.{name}.max_count must be a positive integer"
+            )
         override = preset.get("shared_memory_percent")
         if override is not None and not 0 < float(override) <= 100:
             raise ValueError(

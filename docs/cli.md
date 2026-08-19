@@ -149,9 +149,10 @@ Coder API/configuration failure, and `130` interrupted.
 
 `j` jobs, `g` get, `e` events, `l` logs, `a` attach, `t` top, `m` metrics,
 `k` kill, `c` clean, `d` dashboard, `r` resources, and `s` setup. Completion
-shows base GPU presets first; after `falcon h100`, `falcon a6000`, or
-`falcon 2080ti`, the next Tab completes same-token forms such as
-`2080tix2`. `falcon coder <Tab>` lists only short workspace names read from
+shows base GPU presets first; after a GPU preset, the next Tab completes only
+the counts allowed by that preset (`h100x2` through `h100x8`, `2080tix2`
+through `2080tix4`, and `a6000x2`/`pro6000x2`). `falcon coder <Tab>` lists only
+short workspace names read from
 live Coder Job labels—for example, `falcon` or `lime-gull-30`—and no presets or
 options. One-letter aliases remain accepted but are intentionally omitted from
 completion suggestions.

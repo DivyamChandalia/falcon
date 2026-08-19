@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture the README resources image from the current cluster snapshot."""
+"""Capture both README Resources images from the current cluster state."""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ os.environ.pop("NO_COLOR", None)
 
 from falcon.config import load_config  # noqa: E402
 from falcon.resources import fetch_cluster_snapshot  # noqa: E402
+from falcon.resources_history import history_store  # noqa: E402
 from falcon.resources_ui import FalconResourcesApp  # noqa: E402
 
-ASSET = ROOT / "assets" / "falcon-resources.svg"
+NODES_ASSET = ROOT / "assets" / "falcon-resources.svg"
+ALLOCATIONS_ASSET = ROOT / "assets" / "falcon-resources-allocations.svg"
 
 
 class SnapshotCollector:
@@ -44,44 +46,39 @@ async def capture() -> None:
     if not snapshot.nodes:
         raise RuntimeError("current cluster snapshot contains no nodes")
 
+    store = history_store(config)
     app = FalconResourcesApp(
         SnapshotCollector(snapshot),
         refresh_seconds=3600,
+        history_loader=store.load,
+        history_hours=float(
+            config.get("resources", {}).get("history_hours", 24)
+        ),
+        initial_view="nodes",
     )
     async with app.run_test(size=(140, 32)) as pilot:
         await pilot.pause(0.5)
-        # Prefer a quiet node so the public README demonstrates real headroom
-        # without publishing current user workload names.
-        quiet = next(
-            (
-                node
-                for node in app.nodes
-                if not node.visible_consumers
-                and node.schedulable
-                and node.allocatable.gpu_count
-            ),
-            None,
-        ) or next(
-            (node for node in app.nodes if not node.visible_consumers),
-            None,
-        )
-        if quiet is not None:
-            app.state.selected_node = quiet.name
-            app._ensure_visible()
-            app._render_all()
-            await pilot.pause()
-        svg = app.export_screenshot(
+        nodes_svg = app.export_screenshot(
             title="Falcon resources · live cluster snapshot",
             simplify=True,
         )
 
-    ASSET.write_text(svg, encoding="utf-8")
+        await pilot.press("right")
+        await pilot.pause(0.5)
+        allocations_svg = app.export_screenshot(
+            title="Falcon GPU allocations · live cluster snapshot",
+            simplify=True,
+        )
+
+    NODES_ASSET.write_text(nodes_svg, encoding="utf-8")
+    ALLOCATIONS_ASSET.write_text(allocations_svg, encoding="utf-8")
     availability = ", ".join(
         f"{item.model} {item.request_headroom}/{item.allocatable}"
         for item in snapshot.gpu_availability.values()
     )
     print(
-        f"captured {len(snapshot.nodes)} live nodes to {ASSET}\n"
+        f"captured {len(snapshot.nodes)} live nodes to {NODES_ASSET}\n"
+        f"captured live GPU allocations to {ALLOCATIONS_ASSET}\n"
         f"GPU request headroom: {availability or '-'}"
     )
 

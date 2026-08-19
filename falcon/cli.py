@@ -33,6 +33,7 @@ from .completion import COMMAND_ALIASES, shell_script
 from .config import (
     config_path,
     detect_shell,
+    gpu_preset_max_count,
     load_config,
     logname,
     run_setup,
@@ -90,14 +91,21 @@ def resolve_preset(
     token: str, config: Mapping[str, Any]
 ) -> Optional[Tuple[str, int]]:
     lowered = token.lower()
-    for name in config.get("presets", {}):
+    for name, preset in config.get("presets", {}).items():
         normalized = name.lower()
         if lowered == normalized:
             return name, 1
         prefix = normalized + "x"
         suffix = lowered[len(prefix) :] if lowered.startswith(prefix) else ""
         if suffix.isdigit() and int(suffix) > 0:
-            return name, int(suffix)
+            count = int(suffix)
+            maximum = gpu_preset_max_count(preset)
+            if count > maximum:
+                raise ValueError(
+                    f"GPU preset {name} supports at most {maximum} GPU(s); "
+                    f"requested {count}"
+                )
+            return name, count
     return None
 
 
@@ -610,6 +618,13 @@ def _submit_command(
     gpu = None
     if args.gpu:
         preset = config.get("presets", {}).get(args.gpu)
+        if isinstance(preset, Mapping):
+            maximum = gpu_preset_max_count(preset)
+            if args.gpus > maximum:
+                raise CliError(
+                    f"GPU preset {args.gpu} supports at most {maximum} GPU(s); "
+                    f"requested {args.gpus}"
+                )
         model = preset.get("gpu_type") if isinstance(preset, Mapping) else args.gpu
         gpu = GPURequest(canonical_gpu(str(model)), args.gpus)
     elif args.gpus != 1:
@@ -1717,6 +1732,11 @@ def _skills_setup(args: argparse.Namespace) -> int:
         detected = detect_agents()
         if detected:
             default = ",".join(detected)
+            print(
+                "WARNING: Installing the Falcon skill may increase coding-agent "
+                "and tool usage, and allows agents to launch CPU/GPU workloads "
+                "on your Kubernetes cluster."
+            )
             response = input(
                 "Install Falcon skill for detected coding agents "
                 f"[{default}] (comma-separated, 'none' to skip): "

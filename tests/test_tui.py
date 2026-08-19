@@ -1331,6 +1331,27 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
             self.assertEqual(app.state.selected_node, selected)
 
+    async def test_resource_resize_after_terminal_reattach_has_no_virtual_scroll(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            # tmux can report an intermediate height while the client is
+            # detached/reattached. Resources must reflow against the committed
+            # size instead of retaining the previous pane height.
+            for size in ((140, 31), (140, 32), (140, 30), (140, 32)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause(0.1)
+                app.app_focus = False
+                await pilot.pause()
+                app.app_focus = True
+                await pilot.pause(0.1)
+                self.assertEqual(app.screen.virtual_size, app.size)
+                self.assertEqual(app.screen.scroll_y, 0)
+                self.assertLessEqual(
+                    app.screen.scrollable_content_region.height,
+                    app.size.height,
+                )
+
     async def test_resource_keyboard_and_mouse_navigation(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
 

@@ -43,9 +43,9 @@ DEFAULT_OWNER_KEYS = (
 )
 GPU_LABEL_KEYS = (
     "falcon.dev/gpu-type",
+    "gpu-type",
     "nvidia.com/gpu.product",
     "cloud.google.com/gke-accelerator",
-    "gpu-type",
     "accelerator",
 )
 GPU_RESOURCE_KEYS = frozenset(
@@ -593,6 +593,9 @@ def normalize_gpu_model(value: Any) -> Optional[str]:
         return None
     normalized = re.sub(r"[_-]+", " ", raw)
     lowered = normalized.lower()
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    if "pro6000" in compact:
+        return "PRO6000"
     known = (
         ("h200", "H200"),
         ("h100", "H100"),

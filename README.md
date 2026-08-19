@@ -1,120 +1,93 @@
 # Falcon
 
-### Run GPU jobs on Kubernetes like local commands.
+Run Kubernetes jobs and Coder workspaces from your terminal.
 
-Falcon turns an ordinary command into a well-sized Kubernetes Job, then gives
-you a fast terminal dashboard for understanding what is running, waiting,
-failing, and consuming the cluster.
-
-<p align="center">
-  <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
-</p>
-
-## Why Falcon
-
-Without Falcon, starting one experiment can mean writing Job YAML, GPU
-resources, node selectors, mounts, shared memory, environment plumbing, and
-cleanup rules.
-
-With Falcon:
+Falcon handles GPU selection, CPU and memory sizing, manifests, logs, cleanup,
+and cluster monitoring so you can focus on the command you want to run.
 
 ```console
 falcon h100x2 -- python train.py
 ```
 
-Falcon discovers cluster capacity, creates the Job directly, preserves the
-current Python environment when requested, and keeps request history correct
-after Pods disappear.
+<p align="center">
+  <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
+</p>
 
-## Install
+## Quick start
 
-Requires Python 3.10+, `kubectl`, and access to a Kubernetes cluster.
+Falcon requires Python 3.10+, `kubectl`, and access to a Kubernetes cluster.
 
 ```console
-# From a Falcon checkout:
 python -m pip install .
 falcon setup
 ```
 
-Setup writes `~/.falconrc` and optional shell completion. `falcon` remains a
-normal console executable: no shell function, login shell, or environment
-activation is required to call it.
-
-## Tab completion
-
-Falcon completes commands, GPU presets, options, and current Job names:
-
-```text
-falcon <TAB>               commands and GPU presets
-falcon h<TAB>              h100
-falcon h100<TAB>           h100x2, h100x3, …, h100x8
-falcon h100x2 --<TAB>      launch options
-falcon logs <TAB>          current Kubernetes Job names
-falcon coder <TAB>         current Coder workspace names only
-falcon resources --<TAB>   resource filters and output options
-```
-
-Open a new shell after setup, or load completion immediately:
+`falcon setup` creates `~/.falconrc` and installs shell completion. Open a new
+shell after setup, then launch a workload:
 
 ```console
-eval "$(falcon completion zsh)"   # use bash for Bash
-```
-
-Job-name completion queries Kubernetes directly so newly created Jobs appear
-without waiting for a local cache to expire. Coder completion reads the
-`coder.workspace` label and offers only short workspace names such as `falcon`
-and `lime-gull-30`.
-
-## Run a Job
-
-For normal GPU work, use a preset directly:
-
-```console
+# One GPU
 falcon h100 -- python train.py
+
+# Multiple GPUs
 falcon h100x2 -- python train.py --epochs 100
+
+# CPU-only job
 falcon -c 8 -m 32Gi -- python preprocess.py
 ```
 
-Falcon turns the command after `--` into a Kubernetes Job, applies resource
-requests, mounts the selected environment, creates it directly, and returns.
-Before creation, Falcon prints the resolved namespace, image, command, and
-resource request so the exact launch is visible immediately.
-Add `-f`/`--follow` to stay attached to its logs; Ctrl+C then kills that Job.
-Add `--dry-run` to inspect the manifest without creating the Job:
+## Run workloads
+
+Falcon includes these GPU presets and limits:
+
+| Preset | Maximum GPUs |
+| --- | ---: |
+| `h100` | 8 |
+| `2080ti` | 4 |
+| `a6000` | 2 |
+| `pro6000` | 2 |
+
+Append `xN` to request multiple GPUs, such as `2080tix4` or `pro6000x2`.
+
+Useful launch options:
 
 ```console
-falcon h100x2 --dry-run --output json -- python train.py
-falcon -c 8 -m 32Gi --dry-run --output json -- python preprocess.py
-```
+# Follow logs after submitting
+falcon h100 -f -- python train.py
 
-Omit `-- COMMAND` for a disposable interactive shell:
+# Preview the Kubernetes manifest without creating a Job
+falcon pro6000x2 --dry-run --output json -- python train.py
 
-```console
+# Override automatic CPU and memory sizing
+falcon a6000 -c 12 -m 64Gi -- python train.py
+
+# Open a temporary interactive shell
 falcon 2080ti
 ```
 
-Falcon shows the requested GPU/CPU/RAM while it waits, then opens your current
-Zsh/Bash in the same working directory with a `(2080ti)` prompt marker. Your
-shell config is loaded without letting Conda startup replace Falcon's selected
-environment. The debug Job is deleted when you exit or press Ctrl+C.
+The interactive shell opens in your current working directory and is removed
+when you exit.
 
-Automatic GPU sizing leaves 1 GiB of RAM outside the container request as a
-safety buffer. Pass `-m` to override memory explicitly without also overriding
-CPU.
+## Monitor jobs
 
-Commands are passed as argv. Falcon never wraps them in nested shell strings.
-
-## Monitor
+Open the interactive Jobs dashboard:
 
 ```console
 falcon dashboard
 ```
 
-The Jobs dashboard separates durable requests from current allocations,
-aggregates every Pod attempt and container restart, retains last-known-good
-data during API failures, and offers keyboard and mouse navigation.
+Or use individual commands:
 
-## Understand cluster resources
+| Command | Purpose |
+| --- | --- |
+| `falcon jobs` | List jobs |
+| `falcon get JOB` | Inspect a job and its attempts |
+| `falcon logs JOB` | Follow logs |
+| `falcon events JOB` | Show Kubernetes events |
+| `falcon metrics JOB` | Show available allocation metrics |
+| `falcon kill JOB` | Remove a job |
+
+## Inspect cluster resources
 
 ```console
 falcon resources
@@ -124,180 +97,103 @@ falcon resources
   <img src="assets/falcon-resources.svg" alt="Falcon cluster resources dashboard" width="100%">
 </p>
 
-<p align="center"><sub>Live cluster resource snapshot captured from Falcon.</sub></p>
+Resources has two views:
 
-The resources dashboard reports request headroom—not guessed usage—and lets
-you cycle through two views with <kbd>←</kbd>/<kbd>→</kbd> (the view labels
-are clickable too). Falcon restores the last selected view on the next launch:
+- **Nodes** shows free CPU, memory, and GPUs for every node. Select a node and
+  press <kbd>Enter</kbd> to inspect the jobs using it.
+- **GPU Allocations** shows allocation history, allocation by namespace, and
+  active GPU jobs. Press <kbd>v</kbd> to switch between GPU count and VRAM.
 
-- **Nodes** keeps the cluster inventory and expandable selected-node inspector.
-  The table is ordered Node, CPUs, RAM, GPUs, GPU Type, and Sched; CPU, RAM,
-  and GPU free/allocatable bars consume the width available to them. Per-model GPU
-  availability stays at the top right in both Resources views.
-- **GPU Allocations** starts a detached allocation collector when Resources is
-  first opened. It keeps collecting after the TUI closes and reloads the last
-  24 hours on later launches, so namespace history is already present when you
-  open the view.
-  It also shows a filled namespace pie and the active Jobs requesting GPUs.
-  Press <kbd>v</kbd> to size the pie by allocated VRAM instead of requested GPU
-  count.
+Use <kbd>←</kbd>/<kbd>→</kbd> to switch views, <kbd>Tab</kbd> to move focus,
+and <kbd>Enter</kbd> to expand the selected pane. Falcon remembers your last
+view and keeps GPU allocation history in the background.
 
 <p align="center">
-  <img src="assets/falcon-resources-allocations.svg" alt="Falcon GPU allocations and request history" width="100%">
+  <img src="assets/falcon-resources-allocations.svg" alt="Falcon GPU allocation history" width="100%">
 </p>
 
-In the Nodes view, expand a node to answer:
-
-> Why is this node busy, and which namespace or workload is using it?
-
-It shows Falcon Jobs and other meaningful workloads in Namespace, Job, Status,
-CPU, RAM, and GPU columns. Press `s` while inspecting a node to cycle the
-ordering by Namespace, CPU, Memory, or GPU; the choice is remembered in
-`resources.consumer_sort`.
-Structured output retains `owner_identity` only when a reliable label or
-annotation provides one. GPU history is persisted under Falcon's user state
-directory, keeps at most 24 hours and 20,000 snapshots, and is isolated by
-cluster resource source. Namespace percentages are either requested GPU count divided by
-total requested GPU count, or allocated VRAM divided by total allocated VRAM.
-The responsive GPU bars and Job table remain scheduler-facing allocation/request
-data; no GPU compute utilization is inferred.
+Resource values are based on Kubernetes requests and allocations. Falcon does
+not present them as measured GPU compute utilization.
 
 ## Create a Coder workspace
 
+Create a workspace with CPU and memory:
+
 ```console
 falcon coder -c 4:4 -m 8Gi:8Gi
-falcon coder -c 4:4 -m 8Gi:8Gi --access terminal
-falcon coder 2080ti -j falcon
-falcon coder falcon
 ```
 
-Falcon asks the configured Coder deployment to create the workspace, waits for
-its agent, and prints clickable VS Code, Antigravity, Antigravity 2.0 IDE,
-Cursor, JupyterLab, and web-terminal links when those
-applications are exposed by the template. Editor links open the directory where
-`falcon coder` was invoked inside the workspace. The IDE variant uses the
-`antigravity-ide` URL scheme; JupyterLab uses Coder's authenticated workspace-app
-proxy rather than exposing its localhost port.
-The default name has the same shape as the Coder dashboard—`color-animal-number`—so
-the Kubernetes Job remains `coder-<user>-<color>-<animal>-<number>`.
-GPU presets reuse Falcon's cluster-aware proportional CPU/RAM sizing and pass
-the selected GPU model/count to the Coder template. With `-j falcon`, the
-workspace is `falcon` and its Job is `coder-<user>-falcon`.
-Passing an existing workspace name—or its full `coder-<user>-<workspace>` Job
-name—skips creation and prints fresh access links for that running session.
-
-Coder must create this Job itself because it owns the workspace build and agent
-credential. On the first interactive run, Falcon prints a clickable Coder login
-link, accepts the pasted session token without echoing it, validates it, and
-saves it to Coder's standard `~/.config/coderv2/session` file for future Falcon
-and Coder CLI runs. `CODER_SESSION_TOKEN` remains available for ephemeral and
-non-interactive use. Falcon never stores the token in `.falconrc`. The `IDEs`
-template is selected by default; configure `coder.template` or pass `--template`
-to override it.
-
-Use the full Job name to remove a Coder workspace, for example
-`falcon kill coder-divyam.c-falcon`. Falcon detects the Coder-owned name and
-requests Coder's native delete transition, rather than deleting its Kubernetes
-Job behind the control plane. The same command repairs the cleanup path when
-the underlying Job is already missing; ordinary Falcon Jobs still use direct
-Kubernetes deletion.
-The dashboard's `k`/`F9` actions follow the same rule. Delete goes through
-Coder, Restart performs a Coder-managed stop/start and waits for the agent to
-become ready. The dashboard offers only whole-Job Delete and Restart actions.
-
-## Coding agents
-
-Agents use the same small command surface as humans:
+Or size it from a GPU preset and choose a name:
 
 ```console
-falcon h100x2 --name experiment -- python train.py
-falcon logs experiment --no-follow --tail 100
-falcon metrics experiment --interval 60
-falcon kill experiment
+falcon coder pro6000 -j research
 ```
 
-After launching, an agent should report the Job name and return unless you
-explicitly ask it to observe the Job. Metrics use current allocations. H100
-Jobs require at least 90% average GPU utilization under the eviction policy;
-A6000 and 2080Ti Jobs require at least 30%.
+Falcon waits for the workspace and prints available links for VS Code,
+Antigravity, Cursor, JupyterLab, and the web terminal. Editor links open the
+directory where you ran the command.
 
-Install the single concise Falcon skill:
+Print links for an existing workspace:
 
 ```console
-falcon setup --non-interactive --install-skills codex,claude,opencode
+falcon coder research
 ```
 
-The installer follows each agent’s native skill directory, is idempotent, and
-will not overwrite a user-modified skill.
+On your first run, Falcon shows a Coder sign-in link and saves the pasted
+session token in Coder's standard session file. Delete a workspace through
+Coder by killing its full Kubernetes job name:
 
-## Key features
+```console
+falcon kill coder-user-research
+```
 
-- Direct `batch/v1` Job manifests and Kubernetes operations—no hidden CLI
-  subprocess abstraction.
-- Honest requested, allocated, and observed resource semantics.
-- Retry history across every Job Pod, including total container restarts.
-- Responsive Jobs and cluster-resource TUIs with stale-data retention.
-- Bounded human/JSON commands with meaningful exit codes.
-- Explicit Conda/venv selection without activation or login-shell wrappers.
-- Deterministic demo data, interaction tests, and a 12-dimension visual
-  regression matrix.
+## Shell completion
 
-## Useful commands
+Falcon completes presets, valid GPU counts, options, jobs, and Coder workspace
+names. To load completion immediately after setup:
+
+```console
+eval "$(falcon completion zsh)"  # use bash for Bash
+```
+
+Examples:
 
 ```text
-falcon h100 -- COMMAND             run a GPU Job
-falcon -c CPU -m MEMORY -- COMMAND run a CPU-only Job
-falcon jobs [filters]              list bounded Jobs
-falcon get JOB                     inspect resources and attempts
-falcon events JOB                  inspect bounded Kubernetes events
-falcon logs JOB --no-follow --tail 100
-falcon metrics JOB --interval 60   return allocation-scoped JSON metrics
-falcon kill JOB                    kill a Job
-falcon dashboard                   open the Jobs TUI
-falcon resources                   open the node/resource TUI
-falcon coder [GPU] -c CPU -m RAM  create a Coder development workspace
-falcon setup                       configure Falcon and agent skills
+falcon h100<TAB>          h100x2 … h100x8
+falcon pro6000<TAB>       pro6000x2
+falcon logs <TAB>         current jobs
+falcon coder <TAB>        current Coder workspaces
 ```
 
-GPU shorthand remains intentionally small:
+## Configuration
 
-```console
-falcon h100 -- python train.py
-falcon h100x2 -- python train.py
-falcon a6000 -- python train.py
-falcon 2080ti -- python train.py
+Falcon reads `~/.falconrc`. Common settings include the Kubernetes namespace,
+runtime image, GPU label, resource history, presets, and Coder template.
+
+```yaml
+cluster:
+  namespace: research
+  gpu_label: gpu-type
+presets:
+  pro6000:
+    gpu_type: pro6000
+    max_count: 2
 ```
 
-Common one-letter forms are also available: `j` jobs, `g` get, `e` events,
-`l` logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d`
-dashboard, `r` resources, and `s` setup.
+See [Configuration](docs/configuration.md) for all available settings.
 
 ## Documentation
 
 - [CLI reference](docs/cli.md)
 - [Configuration](docs/configuration.md)
+- [TUI controls](docs/tui.md)
 - [Resource semantics](docs/resource-semantics.md)
 - [JSON schema](docs/json-schema.md)
-- [TUI controls](docs/tui.md)
-- [Agent skills](docs/agents.md)
-- [Architecture](docs/architecture.md)
+- [Coder and agent workflows](docs/agents.md)
 - [Development](docs/development.md)
-- [Migration notes](docs/migration.md)
 
-## Development
-
-```console
-python -m pytest
-python -m build
-python scripts/capture_tui_snapshots.py
-python scripts/capture_live_resources.py
-```
-
-The optional kind suite runs only against an explicitly selected disposable
-kind cluster:
-
-```console
-FALCON_KIND_INTEGRATION=1 python -m unittest tests.test_kind_integration -v
-```
+Common short aliases are also available: `j` jobs, `g` get, `e` events, `l`
+logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
+`r` resources, and `s` setup.
 
 Falcon is licensed under Apache-2.0. See [NOTICE](NOTICE) for attribution.

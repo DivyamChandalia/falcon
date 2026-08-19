@@ -183,7 +183,14 @@ def _nodes_from_metric_map(
             values[labels["node"]]["unschedulable"] = True
     for labels, value in metrics.get("kube_node_labels", []):
         name = labels.get("node", "")
-        product = labels.get("label_nvidia_com_gpu_product")
+        # The scheduler-facing gpu-type label is authoritative for Falcon
+        # presets.  Product labels are retained as a compatibility fallback
+        # for clusters that do not export the custom label through
+        # kube-state-metrics.
+        product = (
+            labels.get("label_gpu_type")
+            or labels.get("label_nvidia_com_gpu_product")
+        )
         if name and value == 1 and product:
             values[name]["gpu_product"] = product.replace("_", " ").replace("-", " ")
     for labels, value in metrics.get("kube_pod_status_phase", []):
@@ -255,6 +262,7 @@ def _display_gpu_model(value: str) -> str:
         "2080ti": "2080Ti",
         "a6000": "A6000",
         "h100": "H100",
+        "pro6000": "PRO6000",
     }.get(normalized, value or "Unknown")
 
 

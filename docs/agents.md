@@ -8,6 +8,10 @@ Install managed copies:
 falcon setup --non-interactive --install-skills codex,claude,opencode
 ```
 
+Interactive setup warns before offering installation: enabling the skill may
+increase coding-agent/tool usage and allows agents to launch CPU/GPU workloads
+on the configured Kubernetes cluster.
+
 Locations:
 
 - Codex: `~/.agents/skills/falcon/`

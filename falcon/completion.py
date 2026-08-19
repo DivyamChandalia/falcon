@@ -7,6 +7,7 @@ import shlex
 from typing import Any, Dict, List, Optional
 
 from .commands import job_names
+from .config import gpu_preset_max_count
 
 BASE_COMMANDS = [
     "jobs",
@@ -90,9 +91,9 @@ def counted_preset_tokens(
 ) -> List[str]:
     return [
         f"{name}x{count}"
-        for name in config.get("presets", {})
+        for name, preset_config in config.get("presets", {}).items()
         if not preset or name == preset
-        for count in range(2, 9)
+        for count in range(2, gpu_preset_max_count(preset_config) + 1)
     ]
 
 

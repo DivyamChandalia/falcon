@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from falcon.cluster import normalize_gpu_model
 from falcon.config import DEFAULT_CONFIG, validate_config
 from falcon.manifest import build_job_manifest
 from falcon.models import (
@@ -97,6 +98,23 @@ class PlanningTests(unittest.TestCase):
 
     def test_gpu_normalization(self) -> None:
         self.assertEqual(canonical_gpu("NVIDIA_GeForce_RTX_2080_Ti"), "2080ti")
+        self.assertEqual(canonical_gpu("NVIDIA RTX PRO 6000 Blackwell"), "pro6000")
+        self.assertEqual(normalize_gpu_model("NVIDIA_RTX_PRO_6000_Blackwell"), "PRO6000")
+
+    def test_pro6000_plan_matches_scheduler_label(self) -> None:
+        node = NodeResources(
+            "node5",
+            cpu_total=64,
+            cpu_used=0,
+            memory_total_gib=480,
+            memory_used_gib=0,
+            gpu_total=2,
+            gpu_used=0,
+            gpu_product="pro6000",
+        )
+        plan = plan_resources([node], "pro6000", "pro6000", 2)
+        self.assertEqual(plan.node, "node5")
+        self.assertEqual(plan.gpu.model, "pro6000")
 
     def test_cpu_only_plan_has_no_gpu(self) -> None:
         plan = plan_cpu_resources("8", "32Gi")

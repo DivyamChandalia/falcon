@@ -26,13 +26,16 @@ def canonical_gpu(product: str) -> str:
     """Normalize common display/product strings to Falcon GPU model keys."""
 
     normalized = product.lower().replace("_", " ").replace("-", " ")
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
     if "h100" in normalized:
         return "h100"
     if "a6000" in normalized:
         return "a6000"
     if "2080" in normalized and ("ti" in normalized or "titanium" in normalized):
         return "2080ti"
-    return re.sub(r"[^a-z0-9]+", "", normalized)
+    if "pro6000" in compact:
+        return "pro6000"
+    return compact
 
 
 def plan_cpu_resources(

@@ -39,6 +39,16 @@ presets:
   h100:
     gpu_type: h100
     minimum_utilization: 90
+    max_count: 8
+  a6000:
+    gpu_type: a6000
+    max_count: 2
+  2080ti:
+    gpu_type: 2080ti
+    max_count: 4
+  pro6000:
+    gpu_type: pro6000
+    max_count: 2
 dashboard:
   ema_alpha: 0.1
   sort_field: Age

@@ -15,9 +15,10 @@ from unittest.mock import patch
 from falcon.cli import (
     EXIT_KUBERNETES,
     EXIT_USAGE,
-    _resources_command,
     _parser,
+    _resources_command,
     _rewrite_shorthand,
+    _skills_setup,
     main,
     resolve_preset,
 )
@@ -75,6 +76,27 @@ class ParserTests(CliHarness):
 
     def test_preset_shorthand(self) -> None:
         self.assertEqual(resolve_preset("h100x2", DEFAULT_CONFIG), ("h100", 2))
+        self.assertEqual(resolve_preset("pro6000", DEFAULT_CONFIG), ("pro6000", 1))
+        self.assertEqual(resolve_preset("pro6000x2", DEFAULT_CONFIG), ("pro6000", 2))
+
+    def test_preset_shorthand_respects_per_gpu_count_limits(self) -> None:
+        for token, maximum in (
+            ("h100x9", 8),
+            ("a6000x3", 2),
+            ("2080tix5", 4),
+            ("pro6000x3", 2),
+        ):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(ValueError, rf"at most {maximum}"):
+                    resolve_preset(token, DEFAULT_CONFIG)
+
+    def test_explicit_gpu_flags_respect_preset_count_limit(self) -> None:
+        code, _, stderr = self.invoke(
+            "--gpu", "pro6000", "--gpus", "3", "--cpu", "1", "--memory",
+            "1Gi", "--dry-run", "--", "true",
+        )
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("pro6000 supports at most 2", stderr)
 
     def test_one_letter_command_aliases_rewrite_to_canonical_commands(self) -> None:
         for alias, canonical in COMMAND_ALIASES.items():
@@ -97,7 +119,7 @@ class ParserTests(CliHarness):
     def test_submit_is_absent_from_completion(self) -> None:
         commands = candidates("commands", DEFAULT_CONFIG)
         self.assertEqual(commands[:5], [
-            "h100", "a6000", "2080ti", "logs", "top"
+            "h100", "a6000", "2080ti", "pro6000", "logs"
         ])
         self.assertNotIn("submit", commands)
         self.assertNotIn("delete", commands)
@@ -110,6 +132,18 @@ class ParserTests(CliHarness):
         self.assertEqual(
             candidates("counts", DEFAULT_CONFIG, "h100"),
             [f"h100x{count}" for count in range(2, 9)],
+        )
+        self.assertEqual(
+            candidates("counts", DEFAULT_CONFIG, "a6000"),
+            ["a6000x2"],
+        )
+        self.assertEqual(
+            candidates("counts", DEFAULT_CONFIG, "2080ti"),
+            [f"2080tix{count}" for count in range(2, 5)],
+        )
+        self.assertEqual(
+            candidates("counts", DEFAULT_CONFIG, "pro6000"),
+            ["pro6000x2"],
         )
         self.assertIn("--dry-run", candidates("options", DEFAULT_CONFIG, "h100"))
         self.assertNotIn(
@@ -149,7 +183,7 @@ class ParserTests(CliHarness):
         top_level = complete("falcon ''", 1)
         self.assertEqual(
             top_level[:5],
-            ["h100", "a6000", "2080ti", "logs", "top"],
+            ["h100", "a6000", "2080ti", "pro6000", "logs"],
         )
         self.assertNotIn("h100x2", top_level)
         self.assertNotIn("--gpu", top_level)
@@ -161,6 +195,7 @@ class ParserTests(CliHarness):
             complete("falcon h100", 1),
             [f"h100x{count}" for count in range(2, 9)],
         )
+        self.assertEqual(complete("falcon pro6000", 1), ["pro6000x2"])
 
     def test_resources_completion_includes_consumer_bound(self) -> None:
         self.assertIn(
@@ -1130,11 +1165,39 @@ class InspectionCliTests(CliHarness):
 
 
 class SetupTests(unittest.TestCase):
+    def test_interactive_skill_offer_warns_about_increased_usage(self) -> None:
+        args = SimpleNamespace(
+            uninstall_skills=None,
+            install_skills=None,
+            skip_skills=False,
+            non_interactive=False,
+        )
+        stdout = io.StringIO()
+        with patch("falcon.cli.detect_agents", return_value=["codex"]), patch(
+            "builtins.input", return_value="none"
+        ) as prompt, contextlib.redirect_stdout(stdout):
+            code = _skills_setup(args)
+
+        self.assertEqual(code, 0)
+        self.assertIn("may increase coding-agent and tool usage", stdout.getvalue())
+        self.assertIn("CPU/GPU workloads", stdout.getvalue())
+        self.assertIn("Install Falcon skill", prompt.call_args.args[0])
+
     def test_resources_view_default_validation_and_atomic_persistence(self) -> None:
         self.assertEqual(DEFAULT_CONFIG["resources"]["last_view"], "nodes")
         self.assertEqual(DEFAULT_CONFIG["resources"]["consumer_sort"], "namespace")
         self.assertTrue(DEFAULT_CONFIG["resources"]["history_enabled"])
         self.assertEqual(DEFAULT_CONFIG["resources"]["history_hours"], 24)
+        self.assertEqual(DEFAULT_CONFIG["presets"]["pro6000"]["max_count"], 2)
+        for preset_name, maximum in (
+            ("h100", 8),
+            ("a6000", 2),
+            ("2080ti", 4),
+            ("pro6000", 2),
+        ):
+            self.assertEqual(
+                DEFAULT_CONFIG["presets"][preset_name]["max_count"], maximum
+            )
         invalid = json.loads(json.dumps(DEFAULT_CONFIG))
         invalid["resources"]["last_view"] = "utilization"
         with self.assertRaisesRegex(ValueError, "resources.last_view"):
@@ -1163,6 +1226,11 @@ class SetupTests(unittest.TestCase):
             save_resources_view("gpu-overview", "/tmp/unused-falcon-config")
         with self.assertRaisesRegex(ValueError, "resources.consumer_sort"):
             save_resources_consumer_sort("pressure", "/tmp/unused-falcon-config")
+
+        invalid = json.loads(json.dumps(DEFAULT_CONFIG))
+        invalid["presets"]["pro6000"]["max_count"] = 3.5
+        with self.assertRaisesRegex(ValueError, "presets.pro6000.max_count"):
+            validate_config(invalid)
 
         for key, value in (
             ("history_enabled", "yes"),
