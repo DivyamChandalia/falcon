@@ -18,8 +18,8 @@ permission to inspect cluster resources and create Jobs.
 Install directly from GitHub and run the guided setup—no clone is required:
 
 ```console
-python3 -m pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
-python3 -m falcon setup
+pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
+falcon setup
 ```
 
 Open a new shell after setup, then launch and manage a named workload:
@@ -293,20 +293,20 @@ See [Configuration](docs/configuration.md) for all available settings.
 Update to the latest version from GitHub:
 
 ```console
-python3 -m pip install --user --upgrade git+https://github.com/DivyamChandalia/falcon.git@main
+pip install --user --upgrade git+https://github.com/DivyamChandalia/falcon.git@main
 ```
 
 Remove the package:
 
 ```console
-python3 -m pip uninstall falcon-k8s
+pip uninstall falcon-k8s
 ```
 
 ## Troubleshooting
 
 - **`falcon: command not found`** — open a new shell after setup, or add the
   user scripts directory to your current shell with
-  `export PATH="$(python3 -m site --user-base)/bin:$PATH"`.
+  `export PATH="$HOME/.local/bin:$PATH"`.
 - **Kubernetes access errors** — check `kubectl config current-context` and
   verify that you can create Jobs in the namespace selected during setup.
 - **No matching GPU nodes** — check `presets` and `cluster.gpu_label` in
