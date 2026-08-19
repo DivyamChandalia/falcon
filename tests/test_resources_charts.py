@@ -88,6 +88,17 @@ class GPUHistoryRendererTests(unittest.TestCase):
         )
         self.assertIn("G", vram.plain)
 
+    def test_history_chart_omits_timestamp_axis(self) -> None:
+        chart = render_gpu_history(
+            self.points(),
+            width=60,
+            height=8,
+            show_legend=False,
+        )
+
+        self.assertNotRegex(chart.plain, r"\d{2}:\d{2}")
+        self.assertEqual(len(chart.plain.splitlines()), 8)
+
     def test_step_transitions_use_connected_corner_glyphs(self) -> None:
         points = [
             GPUHistoryPoint.from_mapping(

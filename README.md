@@ -1,15 +1,51 @@
 # Falcon
 
-Run Kubernetes jobs and Coder workspaces from your terminal.
+Launch and monitor GPU workloads on Kubernetes without writing Job YAML.
 
-Falcon handles GPU selection, CPU and memory sizing, manifests, logs, cleanup,
-and cluster monitoring so you can focus on the command you want to run.
+Falcon selects GPU nodes, sizes CPU and memory from live capacity, carries your
+working directory and Python environment into the container, and gives you
+terminal dashboards for jobs and cluster resources.
+
+```console
+falcon h100x2 -j experiment -- python train.py
+```
+
+## Quick start
+
+Falcon requires Python 3.10+, `kubectl`, a working Kubernetes context, and
+permission to inspect cluster resources and create Jobs.
+
+Install directly from GitHub and run the guided setup—no clone is required:
+
+```console
+python3 -m pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
+python3 -m falcon setup
+```
+
+Open a new shell after setup, then launch and manage a named workload:
+
+```console
+falcon h100 -j quickstart -- python train.py
+falcon dashboard
+falcon logs quickstart
+falcon kill quickstart
+```
+
+<p align="center">
+  <strong>Jobs dashboard</strong><br>
+  <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
+</p>
+
+> [!NOTE]
+> Falcon's default configuration targets NVIDIA GPU nodes labelled with
+> `gpu-type` and the KAI scheduler. `falcon setup` lets you change the namespace,
+> image, mounts, GPU presets, and scheduler for your cluster.
 
 ## Why Falcon
 
-Without Falcon, starting one experiment can mean writing Job YAML, GPU
-resources, node selectors, mounts, shared memory, environment plumbing, and
-cleanup rules.
+Without Falcon, starting one experiment can mean choosing an image, sizing
+resources, adding node selectors, mounting storage and shared memory, carrying
+environment settings, and defining cleanup behavior.
 
 With Falcon, the request is one line:
 
@@ -17,9 +53,9 @@ With Falcon, the request is one line:
 falcon h100x2 -- python train.py
 ```
 
-Falcon discovers cluster capacity, creates the Job directly, preserves the
-current Python environment when requested, and keeps request history correct
-after Pods disappear.
+Falcon discovers capacity, creates the Job directly, mounts an active
+Conda/virtual environment by default when one is detected, and retains GPU
+allocation history for completed workloads.
 
 The equivalent legacy `jet` command requires those choices up front:
 
@@ -37,8 +73,9 @@ jet launch job train \
   --working-dir "$PWD"
 ```
 
-Falcon derives the CPU, memory, and shared-memory values from live capacity;
-the corresponding manual Kubernetes manifest therefore needs concrete values.
+Falcon derives CPU, memory, and shared-memory values from live capacity. The
+manual example below uses illustrative static values; they are not Falcon
+defaults.
 
 <details>
 <summary>Show a representative Kubernetes Job YAML</summary>
@@ -93,42 +130,14 @@ spec:
             sizeLimit: 29Gi
 ```
 
-The image, namespace, scheduler, resource sizes, and host paths above are
-examples; they must match your cluster.
+The image, namespace, scheduler, resource sizes, and host paths must match your
+cluster.
 
 </details>
 
-<p align="center">
-  <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
-</p>
-
-## Quick start
-
-Falcon requires Python 3.10+, `kubectl`, and access to a Kubernetes cluster.
-
-```console
-python -m pip install --user git+https://github.com/DivyamChandalia/falcon.git
-falcon setup
-```
-
-This installs Falcon directly from GitHub—no clone is required. `falcon setup`
-creates `~/.falconrc` and installs shell completion. Open a new shell after
-setup, then launch a workload:
-
-```console
-# One GPU
-falcon h100 -- python train.py
-
-# Multiple GPUs
-falcon h100x2 -- python train.py --epochs 100
-
-# CPU-only job
-falcon -c 8 -m 32Gi -- python preprocess.py
-```
-
 ## Run workloads
 
-Falcon includes these GPU presets and limits:
+The default configuration includes these GPU presets and limits:
 
 | Preset | Maximum GPUs |
 | --- | ---: |
@@ -150,6 +159,9 @@ falcon pro6000x2 --dry-run --output json -- python train.py
 
 # Override automatic CPU and memory sizing
 falcon a6000 -c 12 -m 64Gi -- python train.py
+
+# Run without a GPU
+falcon -c 8 -m 32Gi -- python preprocess.py
 
 # Open a temporary interactive shell
 falcon 2080ti
@@ -174,7 +186,7 @@ Or use individual commands:
 | `falcon get JOB` | Inspect a job and its attempts |
 | `falcon logs JOB` | Follow logs |
 | `falcon events JOB` | Show Kubernetes events |
-| `falcon metrics JOB` | Show available allocation metrics |
+| `falcon metrics JOB` | Return available CPU, RAM, GPU, and VRAM metrics |
 | `falcon kill JOB` | Remove a job |
 
 ## Inspect cluster resources
@@ -184,28 +196,32 @@ falcon resources
 ```
 
 <p align="center">
+  <strong>Nodes: free CPU, memory, and GPUs by node</strong><br>
   <img src="assets/falcon-resources.svg" alt="Falcon cluster resources dashboard" width="100%">
 </p>
 
-Resources has two views:
-
-- **Nodes** shows free CPU, memory, and GPUs for every node. Select a node and
-  press <kbd>Enter</kbd> to inspect the jobs using it.
-- **GPU Allocations** shows allocation history, allocation by namespace, and
-  active GPU jobs. Press <kbd>v</kbd> to switch between GPU count and VRAM.
+The **Nodes** view shows free resources for every node. Select a node and press
+<kbd>Enter</kbd> to inspect the jobs using it.
 
 Use <kbd>←</kbd>/<kbd>→</kbd> to switch views, <kbd>Tab</kbd> to move focus,
 and <kbd>Enter</kbd> to expand the selected pane. Falcon remembers your last
 view and keeps GPU allocation history in the background.
 
 <p align="center">
+  <strong>GPU Allocations: history, namespaces, and active GPU jobs</strong><br>
   <img src="assets/falcon-resources-allocations.svg" alt="Falcon GPU allocation history" width="100%">
 </p>
+
+In **GPU Allocations**, press <kbd>v</kbd> to switch namespace shares between
+GPU count and requested VRAM.
 
 Resource values are based on Kubernetes requests and allocations. Falcon does
 not present them as measured GPU compute utilization.
 
-## Create a Coder workspace
+## Optional: Create a Coder workspace
+
+Coder integration requires access to a Coder deployment and a compatible
+workspace template.
 
 Create a workspace with CPU and memory:
 
@@ -231,10 +247,10 @@ falcon coder research
 
 On your first run, Falcon shows a Coder sign-in link and saves the pasted
 session token in Coder's standard session file. Delete a workspace through
-Coder by killing its full Kubernetes job name:
+Coder by killing its full Kubernetes Job name (completion can supply it):
 
 ```console
-falcon kill coder-user-research
+falcon kill coder-alice-research
 ```
 
 ## Shell completion
@@ -271,6 +287,34 @@ presets:
 ```
 
 See [Configuration](docs/configuration.md) for all available settings.
+
+## Update or remove Falcon
+
+Update to the latest version from GitHub:
+
+```console
+python3 -m pip install --user --upgrade git+https://github.com/DivyamChandalia/falcon.git@main
+```
+
+Remove the package:
+
+```console
+python3 -m pip uninstall falcon-k8s
+```
+
+## Troubleshooting
+
+- **`falcon: command not found`** — open a new shell after setup, or add the
+  user scripts directory to your current shell with
+  `export PATH="$(python3 -m site --user-base)/bin:$PATH"`.
+- **Kubernetes access errors** — check `kubectl config current-context` and
+  verify that you can create Jobs in the namespace selected during setup.
+- **No matching GPU nodes** — check `presets` and `cluster.gpu_label` in
+  `~/.falconrc`, then compare them with your cluster's node labels.
+- **Coder authentication expired** — run `falcon coder WORKSPACE` again;
+  Falcon will reopen the sign-in flow and save the new session token.
+
+Run `falcon config` to print the active configuration path.
 
 ## Documentation
 

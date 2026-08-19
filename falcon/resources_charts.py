@@ -6,7 +6,6 @@ import math
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Iterable, Mapping, Sequence
 
 from rich.text import Text
@@ -459,7 +458,7 @@ def render_gpu_history(
     )
     chart_width = max(2, graph_width - label_width - 1)
     sampled = downsample_history(points, chart_width)
-    chart_height = max(2, height - 2)
+    chart_height = max(2, height)
     maximum = max(
         1,
         *(point.total_for(basis) for point in sampled),
@@ -561,19 +560,8 @@ def render_gpu_history(
                 )
                 glyph = glyphs[connection]
                 graph.append(glyph, style=color)
-        graph.append("\n")
-
-    first = datetime.fromtimestamp(sampled[0].timestamp).strftime("%H:%M")
-    last = datetime.fromtimestamp(sampled[-1].timestamp).strftime("%H:%M")
-    timestamp_capacity = max(1, chart_width - label_width - 1)
-    if len(first) + len(last) + 1 > timestamp_capacity:
-        first = ""
-        last = last[-timestamp_capacity:]
-    timestamp_gap = max(0, timestamp_capacity - len(first) - len(last))
-    graph.append(" " * (label_width + 1), style=GRAY)
-    graph.append(first, style=GRAY)
-    graph.append(" " * timestamp_gap)
-    graph.append(last, style=GRAY)
+        if row != chart_height - 1:
+            graph.append("\n")
 
     legend = (
         _legend_lines(
