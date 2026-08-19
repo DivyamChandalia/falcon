@@ -31,10 +31,9 @@ falcon logs quickstart
 falcon kill quickstart
 ```
 
-<p align="center">
-  <strong>Jobs dashboard</strong><br>
-  <img src="assets/falcon-dashboard.svg" alt="Falcon Jobs dashboard" width="100%">
-</p>
+**Jobs dashboard**
+
+![Falcon Jobs dashboard](./assets/falcon-dashboard.svg)
 
 > [!NOTE]
 > Falcon's default configuration targets NVIDIA GPU nodes labelled with
@@ -195,10 +194,9 @@ Or use individual commands:
 falcon resources
 ```
 
-<p align="center">
-  <strong>Nodes: free CPU, memory, and GPUs by node</strong><br>
-  <img src="assets/falcon-resources.svg" alt="Falcon cluster resources dashboard" width="100%">
-</p>
+**Nodes: free CPU, memory, and GPUs by node**
+
+![Falcon cluster resources dashboard](./assets/falcon-resources.svg)
 
 The **Nodes** view shows free resources for every node. Select a node and press
 <kbd>Enter</kbd> to inspect the jobs using it.
@@ -207,10 +205,9 @@ Use <kbd>←</kbd>/<kbd>→</kbd> to switch views, <kbd>Tab</kbd> to move focus,
 and <kbd>Enter</kbd> to expand the selected pane. Falcon remembers your last
 view and keeps GPU allocation history in the background.
 
-<p align="center">
-  <strong>GPU Allocations: history, namespaces, and active GPU jobs</strong><br>
-  <img src="assets/falcon-resources-allocations.svg" alt="Falcon GPU allocation history" width="100%">
-</p>
+**GPU Allocations: history, namespaces, and active GPU jobs**
+
+![Falcon GPU allocation history](./assets/falcon-resources-allocations.svg)
 
 In **GPU Allocations**, press <kbd>v</kbd> to switch namespace shares between
 GPU count and requested VRAM.
