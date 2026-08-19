@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import shlex
 import sys
 import time
@@ -35,6 +36,7 @@ from .config import (
     load_config,
     logname,
     run_setup,
+    save_resources_consumer_sort,
     save_resources_view,
 )
 from .coder import (
@@ -65,6 +67,7 @@ from .models import GPURequest, JobRequest, NodeResources
 from .output import dumps, render_table
 from .planning import canonical_gpu, plan_cpu_resources, plan_resources
 from .resources import MetricsClusterCollector, fetch_nodes
+from .resources_history import ensure_history_collector, history_store
 from .resources_ui import FalconResourcesApp
 from .theme import COLOR_MODES
 
@@ -1208,7 +1211,7 @@ def _interactive_coder_login(url: str) -> str:
         with CoderClient(url, token) as client:
             user = client.current_user()
     except CoderError as exc:
-        if exc.status_code in {401, 403}:
+        if _is_coder_auth_failure(exc):
             raise CoderError(
                 "Coder rejected that session token; open the login page and try again",
                 status_code=exc.status_code,
@@ -1218,6 +1221,56 @@ def _interactive_coder_login(url: str) -> str:
     session_path = save_connection(url, token)
     print(f"Coder login saved for {username}: {session_path}")
     return token
+
+
+def _is_coder_auth_failure(exc: CoderError) -> bool:
+    """Recognize expired Coder sessions as a promptable login failure."""
+
+    if exc.status_code in {401, 403}:
+        return True
+    message = str(exc).casefold()
+    return any(
+        phrase in message
+        for phrase in (
+            "signed out",
+            "session has expired",
+            "api key expired",
+            "authentication required",
+            "unauthorized",
+        )
+    )
+
+
+def _authenticated_coder_connection(
+    config: Mapping[str, Any],
+    *,
+    url_override: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve a Coder session and re-run login when its token has expired."""
+
+    try:
+        url, token = resolve_connection(config, url_override=url_override)
+    except CoderAuthenticationRequired as exc:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise
+        return exc.url, _interactive_coder_login(exc.url)
+
+    # A session file can exist while its API key is no longer valid. Validate
+    # it before any workspace lookup or creation so an expired token never
+    # leaves the user at a raw Coder 401 error (and no create operation is
+    # retried after a partial side effect).
+    try:
+        with CoderClient(url, token) as client:
+            client.current_user()
+    except CoderError as exc:
+        if (
+            not _is_coder_auth_failure(exc)
+            or not sys.stdin.isatty()
+            or not sys.stdout.isatty()
+        ):
+            raise
+        token = _interactive_coder_login(url)
+    return url, token
 
 
 def _kill_command(
@@ -1232,13 +1285,7 @@ def _kill_command(
     deleted_workspaces: List[Tuple[str, str]] = []
 
     if coder_jobs:
-        try:
-            url, token = resolve_connection(config)
-        except CoderAuthenticationRequired as exc:
-            if not sys.stdin.isatty() or not sys.stdout.isatty():
-                raise
-            url = exc.url
-            token = _interactive_coder_login(url)
+        url, token = _authenticated_coder_connection(config)
 
         with CoderClient(url, token) as client:
             user = client.current_user()
@@ -1341,13 +1388,10 @@ def _coder_command(
     )
     if not 1 <= timeout <= 3600:
         raise CoderError("--timeout must be between 1 and 3600 seconds")
-    try:
-        url, token = resolve_connection(config, url_override=args.url)
-    except CoderAuthenticationRequired as exc:
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise
-        url = exc.url
-        token = _interactive_coder_login(url)
+    url, token = _authenticated_coder_connection(
+        config,
+        url_override=args.url,
+    )
     overrides = parse_parameter_overrides(args.parameter)
     requested_template = args.template or coder_config.get("template")
     requested_name = validate_workspace_name(args.name) if args.name else None
@@ -1499,7 +1543,22 @@ def _resources_command(
         raise CliError("--consumer-limit must be between 1 and 500")
     collector, snapshot = _resource_snapshot(args, config)
     if args.output == "human" and sys.stdout.isatty():
-        FalconResourcesApp(
+        loader = None
+        history_warning = ""
+        history_hours = float(
+            config.get("resources", {}).get("history_hours", 24)
+        )
+        if not args.demo:
+            store = history_store(config)
+            try:
+                ensure_history_collector(config, config_file=config_file)
+            except OSError as exc:
+                history_warning = f"Could not start Resources history collector: {exc}"
+            loader = lambda: store.load(
+                node_filter=args.node or "",
+                gpu_filter=args.gpu or "",
+            )
+        app = FalconResourcesApp(
             collector,
             node_filter=args.node,
             gpu_filter=args.gpu,
@@ -1508,7 +1567,35 @@ def _resources_command(
                 config.get("resources", {}).get("last_view", "nodes")
             ),
             persist_view=lambda view: save_resources_view(view, config_file),
-        ).run(mouse=True)
+            initial_consumer_sort=str(
+                config.get("resources", {}).get("consumer_sort", "namespace")
+            ),
+            persist_consumer_sort=lambda sort: save_resources_consumer_sort(
+                sort, config_file
+            ),
+            history_loader=loader,
+            history_hours=history_hours,
+            history_warning=history_warning,
+        )
+        # Textual restores the alternate screen, but tmux versions in the
+        # wild do not all restore the shell's saved cursor column reliably.
+        # Save it before entering the TUI and restore it after teardown so
+        # the next shell command resumes at its original position.
+        restore_cursor = False
+        try:
+            fileno = sys.stdout.fileno()
+            restore_cursor = os.isatty(fileno)
+        except (AttributeError, OSError, ValueError):
+            pass
+        if restore_cursor:
+            sys.stdout.write("\x1b7")
+            sys.stdout.flush()
+        try:
+            app.run(mouse=True)
+        finally:
+            if restore_cursor:
+                sys.stdout.write("\x1b8")
+                sys.stdout.flush()
         return 0
     nodes = list(snapshot.nodes)
     if args.node:

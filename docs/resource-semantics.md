@@ -30,9 +30,10 @@ therefore report unavailable utilization rather than percentages against
 historical requests.
 
 Node “headroom” is allocatable minus active Pod requests. It is scheduler
-request accounting, not real-time utilization. Resource views display CPU and
-memory as `free/allocatable`; here “free” explicitly means unclaimed request
-headroom, not measured idle CPU or RAM.
+request accounting, not real-time utilization. The Resources TUI Nodes pane
+displays CPU, memory, and GPU as `free/allocatable`; “free” is scheduler
+headroom, not measured compute or memory activity. The plain CLI summary keeps
+the same explicit `free` headroom wording.
 
 Cluster totals include Ready, schedulable Nodes. Falcon obtains the same facts
 from kube-state-metrics when ordinary users cannot list Nodes: allocatable

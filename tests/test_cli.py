@@ -26,6 +26,7 @@ from falcon.config import (
     DEFAULT_CONFIG,
     load_config,
     run_setup,
+    save_resources_consumer_sort,
     save_resources_view,
     validate_config,
 )
@@ -829,19 +830,67 @@ class InspectionCliTests(CliHarness):
         )
         config = json.loads(json.dumps(DEFAULT_CONFIG))
         config["resources"]["last_view"] = "gpu-allocations"
+        config["resources"]["consumer_sort"] = "memory"
         with patch("falcon.cli.sys.stdout.isatty", return_value=True), patch(
             "falcon.cli._resource_snapshot", return_value=(collector, snapshot)
         ), patch("falcon.cli.FalconResourcesApp", App), patch(
             "falcon.cli.save_resources_view"
-        ) as save:
+        ) as save, patch("falcon.cli.save_resources_consumer_sort") as save_sort:
             code = _resources_command(args, config, "/tmp/falcon-test-config")
             captured["persist_view"]("gpu-allocations")
+            captured["persist_consumer_sort"]("memory")
         self.assertEqual(code, 0)
         self.assertEqual(captured["initial_view"], "gpu-allocations")
+        self.assertEqual(captured["initial_consumer_sort"], "memory")
         self.assertTrue(captured["mouse"])
         save.assert_called_once_with(
             "gpu-allocations", "/tmp/falcon-test-config"
         )
+        save_sort.assert_called_once_with("memory", "/tmp/falcon-test-config")
+
+    def test_resources_tui_starts_and_loads_persistent_history(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        collector = SimpleNamespace(collect=lambda force=False: snapshot)
+        captured = {}
+        loaded = []
+
+        class Store:
+            def load(self, **kwargs):
+                loaded.append(kwargs)
+                return ["persisted"]
+
+        class App:
+            def __init__(self, _collector, **kwargs):
+                captured.update(kwargs)
+
+            def run(self, mouse=False):
+                captured["history"] = captured["history_loader"]()
+
+        args = SimpleNamespace(
+            limit=100,
+            consumer_limit=100,
+            demo=None,
+            output="human",
+            node="node-a",
+            gpu="h100",
+            namespace=None,
+        )
+        with patch("falcon.cli.sys.stdout.isatty", return_value=True), patch(
+            "falcon.cli._resource_snapshot", return_value=(collector, snapshot)
+        ), patch("falcon.cli.FalconResourcesApp", App), patch(
+            "falcon.cli.history_store", return_value=Store()
+        ), patch("falcon.cli.ensure_history_collector") as ensure:
+            code = _resources_command(args, DEFAULT_CONFIG, "/tmp/falcon-test-config")
+
+        self.assertEqual(code, 0)
+        ensure.assert_called_once_with(
+            DEFAULT_CONFIG, config_file="/tmp/falcon-test-config"
+        )
+        self.assertEqual(
+            loaded,
+            [{"node_filter": "node-a", "gpu_filter": "h100"}],
+        )
+        self.assertEqual(captured["history"], ["persisted"])
 
     def test_resources_prefers_metrics_when_node_api_rbac_is_unavailable(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
@@ -1083,6 +1132,9 @@ class InspectionCliTests(CliHarness):
 class SetupTests(unittest.TestCase):
     def test_resources_view_default_validation_and_atomic_persistence(self) -> None:
         self.assertEqual(DEFAULT_CONFIG["resources"]["last_view"], "nodes")
+        self.assertEqual(DEFAULT_CONFIG["resources"]["consumer_sort"], "namespace")
+        self.assertTrue(DEFAULT_CONFIG["resources"]["history_enabled"])
+        self.assertEqual(DEFAULT_CONFIG["resources"]["history_hours"], 24)
         invalid = json.loads(json.dumps(DEFAULT_CONFIG))
         invalid["resources"]["last_view"] = "utilization"
         with self.assertRaisesRegex(ValueError, "resources.last_view"):
@@ -1093,9 +1145,12 @@ class SetupTests(unittest.TestCase):
             run_setup(str(target), non_interactive=True, install_shell=False)
             original = load_config(str(target))
             saved = save_resources_view("gpu-allocations", str(target))
+            saved_sort = save_resources_consumer_sort("memory", str(target))
             reloaded = load_config(str(target))
             self.assertEqual(saved, target)
+            self.assertEqual(saved_sort, target)
             self.assertEqual(reloaded["resources"]["last_view"], "gpu-allocations")
+            self.assertEqual(reloaded["resources"]["consumer_sort"], "memory")
             self.assertEqual(
                 reloaded["resources"]["shared_memory_percent"],
                 original["resources"]["shared_memory_percent"],
@@ -1106,6 +1161,19 @@ class SetupTests(unittest.TestCase):
             save_resources_view("not-a-view", "/tmp/unused-falcon-config")
         with self.assertRaisesRegex(ValueError, "resources.last_view"):
             save_resources_view("gpu-overview", "/tmp/unused-falcon-config")
+        with self.assertRaisesRegex(ValueError, "resources.consumer_sort"):
+            save_resources_consumer_sort("pressure", "/tmp/unused-falcon-config")
+
+        for key, value in (
+            ("history_enabled", "yes"),
+            ("history_hours", 0),
+            ("history_interval_seconds", 0),
+            ("consumer_sort", "pressure"),
+        ):
+            invalid = json.loads(json.dumps(DEFAULT_CONFIG))
+            invalid["resources"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                validate_config(invalid)
 
     def test_invalid_persisted_resources_view_falls_back_to_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

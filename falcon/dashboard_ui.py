@@ -1639,8 +1639,8 @@ class FalconDashboard(App):
         marked = len(self.state.marked_job_uids)
         if self.state.focused_pane == "jobs":
             value = (
-                "↑/↓ Jobs   Enter Expand   Tab Pane   / Search   "
-                "f Filter   r Refresh   q Quit"
+                "↑/↓ Jobs  Enter Expand  Tab  / Search  f Filter  "
+                "c Clean  r Refresh  q Quit"
                 if self.size.width < 160
                 else "↑/↓ Navigate   s Sort   Space Mark   f Filters   v Panes   "
                 "k/F9 Actions   c Clean   Enter Expand   Tab Next pane   "

@@ -131,11 +131,14 @@ you cycle through two views with <kbd>←</kbd>/<kbd>→</kbd> (the view labels
 are clickable too). Falcon restores the last selected view on the next launch:
 
 - **Nodes** keeps the cluster inventory and expandable selected-node inspector.
-  Compact terminals show free/allocatable GPU counts; wide terminals turn them
-  into requested/free bars in the cluster summary and each node row.
-- **GPU Allocations** keeps allocation history in the background as soon as the
-  TUI launches, so namespace history is already present when you open the view.
-  It also shows a filled namespace pie and the active Pods requesting GPUs.
+  The table is ordered Node, CPUs, RAM, GPUs, GPU Type, and Sched; CPU, RAM,
+  and GPU free/allocatable bars consume the width available to them. Per-model GPU
+  availability stays at the top right in both Resources views.
+- **GPU Allocations** starts a detached allocation collector when Resources is
+  first opened. It keeps collecting after the TUI closes and reloads the last
+  24 hours on later launches, so namespace history is already present when you
+  open the view.
+  It also shows a filled namespace pie and the active Jobs requesting GPUs.
   Press <kbd>v</kbd> to size the pie by allocated VRAM instead of requested GPU
   count.
 
@@ -147,12 +150,16 @@ In the Nodes view, expand a node to answer:
 
 > Why is this node busy, and which namespace or workload is using it?
 
-It shows Falcon Jobs and other meaningful Pods by namespace and workload.
+It shows Falcon Jobs and other meaningful workloads in Namespace, Job, Status,
+CPU, RAM, and GPU columns. Press `s` while inspecting a node to cycle the
+ordering by Namespace, CPU, Memory, or GPU; the choice is remembered in
+`resources.consumer_sort`.
 Structured output retains `owner_identity` only when a reliable label or
-annotation provides one. GPU history is process-local, keeps at most 24 hours
-since launch. Namespace percentages are either requested GPU count divided by
+annotation provides one. GPU history is persisted under Falcon's user state
+directory, keeps at most 24 hours and 20,000 snapshots, and is isolated by
+cluster resource source. Namespace percentages are either requested GPU count divided by
 total requested GPU count, or allocated VRAM divided by total allocated VRAM.
-The responsive GPU bars and Pod table remain scheduler-facing allocation/request
+The responsive GPU bars and Job table remain scheduler-facing allocation/request
 data; no GPU compute utilization is inferred.
 
 ## Create a Coder workspace

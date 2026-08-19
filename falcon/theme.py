@@ -25,6 +25,7 @@ WHITE = "#FFFFFF"
 GRAY = "#AAAAAA"
 MUTED = "#666666"
 BORDER = "#555555"
+SELECTION = "#202020"
 BACKGROUND = "#000000"
 MINIMUM_WIDTH = 80
 MINIMUM_HEIGHT = 22
@@ -68,6 +69,7 @@ class FalconPalette:
     secondary: str = GRAY
     muted: str = MUTED
     border: str = BORDER
+    selection: str = SELECTION
     background: str = BACKGROUND
     series: tuple[str, ...] = SERIES_COLORS
     pie: tuple[str, ...] = PIE_COLORS

@@ -28,6 +28,10 @@ runtime:
   python_environment: auto
 resources:
   shared_memory_percent: 15
+  consumer_sort: namespace # namespace, cpu, memory, or gpu
+  history_enabled: true
+  history_hours: 24
+  history_interval_seconds: 5
 job:
   backoff_limit: null
   ttl_seconds_after_finished: null

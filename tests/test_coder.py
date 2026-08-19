@@ -960,6 +960,77 @@ class CoderCliTests(unittest.TestCase):
                 "https://coder.yoda.hyperverge.org",
             )
 
+    def test_expired_session_reopens_login_page_and_retries(self) -> None:
+        connections = []
+
+        class ExpiredThenReadyCoderClient:
+            def __init__(self, url, token):
+                connections.append((url, token))
+                self.token = token
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def current_user(self):
+                if self.token == "expired-session":
+                    raise CoderError(
+                        "You are signed out or your session has expired",
+                        status_code=401,
+                    )
+                return {"username": "divyam.c"}
+
+            def workspace_for_job(self, _job, **_kwargs):
+                return ready_workspace("lime-gull-30")
+
+            def wait_until_ready(self, _user, name, **_kwargs):
+                return ready_workspace(name)
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "HOME": directory,
+                "CODER_CONFIG_DIR": f"{directory}/coderv2",
+            },
+            clear=True,
+        ), patch(
+            "falcon.cli.resolve_connection",
+            return_value=("https://coder.example.test", "expired-session"),
+        ), patch(
+            "falcon.cli.CoderClient", ExpiredThenReadyCoderClient
+        ), patch(
+            "falcon.cli.getpass.getpass", return_value="replacement-session"
+        ), patch("falcon.cli.sys.stdin", TtyStringIO()):
+            stdout = TtyStringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = main([
+                    "coder",
+                    "coder-divyam.c-lime-gull-30",
+                    "--access",
+                    "terminal",
+                ])
+
+            root = Path(directory) / "coderv2"
+            self.assertEqual((code, stderr.getvalue()), (0, ""))
+            self.assertEqual(
+                connections,
+                [
+                    ("https://coder.example.test", "expired-session"),
+                    ("https://coder.example.test", "replacement-session"),
+                    ("https://coder.example.test", "replacement-session"),
+                ],
+            )
+            self.assertIn("/cli-auth", stdout.getvalue())
+            self.assertIn("Coder login saved for divyam.c", stdout.getvalue())
+            self.assertIn("Workspace ready:", stdout.getvalue())
+            self.assertEqual(
+                (root / "session").read_text(encoding="utf-8"),
+                "replacement-session",
+            )
+
     def test_rejected_interactive_token_is_not_saved(self) -> None:
         class RejectingCoderClient:
             def __init__(self, _url, _token):

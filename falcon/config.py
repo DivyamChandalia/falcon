@@ -64,6 +64,10 @@ USER_DEFAULTS: Dict[str, Any] = {
     "resources": {
         "shared_memory_percent": 15,
         "last_view": "nodes",
+        "consumer_sort": "namespace",
+        "history_enabled": True,
+        "history_hours": 24,
+        "history_interval_seconds": 5,
     },
     "job": {"backoff_limit": None, "ttl_seconds_after_finished": None},
     "presets": {
@@ -185,6 +189,13 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             # A display preference should never make Falcon unusable after a
             # downgrade, hand edit, or retired preview value.
             resources.pop("last_view", None)
+        if resources.get("consumer_sort", "namespace") not in {
+            "namespace",
+            "cpu",
+            "memory",
+            "gpu",
+        }:
+            resources.pop("consumer_sort", None)
     if isinstance(raw.get("cluster"), dict):
         result["cluster"] = {
             key: value for key, value in raw["cluster"].items()
@@ -308,6 +319,31 @@ def validate_config(config: Dict[str, Any]) -> None:
     if resources_view not in {"nodes", "gpu-allocations"}:
         raise ValueError(
             "resources.last_view must be nodes or gpu-allocations"
+        )
+    resources = config.get("resources", {})
+    consumer_sort = resources.get("consumer_sort", "namespace")
+    if consumer_sort not in {"namespace", "cpu", "memory", "gpu"}:
+        raise ValueError(
+            "resources.consumer_sort must be namespace, cpu, memory, or gpu"
+        )
+    history_enabled = resources.get("history_enabled", True)
+    if not isinstance(history_enabled, bool):
+        raise ValueError("resources.history_enabled must be true or false")
+    history_hours = resources.get("history_hours", 24)
+    if (
+        isinstance(history_hours, bool)
+        or not isinstance(history_hours, (int, float))
+        or not 1 <= float(history_hours) <= 168
+    ):
+        raise ValueError("resources.history_hours must be between 1 and 168")
+    history_interval = resources.get("history_interval_seconds", 5)
+    if (
+        isinstance(history_interval, bool)
+        or not isinstance(history_interval, (int, float))
+        or not 1 <= float(history_interval) <= 300
+    ):
+        raise ValueError(
+            "resources.history_interval_seconds must be between 1 and 300"
         )
     job = config.get("job", {})
     for key in ("backoff_limit", "ttl_seconds_after_finished"):
@@ -433,6 +469,24 @@ def save_resources_view(view: str, path: Optional[str] = None) -> Path:
         raise ValueError(
             "resources.last_view must be nodes or gpu-allocations"
         )
+    return _save_resources_settings({"last_view": view}, path)
+
+
+def save_resources_consumer_sort(
+    sort: str, path: Optional[str] = None
+) -> Path:
+    """Atomically persist the selected-node workload sort."""
+
+    if sort not in {"namespace", "cpu", "memory", "gpu"}:
+        raise ValueError(
+            "resources.consumer_sort must be namespace, cpu, memory, or gpu"
+        )
+    return _save_resources_settings({"consumer_sort": sort}, path)
+
+
+def _save_resources_settings(
+    settings: Dict[str, Any], path: Optional[str] = None
+) -> Path:
     target = config_path(path)
     if not target.exists():
         raise FileNotFoundError(
@@ -444,7 +498,7 @@ def save_resources_view(view: str, path: Optional[str] = None) -> Path:
     resources = raw.setdefault("resources", {})
     if not isinstance(resources, dict):
         raise ValueError("resources must be a YAML mapping")
-    resources["last_view"] = view
+    resources.update(settings)
     _atomic_yaml(target, raw)
     return target
 

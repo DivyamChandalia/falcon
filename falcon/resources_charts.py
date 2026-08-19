@@ -26,6 +26,49 @@ HISTORY_LIMIT = 20_000
 # The source of truth is the same palette used by the Dashboard.
 TOTAL_COLOR = PALETTE.total
 CHART_COLORS = PALETTE.pie
+TOTAL_LABEL = "Total usage"
+
+_LEFT = 1
+_RIGHT = 2
+_UP = 4
+_DOWN = 8
+
+_LIGHT_LINE_GLYPHS = {
+    0: "─",
+    _LEFT: "─",
+    _RIGHT: "─",
+    _UP: "│",
+    _DOWN: "│",
+    _LEFT | _RIGHT: "─",
+    _UP | _DOWN: "│",
+    _RIGHT | _DOWN: "┌",
+    _LEFT | _DOWN: "┐",
+    _RIGHT | _UP: "└",
+    _LEFT | _UP: "┘",
+    _LEFT | _RIGHT | _DOWN: "┬",
+    _LEFT | _RIGHT | _UP: "┴",
+    _RIGHT | _UP | _DOWN: "├",
+    _LEFT | _UP | _DOWN: "┤",
+    _LEFT | _RIGHT | _UP | _DOWN: "┼",
+}
+_HEAVY_LINE_GLYPHS = {
+    0: "━",
+    _LEFT: "━",
+    _RIGHT: "━",
+    _UP: "┃",
+    _DOWN: "┃",
+    _LEFT | _RIGHT: "━",
+    _UP | _DOWN: "┃",
+    _RIGHT | _DOWN: "┏",
+    _LEFT | _DOWN: "┓",
+    _RIGHT | _UP: "┗",
+    _LEFT | _UP: "┛",
+    _LEFT | _RIGHT | _DOWN: "┳",
+    _LEFT | _RIGHT | _UP: "┻",
+    _RIGHT | _UP | _DOWN: "┣",
+    _LEFT | _UP | _DOWN: "┫",
+    _LEFT | _RIGHT | _UP | _DOWN: "╋",
+}
 
 
 @dataclass(frozen=True)
@@ -174,7 +217,7 @@ def _legend_lines(
     if total <= 0:
         return []
     entries = [
-        *(([("Total", total, TOTAL_COLOR)] if include_total else [])),
+        *(([(TOTAL_LABEL, total, TOTAL_COLOR)] if include_total else [])),
         *[(name, value, colors[name]) for name, value in values],
     ]
     lines: list[Text] = []
@@ -182,7 +225,15 @@ def _legend_lines(
         percent = value / total * 100
         suffix = f" {_number(value, unit=unit)} {percent:.0f}%"
         label_width = max(1, width - len(suffix) - 2)
-        label = name if len(name) <= label_width else name[: max(1, label_width - 1)] + "…"
+        if len(name) <= label_width:
+            label = name
+        elif name == TOTAL_LABEL and label_width >= len("Total"):
+            # Preserve the recognizable aggregate label at narrow widths;
+            # the full "Total usage" text returns as soon as the legend can
+            # accommodate it.
+            label = "Total"
+        else:
+            label = name[: max(1, label_width - 1)] + "…"
         line = Text()
         line.append("█ ", style=color)
         line.append(label.ljust(label_width), style=WHITE)
@@ -224,8 +275,15 @@ def render_allocation_legend(
     unit: str = "",
     colors: Mapping[str, str] | None = None,
     columns: int = 1,
+    include_total: bool = False,
 ) -> Text:
-    """Render the one namespace percentage legend shared by both charts."""
+    """Render the one namespace percentage legend shared by both charts.
+
+    ``include_total`` is opt-in so callers that use this renderer as a
+    namespace-only legend retain the compact layout.  When enabled, the
+    aggregate is rendered once above the namespace columns rather than once
+    per column.
+    """
 
     width = max(1, int(width))
     height = max(1, int(height))
@@ -249,7 +307,7 @@ def render_allocation_legend(
             colors=palette,
             unit=unit,
             max_rows=height,
-            include_total=False,
+            include_total=include_total,
         )
     else:
         column_width = max(1, (width - columns + 1) // columns)
@@ -269,11 +327,25 @@ def render_allocation_legend(
             )
             for column in column_values
         ]
+        total_lines = (
+            _legend_lines(
+                (),
+                total=total,
+                width=width,
+                colors={TOTAL_LABEL: TOTAL_COLOR},
+                unit=unit,
+                max_rows=1,
+                include_total=True,
+            )
+            if include_total and height > 0
+            else []
+        )
         rows = min(
-            height,
+            max(0, height - len(total_lines)),
             max((len(column) for column in rendered_columns), default=0),
         )
         lines = []
+        lines.extend(total_lines)
         for row in range(rows):
             line = Text()
             for index, column in enumerate(rendered_columns):
@@ -342,7 +414,7 @@ def render_gpu_history(
         message = (
             "Collecting history"
             if not count
-            else f"Collecting history · {count} sample since launch"
+            else f"Collecting history · {count} persisted sample"
         )
         return Text(message[:width], style=MUTED, justify="center")
 
@@ -393,19 +465,29 @@ def render_gpu_history(
         *(point.total_for(basis) for point in sampled),
         *(value for point in sampled for value in point.values_for(basis).values()),
     )
-    cells: list[list[tuple[str, str, int] | None]] = [
+    cells: list[list[tuple[int, str, int] | None]] = [
         [None for _ in range(chart_width)] for _ in range(chart_height)
     ]
 
     def row_for(value: float) -> int:
         return chart_height - 1 - round(max(0, value) / maximum * (chart_height - 1))
 
-    def put(x: int, y: int, glyph: str, color: str, priority: int) -> None:
+    def put(x: int, y: int, connection: int, color: str, priority: int) -> None:
         if not (0 <= x < chart_width and 0 <= y < chart_height):
             return
         existing = cells[y][x]
-        if existing is None or priority >= existing[2]:
-            cells[y][x] = (glyph, color, priority)
+        if existing is None:
+            cells[y][x] = (connection, color, priority)
+            return
+        existing_connection, existing_color, existing_priority = existing
+        # Lines may share a plateau or cross during rapid changes. Preserve
+        # every physical connection in that cell so compositing cannot leave
+        # an orphaned corner. Colour and weight still follow series priority.
+        cells[y][x] = (
+            existing_connection | connection,
+            color if priority >= existing_priority else existing_color,
+            max(priority, existing_priority),
+        )
 
     point_values = [point.values_for(basis) for point in sampled]
     series: list[tuple[str, list[float], str, int]] = [
@@ -413,25 +495,49 @@ def render_gpu_history(
         for name in names
     ]
     series.append(
-        ("Total", [point.total_for(basis) for point in sampled], TOTAL_COLOR, 2)
+        (
+            TOTAL_LABEL,
+            [point.total_for(basis) for point in sampled],
+            TOTAL_COLOR,
+            2,
+        )
     )
     denominator = max(1, len(sampled) - 1)
     xs = [round(index / denominator * (chart_width - 1)) for index in range(len(sampled))]
     for _, values, color, priority in series:
         previous_x = xs[0]
         previous_y = row_for(values[0])
-        put(previous_x, previous_y, "━" if priority == 2 else "─", color, priority)
+        connections = [
+            [0 for _ in range(chart_width)] for _ in range(chart_height)
+        ]
+        # Extend the endpoints toward the plot boundaries so a first or final
+        # vertical transition still renders as a proper corner.
+        connections[previous_y][previous_x] |= _LEFT
         for x, value in zip(xs[1:], values[1:]):
             y = row_for(value)
-            horizontal = "━" if priority == 2 else "─"
-            vertical = "┃" if priority == 2 else "│"
-            for column in range(previous_x, x + 1):
-                put(column, previous_y, horizontal, color, priority)
-            if y != previous_y:
-                for row in range(min(y, previous_y), max(y, previous_y) + 1):
-                    put(x, row, vertical, color, priority)
-            put(x, y, horizontal, color, priority)
+            for column in range(previous_x, x):
+                connections[previous_y][column] |= _RIGHT
+                connections[previous_y][column + 1] |= _LEFT
+            if y < previous_y:
+                for row in range(previous_y, y, -1):
+                    connections[row][x] |= _UP
+                    connections[row - 1][x] |= _DOWN
+            elif y > previous_y:
+                for row in range(previous_y, y):
+                    connections[row][x] |= _DOWN
+                    connections[row + 1][x] |= _UP
             previous_x, previous_y = x, y
+        connections[previous_y][previous_x] |= _RIGHT
+        for row, line in enumerate(connections):
+            for column, connection in enumerate(line):
+                if connection:
+                    put(
+                        column,
+                        row,
+                        connection,
+                        color,
+                        priority,
+                    )
 
     graph = Text()
     for row, line in enumerate(cells):
@@ -447,7 +553,13 @@ def render_gpu_history(
             if cell is None:
                 graph.append(" ")
             else:
-                glyph, color, priority = cell
+                connection, color, priority = cell
+                glyphs = (
+                    _HEAVY_LINE_GLYPHS
+                    if priority == 2
+                    else _LIGHT_LINE_GLYPHS
+                )
+                glyph = glyphs[connection]
                 graph.append(glyph, style=color)
         graph.append("\n")
 
@@ -468,7 +580,7 @@ def render_gpu_history(
             tuple((name, latest_values.get(name, 0.0)) for name in names),
             total=latest_total,
             width=legend_width,
-            colors={**colors, "Total": TOTAL_COLOR},
+            colors={**colors, TOTAL_LABEL: TOTAL_COLOR},
             unit=unit,
             max_rows=height,
         )
@@ -494,7 +606,17 @@ def render_gpu_history(
             output.append_text(styled_graph_lines[index])
         if index != rows - 1:
             output.append("\n")
-    return output
+    # Panel/table borders and cell padding can be narrower than the nominal
+    # chart width. Crop each logical row at the renderer boundary so Rich
+    # never wraps a box-drawing segment onto the next terminal row.
+    fitted = Text()
+    output_lines = output.split("\n")
+    for index, line in enumerate(output_lines):
+        line.truncate(width, overflow="crop")
+        fitted.append_text(line)
+        if index != len(output_lines) - 1:
+            fitted.append("\n")
+    return fitted
 
 
 def render_namespace_pie(
@@ -576,7 +698,7 @@ def render_namespace_pie(
             values,
             total=total,
             width=legend_width,
-            colors={**slice_colors, "Total": TOTAL_COLOR},
+            colors={**slice_colors, TOTAL_LABEL: TOTAL_COLOR},
             unit=unit,
             max_rows=height,
             include_total=False,

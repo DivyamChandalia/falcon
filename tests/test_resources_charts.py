@@ -66,7 +66,7 @@ class GPUHistoryRendererTests(unittest.TestCase):
             render_gpu_history([], width=30, height=8).plain,
         )
         self.assertIn(
-            "1 sample since launch",
+            "1 persisted sample",
             render_gpu_history(self.points(1), width=50, height=8).plain,
         )
 
@@ -87,6 +87,48 @@ class GPUHistoryRendererTests(unittest.TestCase):
             self.points(), width=80, height=15, basis="vram"
         )
         self.assertIn("G", vram.plain)
+
+    def test_step_transitions_use_connected_corner_glyphs(self) -> None:
+        points = [
+            GPUHistoryPoint.from_mapping(
+                1_700_000_000 + index * 60,
+                {"team": value},
+            )
+            for index, value in enumerate((1, 1, 3, 3, 1, 1))
+        ]
+        chart = render_gpu_history(
+            points,
+            width=60,
+            height=10,
+            show_legend=False,
+        )
+        # The emphasized total series overlays the identical namespace line,
+        # so its heavy corners should describe both a rise and a fall.
+        for corner in ("┛", "┏", "┓", "┗"):
+            self.assertIn(corner, chart.plain)
+        self.assertNotRegex(chart.plain, r"━┃|┃━")
+
+    def test_overlapping_transitions_merge_connectivity(self) -> None:
+        names = ("alpha", "beta", "gamma", "delta")
+        points = [
+            GPUHistoryPoint.from_mapping(
+                1_700_000_000 + index * 60,
+                {
+                    name: (index // (name_index + 2) + name_index) % 9
+                    for name_index, name in enumerate(names)
+                },
+            )
+            for index in range(16)
+        ]
+        chart = render_gpu_history(
+            points,
+            width=76,
+            height=12,
+            show_legend=False,
+        )
+        # Equal-priority namespace paths share cells here. They must form
+        # junctions rather than overwrite one another into orphaned corners.
+        self.assertRegex(chart.plain, r"[┬┴├┤┼]")
 
     def test_node_series_use_the_expanded_palette_without_collisions(self) -> None:
         names = [f"gpu-node-{index:02d}" for index in range(20)]
