@@ -7,6 +7,7 @@ import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rich.color import ColorSystem
@@ -20,7 +21,14 @@ from textual.strip import Strip
 # test runner's NO_COLOR setting.
 os.environ.pop("NO_COLOR", None)
 
-from falcon.dashboard import DemoUsageCollector, JobEvent
+from falcon.dashboard import (
+    DemoUsageCollector,
+    GpuDevice,
+    GpuProcess,
+    JobEvent,
+    StreamingGpuSampler,
+    _parse_gpu_process_utilization,
+)
 from falcon.dashboard_ui import (
     DashboardPane,
     FalconDashboard,
@@ -417,7 +425,7 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause(0.5)
             expected = app.filtered_rows[1].uid
-            clicked = await pilot.click("#jobs-pane", offset=(5, 5))
+            clicked = await pilot.click(".dashboard-pane-content", offset=(5, 4))
             self.assertTrue(clicked)
             self.assertEqual(app.state.cursor_job_uid, expected)
 
@@ -426,8 +434,9 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
             for pane in ("selected", "resources", "events", "jobs"):
-                clicked = await pilot.click(f"#{pane}-pane", offset=(2, 2))
-                self.assertTrue(clicked)
+                await pilot.click(
+                    f"#{pane}-pane-content", offset=(1, 1)
+                )
                 self.assertEqual(app.state.focused_pane, pane)
                 self.assertIn("focused", app.query_one(f"#{pane}-pane").border_title)
 
@@ -475,8 +484,9 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             resources = app.query_one("#resources-pane", DashboardPane)
-            clicked = await pilot.click("#resources-pane", offset=(2, 2))
-            self.assertTrue(clicked)
+            await pilot.click(
+                "#resources-pane-content", offset=(1, 1)
+            )
             self.assertEqual(app.state.focused_pane, "resources")
             self.assertIs(app.focused, resources)
 
@@ -527,6 +537,170 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.cursor_job_uid, selected_uid)
             self.assertEqual(app.state.focused_pane, "selected")
             self.assertEqual(app.state.expanded_pane, "selected")
+
+    async def test_expanded_selected_job_scrolls_the_entire_inspector(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("4", "enter")
+            await pilot.pause()
+            pane = app.query_one("#selected-pane", DashboardPane)
+            self.assertGreater(pane.max_scroll_y, 0)
+            self.assertEqual(int(pane.scroll_y), 0)
+            before = app.export_screenshot(simplify=True)
+
+            await pilot.press("down")
+            self.assertGreater(int(pane.scroll_y), 0)
+            await pilot.press("end")
+            self.assertEqual(int(pane.scroll_y), pane.max_scroll_y)
+            after = app.export_screenshot(simplify=True)
+            self.assertNotEqual(before, after)
+            self.assertIn("COMMAND", after)
+            await pilot.press("home")
+            self.assertEqual(int(pane.scroll_y), 0)
+
+            class Wheel:
+                def prevent_default(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+            pane.on_mouse_scroll_down(Wheel())
+            self.assertGreater(int(pane.scroll_y), 0)
+
+    async def test_expanded_jobs_keeps_job_names_visible_at_minimum_width(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("many"), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            expected_name = app.filtered_rows[0].job
+            await pilot.press("enter")
+            await pilot.pause()
+            svg = app.export_screenshot(simplify=True)
+            self.assertIn(expected_name, svg)
+
+    async def test_expanded_resources_routes_hovered_history_and_page_scroll(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("2", "enter")
+            await pilot.pause()
+            self.assertTrue(app._resource_graph_regions)
+            left, top, right, bottom = app._resource_graph_regions[0]
+            self.assertLess(left, right)
+            self.assertLess(top, bottom)
+
+            class Wheel:
+                def __init__(self, x, y):
+                    self.x = x
+                    self.y = y
+
+                def get_content_offset(self, _pane):
+                    return type(
+                        "Offset", (), {"x": self.x, "y": self.y}
+                    )()
+
+            with patch.object(app, "_scroll_history") as history:
+                app.scroll_focused(
+                    1,
+                    "resources-pane",
+                    Wheel((left + right) // 2, (top + bottom) // 2),
+                )
+                history.assert_called_once_with(1)
+            with patch.object(app, "_scroll_expanded_pane") as page:
+                app.scroll_focused(1, "resources-pane", Wheel(0, top))
+                page.assert_called_once_with("resources", 1)
+
+    async def test_expanded_gpu_devices_show_device_and_process_details(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.5)
+            row = next(item for item in app.rows if item.gpu_requested_count)
+            detailed = replace(
+                row,
+                gpu_devices=[
+                    GpuDevice(
+                        index=0,
+                        name="NVIDIA H100 80GB HBM3",
+                        uuid="GPU-test-uuid",
+                        memory_used_gib=24.0,
+                        memory_total_gib=80.0,
+                        utilization=65.0,
+                        temperature_c=71.0,
+                        power_w=312.0,
+                        ecc_errors=0,
+                        driver_version="570.86",
+                        processes=[
+                            GpuProcess(
+                                gpu_uuid="GPU-test-uuid",
+                                pid=4242,
+                                name="python train.py",
+                                memory_used_gib=23.5,
+                                gpu_utilization=37.0,
+                            )
+                        ],
+                    )
+                ],
+            )
+            app.rows = [detailed]
+            app.filtered_rows = [detailed]
+            app.state.cursor_job_uid = detailed.uid
+            app.state.focused_pane = "resources"
+            app.state.expanded_pane = "resources"
+            app._apply_layout()
+            app._render_all()
+            await pilot.pause()
+            pane = app.query_one("#resources-pane", DashboardPane)
+            frames = [app.export_screenshot(simplify=True)]
+            while int(pane.scroll_y) < pane.max_scroll_y:
+                pane.scroll_relative(
+                    y=max(1, pane.size.height // 2),
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                frames.append(app.export_screenshot(simplify=True))
+            svg = "\n".join(frames)
+            for value in (
+                "POWER", "ECC", "NVIDIA&#160;H100",
+                "4242", "python&#160;train.py", "23.5G", "37.0%",
+            ):
+                self.assertIn(value, svg)
+            self.assertNotIn("PROCESSES", svg)
+            self.assertNotIn("Requested", svg)
+            self.assertNotIn("Telemetry", svg)
+
+    def test_gpu_process_utilization_parser_ignores_headers_and_missing_data(self) -> None:
+        values = _parse_gpu_process_utilization(
+            [
+                "# gpu pid type sm mem enc dec command",
+                "0 4242 C 37 18 - - python",
+                "0 5252 C - - - - python",
+            ]
+        )
+        self.assertEqual(values, {4242: 37.0})
+
+    def test_gpu_process_utilization_uses_a_persistent_pmon_stream(self) -> None:
+        process = SimpleNamespace(
+            stdout=iter(
+                [
+                    "# gpu pid type sm mem enc dec command\n",
+                    "0 4242 C 37 18 - - python\n",
+                ]
+            )
+        )
+        sampler = StreamingGpuSampler("team-a")
+        with patch(
+            "falcon.dashboard.subprocess.Popen", return_value=process
+        ) as popen, patch("falcon.dashboard.threading.Thread") as thread:
+            sampler._start_pmon("pod-a")
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                command[-6:],
+                ["nvidia-smi", "pmon", "-d", "1", "-s", "u"],
+            )
+            thread.call_args.kwargs["target"]()
+        self.assertEqual(sampler._process_utilization["pod-a"], {4242: 37.0})
 
     async def test_expanded_events_reach_oldest_and_newest(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)

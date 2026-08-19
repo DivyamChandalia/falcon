@@ -74,7 +74,7 @@ USER_DEFAULTS: Dict[str, Any] = {
     "presets": {
         "h100": {
             "gpu_type": "h100",
-            "minimum_utilization": 90,
+            "minimum_utilization": 75,
             "max_count": 8,
         },
         "a6000": {
@@ -89,7 +89,7 @@ USER_DEFAULTS: Dict[str, Any] = {
         },
         "pro6000": {
             "gpu_type": "pro6000",
-            "minimum_utilization": 30,
+            "minimum_utilization": 75,
             "max_count": 2,
         },
     },

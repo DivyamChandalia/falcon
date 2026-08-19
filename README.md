@@ -331,4 +331,9 @@ Common short aliases are also available: `j` jobs, `g` get, `e` events, `l`
 logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
 `r` resources, and `s` setup.
 
+## TODO
+
+- Fix the intermittent issue where `falcon resources` breaks.
+- Port the Falcon agent interface to an MCP server for long-running goal loops.
+
 Falcon is licensed under Apache-2.0. See [NOTICE](NOTICE) for attribution.

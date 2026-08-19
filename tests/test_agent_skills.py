@@ -48,7 +48,7 @@ class AgentSkillTests(unittest.TestCase):
         self.assertIn("falcon kill JOB", skill)
         self.assertIn("report its name, and return", skill)
         self.assertIn("Do not add `-f`", skill)
-        self.assertIn("H100 must stay at or above 90%", skill)
+        self.assertIn("H100 and PRO6000 must stay at or above 75%", skill)
         self.assertIn("A6000 and 2080Ti must stay at or above 30%", skill)
         self.assertIn("one targeted `kubectl` command", skill)
         for removed in (

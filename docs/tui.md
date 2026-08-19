@@ -27,6 +27,20 @@ Events follow the newest entry until the user scrolls backward. New events do
 not move a manually positioned viewport. `End` (or scrolling back to the last
 page) resumes follow. Changing Jobs resets event position predictably.
 
+The expanded Selected Job inspector scrolls as one page, including Job details
+and the full command. Use `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, or the
+mouse wheel; resizing is not required to reach fields below the fold.
+
+The expanded Resource Usage inspector also scrolls as one page. When the mouse
+is over a GPU, VRAM, CPU, or RAM utilization card, the wheel moves through that
+metric history instead. `←`/`→` always navigate history. The GPU Devices
+section shows responsive per-device model, UUID, VRAM, utilization,
+temperature, power, ECC, and driver columns. Active compute processes appear
+indented directly below their GPU with PID, process name, GPU utilization, and
+allocated VRAM in GiB.
+Device metrics and per-process GPU utilization use persistent `nvidia-smi`
+streams; process names and allocated VRAM are reconciled every five seconds.
+
 ## Resources
 
 - `↑` / `↓`, `j` / `k`: select nodes

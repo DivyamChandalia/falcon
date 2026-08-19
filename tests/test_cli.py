@@ -1095,7 +1095,7 @@ class InspectionCliTests(CliHarness):
             value["data"]["eviction_policy"][
                 "minimum_average_gpu_utilization_percent"
             ],
-            90.0,
+            75.0,
         )
         self.assertFalse(
             value["data"]["eviction_policy"]["observed_average_meets_minimum"]
@@ -1202,6 +1202,12 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(DEFAULT_CONFIG["resources"]["history_enabled"])
         self.assertEqual(DEFAULT_CONFIG["resources"]["history_hours"], 24)
         self.assertEqual(DEFAULT_CONFIG["presets"]["pro6000"]["max_count"], 2)
+        self.assertEqual(
+            DEFAULT_CONFIG["presets"]["h100"]["minimum_utilization"], 75
+        )
+        self.assertEqual(
+            DEFAULT_CONFIG["presets"]["pro6000"]["minimum_utilization"], 75
+        )
         for preset_name, maximum in (
             ("h100", 8),
             ("a6000", 2),

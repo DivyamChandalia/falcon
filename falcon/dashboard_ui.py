@@ -16,13 +16,14 @@ from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from rich import box
 from rich.align import Align
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
@@ -106,7 +107,6 @@ class ViewState:
     resource_scroll_offset: int = 0
     events_scroll_offset: int = 0
     events_auto_follow: bool = True
-    selected_command_scroll_offset: int = 0
     search_query: str = ""
     filters: Dict[str, str] = field(default_factory=lambda: {
         "status": "All", "pod": "All", "node": "All", "gpu": "All", "marked": "All",
@@ -255,8 +255,57 @@ def _event_style(event: JobEvent) -> str:
     return YELLOW if event.event_type.lower() == "warning" else GREEN
 
 
-class DashboardPane(Static):
+class DashboardPaneContent(Static):
+    def __init__(self, content="", *args, **kwargs):
+        self._natural_content = content
+        self._natural_height_cache: Optional[Tuple[int, int]] = None
+        super().__init__(content, *args, **kwargs)
+
+    def update(self, content="", *, layout: bool = True) -> None:
+        self._natural_content = content
+        self._natural_height_cache = None
+        super().update(content, layout=layout)
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        cached = self._natural_height_cache
+        if cached is not None and cached[0] == width:
+            return cached[1]
+        options = self.app.console.options.update(
+            width=max(1, width), height=None
+        )
+        options.max_height = None
+        height = len(
+            self.app.console.render_lines(
+                self._natural_content,
+                options,
+                pad=True,
+            )
+        )
+        self._natural_height_cache = (width, height)
+        return height
+
+
+class DashboardPane(VerticalScroll):
     can_focus = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pane_content = ""
+
+    def compose(self) -> ComposeResult:
+        yield DashboardPaneContent(
+            self._pane_content,
+            id=f"{self.id}-content" if self.id else None,
+            classes="dashboard-pane-content",
+            markup=False,
+        )
+
+    def update(self, content="", *, layout: bool = True) -> None:
+        self._pane_content = content
+        if self.is_mounted:
+            self.query_one(".dashboard-pane-content", DashboardPaneContent).update(
+                content, layout=layout
+            )
 
     def _activate(self) -> None:
         pane = self.id.replace("-pane", "") if self.id else "jobs"
@@ -291,14 +340,14 @@ class DashboardPane(Static):
         event.stop()
         callback = getattr(self.app, "scroll_focused", None)
         if callback:
-            callback(1, self.id)
+            callback(1, self.id, event)
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         event.prevent_default()
         event.stop()
         callback = getattr(self.app, "scroll_focused", None)
         if callback:
-            callback(-1, self.id)
+            callback(-1, self.id, event)
 
 
 class KillDialog(ModalScreen[Optional[Tuple[str, List[JobUsage]]]]):
@@ -614,9 +663,11 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
 DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
+.dashboard-pane-content {{ width: 1fr; height: auto; }}
 #jobs-pane {{ height: 1fr; min-height: 7; }}
 #selected-pane {{ height: 3; min-height: 3; }}
 #resources-pane {{ height: 6; min-height: 6; }}
+#selected-pane, #resources-pane {{ overflow-y: auto; scrollbar-size-vertical: 1; }}
 #events-pane {{ height: 7; min-height: 3; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #falcon-footer {{ height: 1; color: {GRAY}; padding: 0 1; }}
@@ -690,6 +741,7 @@ class FalconDashboard(App):
         self._result_queue = __import__("queue").Queue(maxsize=1)
         self._last_terminal_size: Tuple[int, int] = (-1, -1)
         self._responsive_hidden_panes: Set[str] = set()
+        self._resource_graph_regions: List[Tuple[int, int, int, int]] = []
 
     @property
     def selected(self) -> int:
@@ -799,12 +851,14 @@ class FalconDashboard(App):
         if pane_id != "jobs-pane" or not self.filtered_rows or self.state.expanded_pane:
             return
         pane = self.query_one("#jobs-pane", DashboardPane)
-        offset = event.get_content_offset(pane)
+        content = pane.query_one(".dashboard-pane-content", DashboardPaneContent)
+        offset = event.get_content_offset(content)
         if offset is None:
             return
         # Rich's SIMPLE_HEAD box renders a blank top line, header, and header
-        # separator before the first Job row.  Mouse coordinates are relative
-        # to the pane content, so ignore those non-row lines.
+        # separator before the first Job row. Resolve coordinates against the
+        # inner content widget so the pane border doesn't introduce a one-row
+        # offset.
         row = offset.y - 3
         if row < 0:
             return
@@ -815,7 +869,12 @@ class FalconDashboard(App):
                 self.action_toggle_mark()
             self._selection_changed()
 
-    def scroll_focused(self, amount: int, pane_id: Optional[str] = None) -> None:
+    def scroll_focused(
+        self,
+        amount: int,
+        pane_id: Optional[str] = None,
+        event: Optional[events.MouseScrollDown | events.MouseScrollUp] = None,
+    ) -> None:
         pane = (pane_id or self.state.focused_pane).replace("-pane", "")
         if pane == "jobs":
             if self.state.expanded_pane == "jobs":
@@ -824,13 +883,48 @@ class FalconDashboard(App):
                 self._move_cursor(amount)
         elif pane == "selected":
             if self.state.expanded_pane == "selected":
-                self._scroll_selected_command(amount)
+                self._scroll_expanded_pane("selected", amount)
             else:
                 self._move_cursor(amount)
         elif pane == "events":
             self._scroll_events(amount)
+        elif self.state.expanded_pane == "resources":
+            resource_pane = self.query_one("#resources-pane", DashboardPane)
+            content = resource_pane.query_one(
+                ".dashboard-pane-content", DashboardPaneContent
+            )
+            offset = event.get_content_offset(content) if event else None
+            over_graph = offset is not None and any(
+                left <= offset.x < right and top <= offset.y < bottom
+                for left, top, right, bottom in self._resource_graph_regions
+            )
+            if over_graph:
+                self._scroll_history(amount)
+            else:
+                self._scroll_expanded_pane("resources", amount)
         else:
             self._scroll_history(amount)
+
+    def _scroll_expanded_pane(self, pane: str, amount: int) -> None:
+        target = self.query_one(f"#{pane}-pane", DashboardPane)
+        target.scroll_relative(
+            y=amount,
+            animate=False,
+            force=True,
+            immediate=True,
+        )
+
+    def _page_expanded_pane(self, pane: str, direction: int) -> None:
+        target = self.query_one(f"#{pane}-pane", DashboardPane)
+        amount = max(1, target.size.height - 1) * direction
+        self._scroll_expanded_pane(pane, amount)
+
+    def _jump_expanded_pane(self, pane: str, end: bool) -> None:
+        target = self.query_one(f"#{pane}-pane", DashboardPane)
+        if end:
+            target.scroll_end(animate=False, force=True, immediate=True)
+        else:
+            target.scroll_home(animate=False, force=True, immediate=True)
 
     def _selected_row(self) -> Optional[JobUsage]:
         return next((row for row in self.rows if row.uid == self.state.cursor_job_uid), None)
@@ -1113,8 +1207,13 @@ class FalconDashboard(App):
                 f"No Jobs match “{self.state.search_query}”.\nPress Esc to clear search.", vertical="middle"
             ))
             return
-        width = self.size.width
+        width = max(1, target.content_size.width or self.size.width - 4)
         expanded = self.state.expanded_pane == "jobs"
+        show_active_pod = width >= 72 and not (expanded and width < 95)
+        show_node = width >= 95
+        show_gpu = width >= 130
+        show_restarts = expanded and width >= 95
+        show_completions = expanded and width >= 115
         table = Table(
             box=box.SIMPLE_HEAD,
             expand=True,
@@ -1123,15 +1222,19 @@ class FalconDashboard(App):
             header_style=f"bold {CYAN_2}",
         )
         table.add_column("MARK", width=5, no_wrap=True)
-        table.add_column("NAME", ratio=3, no_wrap=True, overflow="ellipsis")
+        table.add_column(
+            "NAME", ratio=3, min_width=16, no_wrap=True, overflow="ellipsis"
+        )
         table.add_column("STATUS", width=16, no_wrap=True)
-        table.add_column("ACTIVE POD", width=18, no_wrap=True)
-        if width >= 90:
+        if show_active_pod:
+            table.add_column("ACTIVE POD", width=18, no_wrap=True)
+        if show_node:
             table.add_column("NODE", width=12, no_wrap=True)
-        if width >= 115:
+        if show_gpu:
             table.add_column("GPU REQUEST", width=13, no_wrap=True)
-        if expanded:
+        if show_restarts:
             table.add_column("RESTARTS", width=8, justify="right")
+        if show_completions:
             table.add_column("COMPLETIONS", width=11, justify="right")
         table.add_column("AGE", width=7, justify="right")
         count = self._visible_job_count()
@@ -1148,13 +1251,16 @@ class FalconDashboard(App):
             name_style = f"bold {WHITE}" if selected else WHITE
             cells.append(Text(row.job, style=name_style, no_wrap=True, overflow="ellipsis"))
             cells.append(Text(f"{icon} {status_text}", style=status_color))
-            cells.append(Text(row.active_pod_state, style=WHITE, no_wrap=True, overflow="ellipsis"))
-            if width >= 90:
+            if show_active_pod:
+                cells.append(Text(row.active_pod_state, style=WHITE, no_wrap=True, overflow="ellipsis"))
+            if show_node:
                 cells.append(Text(row.nodes, style=WHITE))
-            if width >= 115:
+            if show_gpu:
                 cells.append(Text(_gpu_display(row.gpu_type, row.gpu_count), style=WHITE))
-            if expanded:
-                cells.extend([Text(str(row.restarts), style=WHITE), Text(row.completions, style=WHITE)])
+            if show_restarts:
+                cells.append(Text(str(row.restarts), style=WHITE))
+            if show_completions:
+                cells.append(Text(row.completions, style=WHITE))
             cells.append(Text(row.age, style=WHITE))
             table.add_row(*cells)
         position = f" {min(start + 1, len(self.filtered_rows))}-{min(start + count, len(self.filtered_rows))}/{len(self.filtered_rows)} "
@@ -1167,19 +1273,6 @@ class FalconDashboard(App):
         for source_line in (row.command or "—").splitlines() or ["—"]:
             lines.extend(textwrap.wrap(source_line, width=width, replace_whitespace=False) or [""])
         return lines
-
-    def _command_view_height(self) -> int:
-        return max(3, self.size.height - 25)
-
-    def _scroll_selected_command(self, amount: int) -> None:
-        row = self._selected_row()
-        if not row:
-            return
-        maximum = max(0, len(self._wrapped_command(row)) - self._command_view_height())
-        self.state.selected_command_scroll_offset = max(
-            0, min(maximum, self.state.selected_command_scroll_offset + amount)
-        )
-        self._render_selected()
 
     def _render_selected(self) -> None:
         row = self._selected_row()
@@ -1230,27 +1323,20 @@ class FalconDashboard(App):
                 value_style = status_color if label == "Status" else (RED if label == "Eviction risk" and row.at_risk else WHITE)
                 overview.add_row(label, Text(value, style=value_style))
             command_lines = self._wrapped_command(row)
-            command_height = self._command_view_height()
-            maximum = max(0, len(command_lines) - command_height)
-            self.state.selected_command_scroll_offset = min(self.state.selected_command_scroll_offset, maximum)
-            command_start = self.state.selected_command_scroll_offset
-            command_end = min(len(command_lines), command_start + command_height)
-            command_position = (
-                f" lines {command_start + 1}-{command_end}/{len(command_lines)} "
-                if len(command_lines) > command_height else ""
-            )
             command = Panel(
-                Text("\n".join(command_lines[command_start:command_end]), style=WHITE),
-                title=Text(" COMMAND ", style=f"bold {CYAN}"), subtitle=command_position,
+                Text("\n".join(command_lines), style=WHITE),
+                title=Text(" COMMAND ", style=f"bold {CYAN}"),
                 border_style=BORDER, box=box.SQUARE,
             )
-            content = Table.grid(expand=True)
-            content.add_column(ratio=1)
-            content.add_row(Panel(
-                overview, title=Text(" JOB DETAILS ", style=f"bold {CYAN}"),
-                border_style=BORDER, box=box.SQUARE,
-            ))
-            content.add_row(command)
+            content = Group(
+                Panel(
+                    overview,
+                    title=Text(" JOB DETAILS ", style=f"bold {CYAN}"),
+                    border_style=BORDER,
+                    box=box.SQUARE,
+                ),
+                command,
+            )
             target.border_subtitle = ""
             target.update(content)
             return
@@ -1500,37 +1586,43 @@ class FalconDashboard(App):
         )
 
     def _gpu_devices_panel(self, row: JobUsage, layout: str) -> Panel:
-        full = layout == "wide"
-        devices = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), header_style=f"bold {CYAN}")
+        del layout
+        show_power = self.size.width >= 95
+        show_ecc = self.size.width >= 110
+        show_driver = self.size.width >= 135
+        show_uuid = self.size.width >= 175
+        devices = Table(
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            padding=(0, 1),
+            header_style=f"bold {CYAN}",
+        )
         devices.add_column("GPU", width=4)
-        if full:
-            if self.size.width < 160:
-                devices.add_column("MODEL / UUID", width=24, overflow="ellipsis", no_wrap=True)
-            else:
-                devices.add_column("MODEL / UUID", ratio=2, overflow="ellipsis", no_wrap=True)
+        devices.add_column("MODEL", ratio=2, overflow="ellipsis", no_wrap=True)
+        if show_uuid:
+            devices.add_column("UUID", ratio=2, overflow="ellipsis", no_wrap=True)
         devices.add_column("VRAM", width=13, justify="right")
         devices.add_column("UTIL", width=6, justify="right")
         devices.add_column("TEMP", width=6, justify="right")
-        if full:
+        if show_power:
             devices.add_column("POWER", width=8, justify="right")
+        if show_ecc:
             devices.add_column("ECC", width=5, justify="right")
+        if show_driver:
             devices.add_column("DRIVER", width=8, overflow="ellipsis", no_wrap=True)
-        if layout == "collapsed":
-            pane_height = self.query_one("#resources-pane", DashboardPane).size.height
-            limit = min(len(row.gpu_devices), max(1, pane_height - 10))
-        else:
-            # Expanded resource views have enough vertical space to show all
-            # device rows; never hide real GPUs behind an arbitrary four-row cap.
-            limit = len(row.gpu_devices)
-        for device in row.gpu_devices[:limit]:
+        for device in row.gpu_devices:
             memory = (
                 "—" if device.memory_used_gib is None or device.memory_total_gib is None
                 else f"{device.memory_used_gib:.1f}/{device.memory_total_gib:.1f}G"
             )
-            cells = [Text(str(device.index), style=WHITE)]
-            if full:
-                identity = device.name if self.size.width < 160 else f"{device.name} · {device.uuid}"
-                cells.append(Text(identity, style=WHITE, no_wrap=True, overflow="ellipsis"))
+            cells = [
+                Text(str(device.index), style=WHITE),
+                Text(device.name, style=WHITE, no_wrap=True, overflow="ellipsis"),
+            ]
+            if show_uuid:
+                cells.append(
+                    Text(device.uuid, style=GRAY, no_wrap=True, overflow="ellipsis")
+                )
             cells.extend([
                 Text(memory, style=WHITE),
                 Text(
@@ -1539,38 +1631,168 @@ class FalconDashboard(App):
                 ),
                 Text(self._device_value(device.temperature_c, "°C"), style=WHITE),
             ])
-            if full:
-                cells.extend([
-                    Text(self._device_value(device.power_w, "W"), style=WHITE),
-                    Text("—" if device.ecc_errors is None else str(device.ecc_errors), style=WHITE),
-                    Text(device.driver_version, style=WHITE),
-                ])
+            if show_power:
+                cells.append(Text(self._device_value(device.power_w, "W"), style=WHITE))
+            if show_ecc:
+                cells.append(
+                    Text(
+                        "—" if device.ecc_errors is None else str(device.ecc_errors),
+                        style=WHITE,
+                    )
+                )
+            if show_driver:
+                cells.append(Text(device.driver_version, style=WHITE))
             devices.add_row(*cells)
+            for process in device.processes:
+                process_cells = [
+                    Text("", style=GRAY),
+                    Text(
+                        f"  └─ {process.pid}  {process.name}",
+                        style=GRAY,
+                        no_wrap=True,
+                        overflow="ellipsis",
+                    ),
+                ]
+                if show_uuid:
+                    process_cells.append(Text("", style=GRAY))
+                process_cells.extend(
+                    [
+                        Text(
+                            "—"
+                            if process.memory_used_gib is None
+                            else f"{process.memory_used_gib:.1f}G",
+                            style=CYAN_2,
+                        ),
+                        Text(
+                            "—"
+                            if process.gpu_utilization is None
+                            else f"{process.gpu_utilization:.1f}%",
+                            style=CYAN_2,
+                        ),
+                        Text("", style=GRAY),
+                    ]
+                )
+                if show_power:
+                    process_cells.append(Text("", style=GRAY))
+                if show_ecc:
+                    process_cells.append(Text("", style=GRAY))
+                if show_driver:
+                    process_cells.append(Text("", style=GRAY))
+                devices.add_row(*process_cells)
+
+        column_count = 5 + sum((show_uuid, show_power, show_ecc, show_driver))
         if not row.gpu_devices:
-            span = 8 if full else 4
-            devices.add_row(*(["—", "GPU device metrics unavailable"] + [""] * (span - 2)))
-        elif len(row.gpu_devices) > limit:
-            span = 8 if full else 4
-            devices.add_row(*(["…", f"{len(row.gpu_devices) - limit} more devices"] + [""] * (span - 2)))
+            devices.add_row(
+                *(["—", "GPU device metrics unavailable"] + [""] * (column_count - 2))
+            )
+
         return Panel(
-            devices, title=Text(f" GPU DEVICES ({len(row.gpu_devices)}) ", style=f"bold {CYAN}"),
+            devices,
+            title=Text(f" GPU DEVICES ({len(row.gpu_devices)}) ", style=f"bold {CYAN}"),
             border_style=CYAN_2, box=box.SQUARE, padding=(0, 0),
         )
+
+    def _renderable_height(self, renderable, width: int) -> int:
+        options = self.console.options.update(width=max(1, width), height=None)
+        options.max_height = None
+        return len(self.console.render_lines(renderable, options, pad=True))
 
     def _render_expanded_resources(self, target: DashboardPane, row: JobUsage, points: List[MetricPoint]) -> None:
         layout = self._resource_layout()
         metrics = self._resource_metrics(row, points)
-        content = Table.grid(expand=True)
-        content.add_column(ratio=1)
-        content.add_row(self._selected_resource_strip(row, layout))
+        selected = self._selected_resource_strip(row, layout)
+        width = max(1, target.size.width)
+        metric_start = self._renderable_height(selected, width)
+        graph_height = self._resource_history_height(layout)
+        graph_regions: List[Tuple[int, int, int, int]] = []
         if layout == "wide":
-            for metric in metrics:
-                content.add_row(self._wide_metric_panel(metric))
+            panels = [self._wide_metric_panel(metric) for metric in metrics]
+            metric_content = Group(*panels)
+            panel_top = metric_start
+            for panel in panels:
+                panel_height = self._renderable_height(panel, width)
+                stats_width = int(panel.renderable.columns[0].width or 0)
+                history_width = self._resource_history_width(
+                    "wide", stats_width
+                )
+                graph_regions.append(
+                    (
+                        max(0, width - history_width - 3),
+                        max(panel_top + 1, panel_top + panel_height - 1 - graph_height),
+                        max(1, width - 1),
+                        panel_top + panel_height - 1,
+                    )
+                )
+                panel_top += panel_height
         elif layout == "compact":
-            content.add_row(self._compact_metrics_grid(metrics))
+            panels = [self._compact_metric_panel(metric) for metric in metrics]
+            metric_content = Table.grid(expand=True, padding=(0, 1))
+            metric_content.add_column(ratio=1)
+            metric_content.add_column(ratio=1)
+            metric_content.add_row(panels[0], panels[1])
+            metric_content.add_row(panels[2], panels[3])
+            card_width = max(1, (width - 2) // 2)
+            row_top = metric_start
+            for row_index in range(2):
+                row_panels = panels[row_index * 2:row_index * 2 + 2]
+                row_height = max(
+                    self._renderable_height(panel, card_width)
+                    for panel in row_panels
+                )
+                for column, panel in enumerate(row_panels):
+                    stats_width = int(panel.renderable.columns[0].width or 0)
+                    history_width = self._resource_history_width(
+                        "compact", stats_width
+                    )
+                    card_left = column * (card_width + 2)
+                    graph_regions.append(
+                        (
+                            card_left + max(2, card_width - history_width - 2),
+                            max(row_top + 1, row_top + row_height - 1 - graph_height),
+                            min(width, card_left + card_width - 1),
+                            row_top + row_height - 1,
+                        )
+                    )
+                row_top += row_height
         else:
-            content.add_row(self._compact_metrics_grid(metrics, collapsed=True))
-        content.add_row(self._gpu_devices_panel(row, layout))
+            panels = [
+                self._compact_metric_panel(metric, collapsed=True)
+                for metric in metrics
+            ]
+            metric_content = Table.grid(expand=True, padding=(0, 1))
+            metric_content.add_column(ratio=1)
+            metric_content.add_column(ratio=1)
+            metric_content.add_row(panels[0], panels[1])
+            metric_content.add_row(panels[2], panels[3])
+            card_width = max(1, (width - 2) // 2)
+            row_top = metric_start
+            for row_index in range(2):
+                row_panels = panels[row_index * 2:row_index * 2 + 2]
+                row_height = max(
+                    self._renderable_height(panel, card_width)
+                    for panel in row_panels
+                )
+                for column, panel in enumerate(row_panels):
+                    stats_width = int(panel.renderable.columns[0].width or 0)
+                    history_width = self._resource_history_width(
+                        "collapsed", stats_width
+                    )
+                    card_left = column * (card_width + 2)
+                    graph_regions.append(
+                        (
+                            card_left + max(2, card_width - history_width - 2),
+                            max(row_top + 1, row_top + row_height - 1 - graph_height),
+                            min(width, card_left + card_width - 1),
+                            row_top + row_height - 1,
+                        )
+                    )
+                row_top += row_height
+        self._resource_graph_regions = graph_regions
+        content = Group(
+            selected,
+            metric_content,
+            self._gpu_devices_panel(row, layout),
+        )
         target.border_subtitle = ""
         target.update(content)
 
@@ -1701,14 +1923,14 @@ class FalconDashboard(App):
                 )
         elif self.state.focused_pane == "selected":
             value = (
-                "↑/↓ Command   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
+                "↑/↓ Scroll   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
                 if self.state.expanded_pane == "selected"
                 else f"↑/↓ Change Job   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
             )
         elif self.state.focused_pane == "resources":
             zoom = round(100 / self.state.resource_zoom)
             if self.state.expanded_pane == "resources":
-                value = f"←/→ History   R Range   +/- Zoom {zoom}%   Z Cycle   Esc Restore   Tab Next pane   r Refresh   q Quit"
+                value = f"↑/↓ Scroll   ←/→ History   Hover charts: history   R Range   +/- Zoom {zoom}%   Esc Restore   Tab Next pane   q Quit"
             else:
                 value = f"←/→ History   Home/End Range   +/- Zoom {zoom}%   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
         else:
@@ -1775,11 +1997,13 @@ class FalconDashboard(App):
             active = self.state.expanded_pane + "-pane"
             for pane_id in pane_ids:
                 self.query_one(f"#{pane_id}").display = pane_id == active
-            self.query_one(f"#{active}").styles.height = "1fr"
+            expanded = self.query_one(f"#{active}")
+            expanded.styles.height = "1fr"
             return
         for pane_id in pane_ids:
             pane = pane_id.removesuffix("-pane")
-            self.query_one(f"#{pane_id}").display = pane_id in {"summary", "controls"} or pane in visible_panes
+            widget = self.query_one(f"#{pane_id}")
+            widget.display = pane_id in {"summary", "controls"} or pane in visible_panes
         self.query_one("#jobs-pane").styles.height = "1fr"
         self.query_one("#summary").styles.height = 2
         self.query_one("#selected-pane").styles.height = 3
@@ -1876,29 +2100,38 @@ class FalconDashboard(App):
         self.state.events_scroll_offset = 0
         self.state.events_auto_follow = True
         self.state.resource_scroll_offset = 0
-        self.state.selected_command_scroll_offset = 0
+        for pane in ("selected", "resources"):
+            self.query_one(f"#{pane}-pane", DashboardPane).scroll_home(
+                animate=False,
+                force=True,
+                immediate=True,
+            )
         self._request_update()
         self._render_all()
 
     def action_up(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_selected_command(-1)
+            self._scroll_expanded_pane("selected", -1)
             return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(-1)
         elif self.state.focused_pane == "events":
             self._scroll_events(-1)
+        elif self.state.expanded_pane == "resources":
+            self._scroll_expanded_pane("resources", -1)
         else:
             self._scroll_history(1)
 
     def action_down(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_selected_command(1)
+            self._scroll_expanded_pane("selected", 1)
             return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(1)
         elif self.state.focused_pane == "events":
             self._scroll_events(1)
+        elif self.state.expanded_pane == "resources":
+            self._scroll_expanded_pane("resources", 1)
         else:
             self._scroll_history(-1)
 
@@ -1939,7 +2172,9 @@ class FalconDashboard(App):
 
     def action_page_up(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_selected_command(-self._command_view_height())
+            self._page_expanded_pane("selected", -1)
+        elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
+            self._page_expanded_pane("resources", -1)
         elif self.state.focused_pane == "resources":
             self.state.resource_zoom = min(16, self.state.resource_zoom * 2)
             self._render_resources()
@@ -1949,7 +2184,9 @@ class FalconDashboard(App):
 
     def action_page_down(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_selected_command(self._command_view_height())
+            self._page_expanded_pane("selected", 1)
+        elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
+            self._page_expanded_pane("resources", 1)
         elif self.state.focused_pane == "resources":
             self.state.resource_zoom = max(1, self.state.resource_zoom // 2)
             self._render_resources()
@@ -1959,31 +2196,31 @@ class FalconDashboard(App):
 
     def action_home(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self.state.selected_command_scroll_offset = 0
-            self._render_selected()
+            self._jump_expanded_pane("selected", False)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = False
             self.state.events_scroll_offset = 0
             self._render_events()
         elif self.state.focused_pane == "resources":
-            row = self._selected_row()
-            self.state.resource_scroll_offset = max(0, len(self.histories.get(row.uid, [])) - 1) if row else 0
-            self._render_resources()
+            if self.state.expanded_pane == "resources":
+                self._jump_expanded_pane("resources", False)
+            else:
+                row = self._selected_row()
+                self.state.resource_scroll_offset = max(0, len(self.histories.get(row.uid, [])) - 1) if row else 0
+                self._render_resources()
 
     def action_end(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            row = self._selected_row()
-            if row:
-                self.state.selected_command_scroll_offset = max(
-                    0, len(self._wrapped_command(row)) - self._command_view_height()
-                )
-            self._render_selected()
+            self._jump_expanded_pane("selected", True)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = True
             self._render_events()
         elif self.state.focused_pane == "resources":
-            self.state.resource_scroll_offset = 0
-            self._render_resources()
+            if self.state.expanded_pane == "resources":
+                self._jump_expanded_pane("resources", True)
+            else:
+                self.state.resource_scroll_offset = 0
+                self._render_resources()
 
     def action_history_left(self) -> None:
         if self.state.focused_pane == "resources":

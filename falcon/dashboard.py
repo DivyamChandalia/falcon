@@ -27,6 +27,15 @@ RISK_AVERAGE_SAMPLES = 60
 
 
 @dataclass
+class GpuProcess:
+    gpu_uuid: str
+    pid: int
+    name: str
+    memory_used_gib: Optional[float] = None
+    gpu_utilization: Optional[float] = None
+
+
+@dataclass
 class GpuDevice:
     index: int
     name: str = "—"
@@ -38,6 +47,7 @@ class GpuDevice:
     power_w: Optional[float] = None
     ecc_errors: Optional[int] = None
     driver_version: str = "—"
+    processes: List[GpuProcess] = field(default_factory=list)
 
 
 @dataclass
@@ -346,7 +356,100 @@ def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
         ["exec", "-n", namespace, pod, "--", "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
         timeout=8,
     )
-    return _parse_gpu_lines(output.splitlines() if output else [])
+    sample = _parse_gpu_lines(output.splitlines() if output else [])
+    processes = _gpu_processes(namespace, pod)
+    _apply_gpu_process_utilization(
+        processes,
+        _gpu_process_utilization(namespace, pod),
+    )
+    _attach_gpu_processes(sample, processes)
+    return sample
+
+
+def _parse_gpu_process_lines(lines: List[str]) -> List[GpuProcess]:
+    processes: List[GpuProcess] = []
+    for line in lines:
+        parts = [part.strip() for part in line.split(",", 3)]
+        if len(parts) != 4:
+            continue
+        try:
+            pid = int(parts[1])
+            memory = float(parts[3]) / 1024
+        except (TypeError, ValueError):
+            continue
+        processes.append(
+            GpuProcess(
+                gpu_uuid=parts[0],
+                pid=pid,
+                name=parts[2] or "—",
+                memory_used_gib=memory,
+            )
+        )
+    return processes
+
+
+def _gpu_processes(namespace: str, pod: str) -> List[GpuProcess]:
+    query = "gpu_uuid,pid,process_name,used_gpu_memory"
+    output = _kubectl(
+        [
+            "exec", "-n", namespace, pod, "--", "nvidia-smi",
+            f"--query-compute-apps={query}", "--format=csv,noheader,nounits",
+        ],
+        timeout=8,
+    )
+    return _parse_gpu_process_lines(output.splitlines() if output else [])
+
+
+def _gpu_process_utilization(namespace: str, pod: str) -> Dict[int, float]:
+    output = _kubectl(
+        [
+            "exec", "-n", namespace, pod, "--", "nvidia-smi",
+            "pmon", "-c", "1", "-s", "u",
+        ],
+        timeout=8,
+    )
+    return _parse_gpu_process_utilization(
+        output.splitlines() if output else []
+    )
+
+
+def _parse_gpu_process_utilization(lines: List[str]) -> Dict[int, float]:
+    utilization: Dict[int, float] = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[1])
+            gpu_percent = float(parts[3])
+        except (TypeError, ValueError):
+            continue
+        utilization[pid] = gpu_percent
+    return utilization
+
+
+def _apply_gpu_process_utilization(
+    processes: List[GpuProcess],
+    utilization: Dict[int, float],
+) -> None:
+    for process in processes:
+        process.gpu_utilization = utilization.get(process.pid)
+
+
+def _attach_gpu_processes(
+    sample: GpuSample,
+    processes: List[GpuProcess],
+) -> None:
+    by_uuid: Dict[str, List[GpuProcess]] = {}
+    for process in processes:
+        by_uuid.setdefault(process.gpu_uuid, []).append(process)
+    for device in sample.devices:
+        device.processes = sorted(
+            by_uuid.get(device.uuid, []),
+            key=lambda process: (-float(process.memory_used_gib or 0), process.pid),
+        )
 
 
 def _parse_gpu_lines(lines: List[str]) -> GpuSample:
@@ -407,19 +510,68 @@ class StreamingGpuSampler:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._samples: Dict[str, GpuSample] = {}
         self._ready: Dict[str, threading.Event] = {}
+        self._process_samples: Dict[str, List[GpuProcess]] = {}
+        self._process_samples_at = 0.0
+        self._pmon_streams: Dict[str, subprocess.Popen] = {}
+        self._process_utilization: Dict[str, Dict[int, float]] = {}
+
+    @staticmethod
+    def _terminate(process: Optional[subprocess.Popen]) -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=0.2)
+
+    def _stop_pmon(self, pod: str) -> None:
+        self._terminate(self._pmon_streams.pop(pod, None))
+        with self._lock:
+            self._process_utilization.pop(pod, None)
 
     def _stop(self, pod: str) -> None:
         process = self._processes.pop(pod, None)
         self._ready.pop(pod, None)
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=0.2)
+        self._terminate(process)
+        self._stop_pmon(pod)
         with self._lock:
             self._samples.pop(pod, None)
+            self._process_samples.pop(pod, None)
+
+    def _start_pmon(self, pod: str) -> None:
+        try:
+            process = subprocess.Popen(
+                [
+                    "kubectl", "exec", "-n", self.namespace, pod, "--",
+                    "nvidia-smi", "pmon", "-d", "1", "-s", "u",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
+            return
+        self._pmon_streams[pod] = process
+
+        def read_process_utilization() -> None:
+            stream = process.stdout
+            if stream is None:
+                return
+            for line in stream:
+                values = _parse_gpu_process_utilization([line])
+                if not values:
+                    continue
+                with self._lock:
+                    self._process_utilization.setdefault(pod, {}).update(values)
+
+        threading.Thread(
+            target=read_process_utilization,
+            name=f"falcon-pmon-{pod}",
+            daemon=True,
+        ).start()
 
     def _start(self, pod: str, gpu_count: int) -> None:
         query = (
@@ -463,6 +615,7 @@ class StreamingGpuSampler:
                 ready.set()
 
         threading.Thread(target=read_samples, name=f"falcon-gpu-{pod}", daemon=True).start()
+        self._start_pmon(pod)
 
     def samples(self, pods: Dict[str, int]) -> Dict[str, GpuSample]:
         for pod in list(self._processes):
@@ -474,13 +627,59 @@ class StreamingGpuSampler:
             if pod not in self._processes:
                 self._start(pod, gpu_count)
                 started.append(pod)
+            elif (
+                pod not in self._pmon_streams
+                or self._pmon_streams[pod].poll() is not None
+            ):
+                self._stop_pmon(pod)
+                self._start_pmon(pod)
         deadline = time.monotonic() + 0.5
         for pod in started:
             ready = self._ready.get(pod)
             if ready:
                 ready.wait(max(0.0, deadline - time.monotonic()))
+        now = time.monotonic()
+        if pods and now - self._process_samples_at >= KUBERNETES_USAGE_SECONDS:
+            pod_names = list(pods)
+            with ThreadPoolExecutor(
+                max_workers=min(8, max(1, len(pod_names)))
+            ) as pool:
+                process_samples = dict(
+                    zip(
+                        pod_names,
+                        pool.map(
+                            lambda pod: _gpu_processes(self.namespace, pod),
+                            pod_names,
+                        ),
+                    )
+                )
+            with self._lock:
+                self._process_samples.update(process_samples)
+                for pod, pod_processes in process_samples.items():
+                    active_pids = {process.pid for process in pod_processes}
+                    self._process_utilization[pod] = {
+                        pid: value
+                        for pid, value in self._process_utilization.get(
+                            pod, {}
+                        ).items()
+                        if pid in active_pids
+                    }
+            self._process_samples_at = now
         with self._lock:
-            return {pod: self._samples.get(pod, GpuSample()) for pod in pods}
+            samples = {pod: self._samples.get(pod, GpuSample()) for pod in pods}
+            processes = {
+                pod: list(self._process_samples.get(pod, [])) for pod in pods
+            }
+            process_utilization = {
+                pod: dict(self._process_utilization.get(pod, {}))
+                for pod in pods
+            }
+        for pod, sample in samples.items():
+            _apply_gpu_process_utilization(
+                processes[pod], process_utilization[pod]
+            )
+            _attach_gpu_processes(sample, processes[pod])
+        return samples
 
     def close(self) -> None:
         for pod in list(self._processes):
@@ -1056,8 +1255,9 @@ class DemoUsageCollector:
             running = job.status == "Running"
             has_metrics = running and "missing-metrics" not in job.name
             risk_threshold = (
-                90.0
-                if canonical_gpu(job.gpu_requested_model or "") == "h100"
+                75.0
+                if canonical_gpu(job.gpu_requested_model or "")
+                in {"h100", "pro6000"}
                 else 30.0
             )
             utilization = (
