@@ -722,17 +722,34 @@ class FalconDashboard(App):
             close()
 
     def on_resize(self, event: events.Resize) -> None:
+        # Some terminal backends dispatch Resize before Textual commits the
+        # App's new size. Defer layout until the next refresh so minimum-size
+        # and responsive-pane decisions use the final dimensions.
+        self._last_terminal_size = (-1, -1)
+        self.call_after_refresh(self._apply_resized_layout)
+
+    def _apply_resized_layout(self) -> None:
+        if not self.is_mounted:
+            return
         self._last_terminal_size = (self.size.width, self.size.height)
-        self._apply_layout()
-        self._render_all()
+        try:
+            self._apply_layout()
+            self._render_all()
+        except NoMatches:
+            # Resize callbacks may outlive the default screen during teardown.
+            return
 
     def _check_terminal_size(self) -> None:
         current = (self.size.width, self.size.height)
         if current == self._last_terminal_size:
             return
         self._last_terminal_size = current
-        self._apply_layout()
-        self._render_all()
+        try:
+            self._apply_layout()
+            self._render_all()
+        except NoMatches:
+            # The compatibility timer may tick after the screen unmounts.
+            return
 
     def _tick_clock(self) -> None:
         self._spinner = (self._spinner + 1) % 4
