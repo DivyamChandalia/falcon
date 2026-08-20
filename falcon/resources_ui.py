@@ -2142,6 +2142,12 @@ class FalconResourcesApp(App[None]):
         if node is None:
             target.update(Align.center("Select a node to inspect its consumers.", vertical="middle"))
             return
+        # Resource inspection is scheduler-facing: show allocatable headroom
+        # (free) over the allocatable total consistently in both the compact
+        # selected-node strip and the expanded inspector. ``requested`` is
+        # retained for allocation/history views, but is not displayed here as
+        # physical usage.
+        headroom = node.request_headroom
         if not self.state.expanded:
             sched, sched_color = _schedulable(node)
             line = Text(node.name, style=f"bold {CYAN}")
@@ -2149,19 +2155,19 @@ class FalconResourcesApp(App[None]):
                 line.append(f"   {sched}", style=sched_color)
             line.append("   CPU ", style=GRAY)
             line.append(
-                f"{_short_cpu(node.requested.cpu_cores)}/"
+                f"{_short_cpu(headroom.cpu_cores)}/"
                 f"{_short_cpu(node.allocatable.cpu_cores)}",
-                style=_request_pressure_color(
-                    node.requested.cpu_cores,
+                style=_resource_headroom_color(
+                    headroom.cpu_cores,
                     node.allocatable.cpu_cores,
                 ),
             )
             line.append("   RAM ", style=GRAY)
             line.append(
-                f"{_short_memory(node.requested.memory_bytes)}/"
+                f"{_short_memory(headroom.memory_bytes)}/"
                 f"{_short_memory(node.allocatable.memory_bytes)}",
-                style=_request_pressure_color(
-                    node.requested.memory_bytes,
+                style=_resource_headroom_color(
+                    headroom.memory_bytes,
                     node.allocatable.memory_bytes,
                 ),
             )
@@ -2170,9 +2176,9 @@ class FalconResourcesApp(App[None]):
                 style=WHITE,
             )
             line.append(
-                f"{node.requested.gpu_count}/{node.allocatable.gpu_count}",
-                style=_request_pressure_color(
-                    node.requested.gpu_count,
+                f"{headroom.gpu_count}/{node.allocatable.gpu_count}",
+                style=_resource_headroom_color(
+                    headroom.gpu_count,
                     node.allocatable.gpu_count,
                 ),
             )
@@ -2219,9 +2225,9 @@ class FalconResourcesApp(App[None]):
             node_value.append(sched, style=sched_color)
             gpu_value = Text(f"{node.gpu_model or '-'}  ", style=WHITE)
             gpu_value.append(
-                f"{node.requested.gpu_count}/{node.allocatable.gpu_count}",
-                style=_request_pressure_color(
-                    node.requested.gpu_count,
+                f"{headroom.gpu_count}/{node.allocatable.gpu_count}",
+                style=_resource_headroom_color(
+                    headroom.gpu_count,
                     node.allocatable.gpu_count,
                 ),
             )
@@ -2237,10 +2243,10 @@ class FalconResourcesApp(App[None]):
             facts.add_row(
                 "CPU",
                 Text(
-                    f"{_short_cpu(node.requested.cpu_cores)} / "
+                    f"{_short_cpu(headroom.cpu_cores)} / "
                     f"{_short_cpu(node.allocatable.cpu_cores)}",
-                    style=_request_pressure_color(
-                        node.requested.cpu_cores,
+                    style=_resource_headroom_color(
+                        headroom.cpu_cores,
                         node.allocatable.cpu_cores,
                     ),
                 ),
@@ -2248,10 +2254,10 @@ class FalconResourcesApp(App[None]):
             facts.add_row(
                 "RAM",
                 Text(
-                    f"{_short_memory(node.requested.memory_bytes)} / "
+                    f"{_short_memory(headroom.memory_bytes)} / "
                     f"{_short_memory(node.allocatable.memory_bytes)}",
-                    style=_request_pressure_color(
-                        node.requested.memory_bytes,
+                    style=_resource_headroom_color(
+                        headroom.memory_bytes,
                         node.allocatable.memory_bytes,
                     ),
                 ),
@@ -2269,12 +2275,12 @@ class FalconResourcesApp(App[None]):
             facts.add_row(
                 "CPU capacity",
                 _short_cpu(node.capacity.cpu_cores),
-                "CPU used / alloc",
+                "CPU free / alloc",
                 Text(
-                    f"{_short_cpu(node.requested.cpu_cores)} / "
+                    f"{_short_cpu(headroom.cpu_cores)} / "
                     f"{_short_cpu(node.allocatable.cpu_cores)}",
-                    style=_request_pressure_color(
-                        node.requested.cpu_cores,
+                    style=_resource_headroom_color(
+                        headroom.cpu_cores,
                         node.allocatable.cpu_cores,
                     ),
                 ),
@@ -2282,12 +2288,12 @@ class FalconResourcesApp(App[None]):
             facts.add_row(
                 "RAM capacity",
                 _short_memory(node.capacity.memory_bytes),
-                "RAM used / alloc",
+                "RAM free / alloc",
                 Text(
-                    f"{_short_memory(node.requested.memory_bytes)} / "
+                    f"{_short_memory(headroom.memory_bytes)} / "
                     f"{_short_memory(node.allocatable.memory_bytes)}",
-                    style=_request_pressure_color(
-                        node.requested.memory_bytes,
+                    style=_resource_headroom_color(
+                        headroom.memory_bytes,
                         node.allocatable.memory_bytes,
                     ),
                 ),
@@ -2305,11 +2311,11 @@ class FalconResourcesApp(App[None]):
             facts.add_row(
                 "GPU capacity",
                 str(node.allocatable.gpu_count),
-                "GPU used / alloc",
+                "GPU free / alloc",
                 Text(
-                    f"{node.requested.gpu_count}/{node.allocatable.gpu_count}",
-                    style=_request_pressure_color(
-                        node.requested.gpu_count,
+                    f"{headroom.gpu_count}/{node.allocatable.gpu_count}",
+                    style=_resource_headroom_color(
+                        headroom.gpu_count,
                         node.allocatable.gpu_count,
                     ),
                 ),

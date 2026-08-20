@@ -1249,6 +1249,12 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertLess(inspector_text.index("CPU capacity"), inspector_text.index("RAM capacity"))
             self.assertLess(inspector_text.index("RAM capacity"), inspector_text.index("GPU model"))
+            self.assertIn("CPU free / alloc", inspector_text)
+            self.assertIn("RAM free / alloc", inspector_text)
+            self.assertIn("GPU free / alloc", inspector_text)
+            self.assertIn("27.5 / 64", inspector_text)
+            self.assertIn("335G / 480G", inspector_text)
+            self.assertNotIn("CPU used / alloc", inspector_text)
 
     async def test_two_views_wrap_restore_persist_and_support_clicks(self) -> None:
         saved = []
@@ -1647,6 +1653,9 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             compact = app.export_screenshot(simplify=True)
             self.assertIn("VRAM", compact)
             self.assertIn("H100&#160;1/4", compact)
+            self.assertIn("27.5/64", compact)
+            self.assertIn("335G/480G", compact)
+            self.assertNotIn("36.5/64", compact)
             self.assertIn("free/allocatable", compact)
             await pilot.press("enter")
             self.assertTrue(app.state.expanded)
