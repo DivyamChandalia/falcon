@@ -220,6 +220,51 @@ def _scaled_history(
     return text
 
 
+class _ResourceHistoryChart:
+    """Mutable chart cell used by the expanded resource inspector.
+
+    The surrounding metric panel is deliberately kept stable while the user
+    browses history. Only this renderable's values change on each horizontal
+    history movement.
+    """
+
+    def __init__(
+        self,
+        values: List[Optional[float]],
+        width: int,
+        height: int,
+        zoom: int,
+        sample_period: int,
+        color: Optional[str],
+    ) -> None:
+        self.values = values
+        self.width = width
+        self.height = height
+        self.zoom = zoom
+        self.sample_period = sample_period
+        self.color = color
+
+    def update(
+        self,
+        values: List[Optional[float]],
+        zoom: int,
+        color: Optional[str],
+    ) -> None:
+        self.values = values
+        self.zoom = zoom
+        self.color = color
+
+    def __rich_console__(self, console, options):
+        yield _scaled_history(
+            self.values,
+            self.width,
+            self.height,
+            self.zoom,
+            self.sample_period,
+            self.color,
+        )
+
+
 def _status_style(status: str) -> Tuple[str, str]:
     lowered = status.lower()
     if lowered == "running":
@@ -661,7 +706,7 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; padding: 0 1; }}
 #controls {{ height: 1; color: {GRAY}; padding: 0 1; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
-DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; }}
+DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; scrollbar-visibility: hidden; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
 .dashboard-pane-content {{ width: 1fr; height: auto; }}
 #jobs-pane {{ height: 1fr; min-height: 7; }}
@@ -742,6 +787,9 @@ class FalconDashboard(App):
         self._last_terminal_size: Tuple[int, int] = (-1, -1)
         self._responsive_hidden_panes: Set[str] = set()
         self._resource_graph_regions: List[Tuple[int, int, int, int]] = []
+        self._expanded_resource_charts: Dict[str, _ResourceHistoryChart] = {}
+        self._expanded_resource_uid: Optional[str] = None
+        self._building_expanded_resource = False
 
     @property
     def selected(self) -> int:
@@ -855,11 +903,10 @@ class FalconDashboard(App):
         offset = event.get_content_offset(content)
         if offset is None:
             return
-        # Rich's SIMPLE_HEAD box renders a blank top line, header, and header
-        # separator before the first Job row. Resolve coordinates against the
-        # inner content widget so the pane border doesn't introduce a one-row
-        # offset.
-        row = offset.y - 3
+        # With ``show_edge=False`` Rich renders the header and its separator
+        # directly at the top of the table. Resolve coordinates against the
+        # inner content widget so the pane border doesn't introduce an offset.
+        row = offset.y - 2
         if row < 0:
             return
         index = self.state.jobs_scroll_offset + row
@@ -1178,9 +1225,10 @@ class FalconDashboard(App):
             # test/app screen. Keep filtering state updates safe during that
             # short lifecycle window.
             return 4
-        # SIMPLE_HEAD contributes a blank top line, header, and separator.
-        # Its trailing spacer may be clipped, so retain every Job data row.
-        return max(1, widget.content_size.height - 3)
+        # With ``show_edge=False`` SIMPLE_HEAD contributes the header and its
+        # separator. Its trailing spacer may be clipped, so retain every Job
+        # data row.
+        return max(1, widget.content_size.height - 2)
 
     def _ensure_cursor_visible(self) -> None:
         count = self._visible_job_count() if self.is_mounted else 4
@@ -1218,6 +1266,7 @@ class FalconDashboard(App):
             box=box.SIMPLE_HEAD,
             expand=True,
             padding=(0, 1),
+            show_edge=False,
             show_header=True,
             header_style=f"bold {CYAN_2}",
         )
@@ -1490,11 +1539,23 @@ class FalconDashboard(App):
         summary.append("—" if peak is None else f"{peak:.0f}%", style=self._resource_metric_color(metric, peak))
         summary.append("  " + self._absolute_metric(peak, metric["capacity"], metric["unit"]), style=WHITE)
         stats_width = max(len(line) for line in summary.plain.splitlines())
-        history = _scaled_history(
-            values, self._resource_history_width("wide", stats_width), self._resource_history_height("wide"),
-            self.state.resource_zoom, metric["sample_period"],
-            self._resource_metric_color(metric, current) if metric.get("terminal") else None,
+        history_width = self._resource_history_width("wide", stats_width)
+        history_height = self._resource_history_height("wide")
+        history_color = (
+            self._resource_metric_color(metric, current)
+            if metric.get("terminal")
+            else None
         )
+        history = _ResourceHistoryChart(
+            values,
+            history_width,
+            history_height,
+            self.state.resource_zoom,
+            metric["sample_period"],
+            history_color,
+        )
+        if self._building_expanded_resource:
+            self._expanded_resource_charts[metric["label"]] = history
         body = Table.grid(expand=True, padding=0)
         body.add_column(width=stats_width, justify="left")
         body.add_column(width=1)
@@ -1521,11 +1582,23 @@ class FalconDashboard(App):
         stats.append("—" if peak is None else f"{peak:.0f}%", style=self._resource_metric_color(metric, peak))
         layout = "collapsed" if collapsed else "compact"
         stats_width = max(len(line) for line in stats.plain.splitlines())
-        history = _scaled_history(
-            metric["values"], self._resource_history_width(layout, stats_width),
-            self._resource_history_height(layout), self.state.resource_zoom, metric["sample_period"],
-            self._resource_metric_color(metric, current) if metric.get("terminal") else None,
+        history_width = self._resource_history_width(layout, stats_width)
+        history_height = self._resource_history_height(layout)
+        history_color = (
+            self._resource_metric_color(metric, current)
+            if metric.get("terminal")
+            else None
         )
+        history = _ResourceHistoryChart(
+            metric["values"],
+            history_width,
+            history_height,
+            self.state.resource_zoom,
+            metric["sample_period"],
+            history_color,
+        )
+        if self._building_expanded_resource:
+            self._expanded_resource_charts[metric["label"]] = history
         body = Table.grid(expand=True, padding=0)
         body.add_column(width=stats_width, justify="left")
         body.add_column(width=1)
@@ -1701,6 +1774,9 @@ class FalconDashboard(App):
         layout = self._resource_layout()
         metrics = self._resource_metrics(row, points)
         selected = self._selected_resource_strip(row, layout)
+        self._expanded_resource_charts = {}
+        self._expanded_resource_uid = row.uid
+        self._building_expanded_resource = True
         width = max(1, target.size.width)
         metric_start = self._renderable_height(selected, width)
         graph_height = self._resource_history_height(layout)
@@ -1787,6 +1863,7 @@ class FalconDashboard(App):
                         )
                     )
                 row_top += row_height
+        self._building_expanded_resource = False
         self._resource_graph_regions = graph_regions
         content = Group(
             selected,
@@ -2168,6 +2245,34 @@ class FalconDashboard(App):
         row = self._selected_row()
         maximum = max(0, len(self.histories.get(row.uid, [])) - 1) if row else 0
         self.state.resource_scroll_offset = max(0, min(maximum, self.state.resource_scroll_offset + amount))
+        if (
+            row
+            and self.state.expanded_pane == "resources"
+            and self._expanded_resource_uid == row.uid
+            and self._expanded_resource_charts
+        ):
+            points = self._history_slice(row.uid)
+            metrics = self._resource_metrics(row, points) if points else []
+            for metric in metrics:
+                chart = self._expanded_resource_charts.get(metric["label"])
+                if chart is not None:
+                    chart.update(
+                        metric["values"],
+                        self.state.resource_zoom,
+                        (
+                            self._resource_metric_color(metric, metric["current"])
+                            if metric.get("terminal")
+                            else None
+                        ),
+                    )
+            try:
+                self.query_one(
+                    "#resources-pane .dashboard-pane-content",
+                    DashboardPaneContent,
+                ).refresh(layout=False)
+            except NoMatches:
+                pass
+            return
         self._render_resources()
 
     def action_page_up(self) -> None:

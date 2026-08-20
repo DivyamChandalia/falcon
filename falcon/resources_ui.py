@@ -333,7 +333,9 @@ ResourcesPane {{
     overflow: hidden;
 }}
 ResourcesPane:focus {{ border: solid {CYAN}; }}
-#nodes-pane {{ height: 1fr; min-height: 6; }}
+# The node table has no Rich edge spacer; keep its minimum at the smallest
+# useful one-row table (border + header + separator + one data row).
+#nodes-pane {{ height: 1fr; min-height: 5; }}
 #node-pane {{ height: 9; min-height: 5; }}
 #gpu-allocations-pane {{ height: 1fr; min-height: 8; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
@@ -350,10 +352,10 @@ class FalconResourcesApp(App[None]):
 
     # The fixed sections surrounding the two resource panes are one combined
     # header/view row, two overview rows, one controls row, and one footer. The node
-    # table needs its top spacer, header, separator, and two pane borders. The
-    # trailing Rich spacer can be clipped without hiding a data row.
+    # table needs its header, separator, and two pane borders. The trailing
+    # Rich spacer can be clipped without hiding a data row.
     _FIXED_LAYOUT_HEIGHT = 5
-    _NODE_TABLE_OVERHEAD = 5
+    _NODE_TABLE_OVERHEAD = 4
     _DETAIL_MIN_HEIGHT = 5
     _HISTORY_LOAD_INTERVAL = 2.0
 
@@ -1107,7 +1109,7 @@ class FalconResourcesApp(App[None]):
         return 0
 
     def _visible_nodes(self) -> int:
-        # ``box.SIMPLE_HEAD`` contributes a blank top row, the header, and its
+        # With ``show_edge=False`` SIMPLE_HEAD contributes the header and its
         # separator before the data rows. The trailing spacer is allowed to
         # clip so the last node still fits in the fixed inventory height.
         pane = self.query_one("#nodes-pane")
@@ -1116,7 +1118,7 @@ class FalconResourcesApp(App[None]):
         # the inline numeric height is already authoritative.
         if pane.styles.height.is_cells:
             return max(1, int(pane.styles.height.value) - self._NODE_TABLE_OVERHEAD)
-        return max(1, pane.content_size.height - 3)
+        return max(1, pane.content_size.height - 2)
 
     def _node_inventory_height(self) -> int:
         """Return the outer height needed to show every node row."""
@@ -1945,6 +1947,7 @@ class FalconResourcesApp(App[None]):
             expand=True,
             padding=(0, 1),
             collapse_padding=True,
+            show_edge=False,
             header_style=f"bold {CYAN_2}",
         )
         table.add_column(
@@ -2437,10 +2440,10 @@ class FalconResourcesApp(App[None]):
     def node_clicked(self, offset) -> None:
         if self.state.expanded or not self.nodes or offset is None or offset.y <= 0:
             return
-        # Rich's SIMPLE_HEAD box renders a blank top line, header, and header
-        # separator before the first data row.  Ignore those non-row lines;
-        # ``offset`` is relative to the pane content (not its border).
-        row = offset.y - 3
+        # With ``show_edge=False`` SIMPLE_HEAD renders the header and header
+        # separator directly above the first data row. Ignore those non-row
+        # lines; ``offset`` is relative to the pane content (not its border).
+        row = offset.y - 2
         if row < 0:
             return
         index = self.state.node_scroll + row

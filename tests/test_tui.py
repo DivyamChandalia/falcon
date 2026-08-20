@@ -31,7 +31,9 @@ from falcon.dashboard import (
 )
 from falcon.dashboard_ui import (
     DashboardPane,
+    DashboardPaneContent,
     FalconDashboard,
+    MetricPoint,
     _restart_job_manifest,
 )
 from falcon.demo import DEMO_NOW, DemoCollector, demo_cluster_snapshot
@@ -425,7 +427,7 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause(0.5)
             expected = app.filtered_rows[1].uid
-            clicked = await pilot.click(".dashboard-pane-content", offset=(5, 4))
+            clicked = await pilot.click(".dashboard-pane-content", offset=(5, 3))
             self.assertTrue(clicked)
             self.assertEqual(app.state.cursor_job_uid, expected)
 
@@ -610,6 +612,62 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(app, "_scroll_expanded_pane") as page:
                 app.scroll_focused(1, "resources-pane", Wheel(0, top))
                 page.assert_called_once_with("resources", 1)
+
+    async def test_expanded_history_scroll_updates_only_chart_renderables(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("2", "enter")
+            row = app._selected_row()
+            self.assertIsNotNone(row)
+            assert row is not None
+            app.histories[row.uid] = [
+                MetricPoint(
+                    timestamp=float(index),
+                    gpu=float(index + 1),
+                    vram=float(index + 2),
+                    cpu=float(index + 3),
+                    ram=float(index + 4),
+                    gpu_capacity=1.0,
+                    vram_capacity=1.0,
+                    cpu_capacity=1.0,
+                    ram_capacity=1.0,
+                )
+                for index in range(4)
+            ]
+            app._render_all()
+            content = app.query_one(
+                "#resources-pane .dashboard-pane-content",
+                DashboardPaneContent,
+            )
+            static_content = app.query_one(
+                "#resources-pane", DashboardPane
+            )._pane_content
+            chart_ids = {
+                label: id(chart)
+                for label, chart in app._expanded_resource_charts.items()
+            }
+            old_values = {
+                label: list(chart.values)
+                for label, chart in app._expanded_resource_charts.items()
+            }
+            app._scroll_history(1)
+            self.assertIs(
+                app.query_one("#resources-pane", DashboardPane)._pane_content,
+                static_content,
+            )
+            self.assertIsNotNone(content)
+            self.assertEqual(
+                chart_ids,
+                {
+                    label: id(chart)
+                    for label, chart in app._expanded_resource_charts.items()
+                },
+            )
+            self.assertNotEqual(
+                old_values["GPU"],
+                app._expanded_resource_charts["GPU"].values,
+            )
 
     async def test_expanded_gpu_devices_show_device_and_process_details(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
@@ -1133,6 +1191,9 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selected.style.color.name.upper(), CYAN)
             self.assertEqual(selected.style.bgcolor.name.upper(), SELECTION)
             compact_text = "".join(segment.text for segment in segments)
+            # The removed SIMPLE_HEAD edge spacer must give the inventory
+            # enough room to render the final node at the supported minimum.
+            self.assertIn("node-d-cpu", compact_text)
             headers = ("NODE", "CPUS", "RAM (GB)", "GPUS", "GPU TYPE", "SCHED")
             positions = [compact_text.index(header) for header in headers]
             self.assertEqual(positions, sorted(positions))
@@ -1700,17 +1761,22 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(140, 27)) as pilot:
             await pilot.pause(0.5)
             self.assertFalse(app._detail_auto_hidden)
-            self.assertEqual(app.query_one("#nodes-pane").region.height, 15)
-            self.assertEqual(app.query_one("#node-pane").region.height, 7)
+            # Removing SIMPLE_HEAD's edge spacer gives the inventory one
+            # additional row of usable height without hiding any node.
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 14)
+            self.assertEqual(app.query_one("#node-pane").region.height, 8)
             await pilot.click("#node-pane", offset=(2, 2))
             self.assertEqual(app.state.active_pane, "node")
             await pilot.resize_terminal(140, 24)
             await pilot.pause()
-            self.assertTrue(app._detail_auto_hidden)
-            self.assertFalse(app.query_one("#node-pane").display)
-            self.assertEqual(app.query_one("#nodes-pane").region.height, 19)
-            self.assertEqual(app.state.active_pane, "nodes")
-            self.assertIs(app.focused, app.query_one("#nodes-pane"))
+            # At the new boundary the selected-node pane can retain its
+            # five-row minimum while all ten inventory rows remain visible.
+            self.assertFalse(app._detail_auto_hidden)
+            self.assertTrue(app.query_one("#node-pane").display)
+            self.assertEqual(app.query_one("#nodes-pane").region.height, 14)
+            self.assertEqual(app.query_one("#node-pane").region.height, 5)
+            self.assertEqual(app.state.active_pane, "node")
+            self.assertIs(app.focused, app.query_one("#node-pane"))
 
     async def test_resource_node_pane_stays_fixed_while_detail_pane_grows(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -1857,9 +1923,9 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(140, 32)) as pilot:
             await pilot.pause(0.5)
-            # The first data row follows SIMPLE_HEAD's blank top line,
-            # header, and separator.  Click the second visible row.
-            clicked = await pilot.click("#nodes-pane", offset=(5, 5))
+            # The first data row follows SIMPLE_HEAD's header and separator.
+            # Click the second visible row.
+            clicked = await pilot.click("#nodes-pane", offset=(5, 4))
             self.assertTrue(clicked)
             selected = app.state.selected_node
             self.assertEqual(selected, "node-b-a6000")
