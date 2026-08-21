@@ -11,7 +11,7 @@ cluster:
   namespace: research
   gpu_label: gpu-type
   hostname_label: kubernetes.io/hostname
-  kube_state_metrics_url: http://localhost:30080/metrics
+  kube_state_metrics_url: http://node1.yoda.hyperverge.org:30080/metrics
 runtime:
   image: registry.gitlab.com/hvlabs/teams/ai/container-images/base:ubuntu24.04-cuda13.0.2-runtime-withtools-v1.0.0
   scheduler: kai-scheduler

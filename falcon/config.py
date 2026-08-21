@@ -27,10 +27,10 @@ DEFAULT_GPU_PRESET_MAX_COUNT = 8
 INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
     "cluster": {
         "namespace": "default",
-        # This is the same local kube-state-metrics endpoint used by the
-        # original resource command. It supplies cluster request headroom on
+        # This is the same kube-state-metrics endpoint used by the original
+        # resource command. It supplies cluster request headroom on
         # installations where ordinary users cannot list Nodes.
-        "kube_state_metrics_url": "http://localhost:30080/metrics",
+        "kube_state_metrics_url": "http://node1.yoda.hyperverge.org:30080/metrics",
         "gpu_label": "gpu-type",
         "hostname_label": "kubernetes.io/hostname",
     },

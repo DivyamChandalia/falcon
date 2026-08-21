@@ -7,6 +7,7 @@ working directory and Python environment into the container, and gives you
 terminal dashboards for jobs and cluster resources.
 
 ```console
+source .venv/bin/activate  # or: conda activate <environment>
 falcon h100x2 -j experiment -- python train.py
 ```
 
@@ -25,6 +26,7 @@ falcon setup
 Open a new shell after setup, then launch and manage a named workload:
 
 ```console
+source .venv/bin/activate  # or: conda activate <environment>
 falcon h100 -j quickstart -- python train.py
 falcon dashboard
 falcon logs quickstart
@@ -310,6 +312,9 @@ pip uninstall falcon-k8s
   `export PATH="$HOME/.local/bin:$PATH"`.
 - **Kubernetes access errors** — check `kubectl config current-context` and
   verify that you can create Jobs in the namespace selected during setup.
+- **No Kubernetes context** — if `kubectl config current-context` is empty or
+  invalid, run Falcon from `node1`, not from inside a Coder session, then check
+  the context again.
 - **No matching GPU nodes** — check `presets` and `cluster.gpu_label` in
   `~/.falconrc`, then compare them with your cluster's node labels.
 - **Coder authentication expired** — run `falcon coder WORKSPACE` again;

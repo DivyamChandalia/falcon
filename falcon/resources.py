@@ -28,7 +28,7 @@ from .planning import canonical_gpu, plan_cpu_resources, plan_resources
 from .quantities import parse_cpu as _parse_cpu
 from .quantities import parse_memory_gib as _parse_memory_gib
 
-DEFAULT_KUBE_STATE_METRICS_URL = "http://localhost:30080/metrics"
+DEFAULT_KUBE_STATE_METRICS_URL = "http://node1.yoda.hyperverge.org:30080/metrics"
 
 _METRIC = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)"

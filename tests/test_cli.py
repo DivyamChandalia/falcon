@@ -1308,7 +1308,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(value["cluster"]["namespace"], "test")
             self.assertEqual(
                 value["cluster"]["kube_state_metrics_url"],
-                "http://localhost:30080/metrics",
+                "http://node1.yoda.hyperverge.org:30080/metrics",
             )
             self.assertEqual(
                 value["runtime"]["image"],
@@ -1330,7 +1330,7 @@ class SetupTests(unittest.TestCase):
             value = load_config(str(target))
         self.assertEqual(
             value["cluster"]["kube_state_metrics_url"],
-            "http://localhost:30080/metrics",
+            "http://node1.yoda.hyperverge.org:30080/metrics",
         )
 
     def test_existing_config_resolves_null_home_for_debug_shells(self) -> None:
