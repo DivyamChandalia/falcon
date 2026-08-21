@@ -8,25 +8,22 @@ nor deleted.
 
 ## Installation on node1
 
-The following block is directly copy-pastable. It installs the published
-`sse` branch into an isolated system virtual environment, downloads the exact
-unit files from the same branch, and creates the locked-down service identity:
+The following block is directly copy-pastable. It clones the published `sse`
+branch, installs that checkout into an isolated system virtual environment,
+copies its unit files, and creates the locked-down service identity:
 
 ```console
+git clone --branch sse --single-branch \
+  https://github.com/DivyamChandalia/falcon.git falcon-sse
+cd falcon-sse
 sudo python3 -m venv /opt/falcon-resource-service
 sudo /opt/falcon-resource-service/bin/python -m pip install --upgrade \
-  "git+https://github.com/DivyamChandalia/falcon.git@sse"
+  .
 getent passwd falcon-resource >/dev/null || sudo useradd --system \
   --home /var/lib/falcon-resource-service --shell /usr/sbin/nologin \
   falcon-resource
-sudo curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/DivyamChandalia/falcon/sse/deploy/falcon-resource-service.socket \
-  --output /etc/systemd/system/falcon-resource-service.socket
-sudo curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/DivyamChandalia/falcon/sse/deploy/falcon-resource-service.service \
-  --output /etc/systemd/system/falcon-resource-service.service
-sudo chmod 0644 /etc/systemd/system/falcon-resource-service.socket \
-  /etc/systemd/system/falcon-resource-service.service
+sudo install -m 0644 deploy/falcon-resource-service.{socket,service} \
+  /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/falcon-resource-service.{socket,service}
 sudo systemctl daemon-reload
 sudo systemctl enable --now falcon-resource-service.socket falcon-resource-service.service
