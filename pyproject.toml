@@ -39,6 +39,7 @@ Source = "https://github.com/DivyamChandalia/falcon"
 
 [project.scripts]
 falcon = "falcon.cli:main"
+falcon-resource-server = "falcon.resource_service:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -47,6 +48,13 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 falcon = ["skills/falcon/*.md"]
+
+[tool.setuptools.data-files]
+"share/falcon-k8s/systemd" = [
+    "deploy/falcon-resource-service.socket",
+    "deploy/falcon-resource-service.service",
+]
+"share/doc/falcon-k8s" = ["docs/resource-service.md"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.24"]

@@ -942,6 +942,8 @@ class InspectionCliTests(CliHarness):
 
     def test_resources_prefers_metrics_when_node_api_rbac_is_unavailable(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+        config["cluster"]["resource_service_url"] = None
 
         class MetricsCollector:
             def __init__(self, url):
@@ -953,7 +955,7 @@ class InspectionCliTests(CliHarness):
             def close(self):
                 pass
 
-        with patch("falcon.cli.load_config", return_value=DEFAULT_CONFIG), patch(
+        with patch("falcon.cli.load_config", return_value=config), patch(
             "falcon.cli.MetricsClusterCollector", MetricsCollector
         ), patch("falcon.cli.ClusterCollector") as kubernetes_collector:
             code, stdout, stderr = self.invoke(
@@ -969,6 +971,8 @@ class InspectionCliTests(CliHarness):
 
     def test_resources_consumer_output_is_bounded(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+        config["cluster"]["resource_service_url"] = None
 
         class MetricsCollector:
             def __init__(self, url):
@@ -980,7 +984,7 @@ class InspectionCliTests(CliHarness):
             def close(self):
                 pass
 
-        with patch("falcon.cli.load_config", return_value=DEFAULT_CONFIG), patch(
+        with patch("falcon.cli.load_config", return_value=config), patch(
             "falcon.cli.MetricsClusterCollector", MetricsCollector
         ):
             code, stdout, stderr = self.invoke(
@@ -1000,6 +1004,8 @@ class InspectionCliTests(CliHarness):
 
     def test_resources_json_omits_system_consumers_and_counts(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+        config["cluster"]["resource_service_url"] = None
 
         class MetricsCollector:
             def __init__(self, url):
@@ -1011,7 +1017,7 @@ class InspectionCliTests(CliHarness):
             def close(self):
                 pass
 
-        with patch("falcon.cli.load_config", return_value=DEFAULT_CONFIG), patch(
+        with patch("falcon.cli.load_config", return_value=config), patch(
             "falcon.cli.MetricsClusterCollector", MetricsCollector
         ):
             code, stdout, stderr = self.invoke(

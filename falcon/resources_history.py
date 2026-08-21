@@ -289,6 +289,9 @@ def ensure_history_collector(
     *,
     config_file: Optional[str] = None,
 ) -> bool:
+    cluster = config.get("cluster", {})
+    if isinstance(cluster, Mapping) and cluster.get("resource_service_url") is not None:
+        return False
     resources = config.get("resources", {})
     if isinstance(resources, Mapping) and not resources.get("history_enabled", True):
         return False
@@ -308,6 +311,30 @@ def ensure_history_collector(
         close_fds=True,
     )
     return True
+
+
+def stop_legacy_history_collector(config: Mapping[str, Any]) -> bool:
+    """Stop only this user's positively identified legacy publisher.
+
+    PID reuse is handled by checking ownership and the exact module name in
+    ``/proc`` before signalling.  Personal SQLite databases are untouched.
+    """
+
+    path = _pid_path(config)
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+        proc = Path("/proc") / str(pid)
+        if proc.stat().st_uid != os.getuid():
+            return False
+        command = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", "replace"
+        )
+        if "-m falcon.resources_history" not in command:
+            return False
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+        return False
 
 
 def run_collector(config_file: Optional[str] = None) -> int:

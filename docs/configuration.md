@@ -9,6 +9,7 @@ Core fields:
 version: 1
 cluster:
   namespace: research
+  resource_service_url: http://node1.yoda.hyperverge.org:30081
   gpu_label: gpu-type
   hostname_label: kubernetes.io/hostname
   kube_state_metrics_url: http://node1.yoda.hyperverge.org:30080/metrics
@@ -108,3 +109,10 @@ the Kubernetes request and limit. Coder credentials are read from
 Falcon configuration. If neither exists, an interactive `falcon coder` run
 guides login and saves the validated token to the Coder CLI session file with
 owner-only permissions.
+# Shared resource service
+
+`cluster.resource_service_url` defaults to
+`http://node1.yoda.hyperverge.org:30081`. Resources, Dashboard GPU
+availability, and launch planning use that authoritative service without
+falling back to direct kube-state-metrics. Set it to `null` only on deployments
+that need the legacy direct polling and per-user history collector.

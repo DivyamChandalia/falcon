@@ -11,10 +11,11 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 from .coder import CoderClient, CoderError, resolve_connection
 from .config import DEFAULT_DASHBOARD_EMA_ALPHA, save_dashboard_sort, save_hidden_panes
+from .resource_service import ResourceServiceCollector
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
 
@@ -693,6 +694,7 @@ class UsageCollector:
         streaming_gpu: bool = False, metrics_url: Optional[str] = None,
         risk_average_samples: int = RISK_AVERAGE_SAMPLES,
         collect_availability: bool = True,
+        resource_source: Optional[Any] = None,
     ):
         self.namespace = namespace
         self.thresholds = thresholds
@@ -711,6 +713,7 @@ class UsageCollector:
         self._event_cache: Dict[str, Tuple[float, List[JobEvent]]] = {}
         self.metrics_url = metrics_url
         self.collect_availability = collect_availability
+        self.resource_source = resource_source
         self.gpu_availability: Dict[str, Tuple[int, int]] = {}
         self._availability_at = 0.0
         self.last_error = ""
@@ -723,6 +726,8 @@ class UsageCollector:
     def close(self) -> None:
         if self._gpu_sampler:
             self._gpu_sampler.close()
+        if self.resource_source is not None:
+            self.resource_source.close()
 
     def _refresh_gpu_availability(self, now: float) -> None:
         if now - self._availability_at < GPU_AVAILABILITY_SECONDS:
@@ -733,6 +738,17 @@ class UsageCollector:
         # Existing values remain the last-known-good display until replacement
         # data has been collected.
         self._availability_at = now
+        if self.resource_source is not None:
+            snapshot = self.resource_source.collect()
+            availability = {
+                item.model.lower(): (item.request_headroom, item.allocatable)
+                for item in snapshot.gpu_availability.values()
+            }
+            if availability or not snapshot.stale:
+                self.gpu_availability = availability
+            if snapshot.stale:
+                self.last_error = snapshot.error or "resource service snapshot is stale"
+            return
         if self.metrics_url:
             try:
                 nodes = fetch_nodes(self.metrics_url, timeout=5)
@@ -1382,6 +1398,8 @@ def run_dashboard(
     demo_state: Optional[str] = None,
     color_mode: Optional[str] = None,
 ) -> None:
+    from .resources_history import stop_legacy_history_collector
+
     namespace = namespace or config["cluster"]["namespace"]
     thresholds = {
         preset["gpu_type"].lower(): float(preset.get("minimum_utilization", 30))
@@ -1396,7 +1414,19 @@ def run_dashboard(
             job_filter=job,
             ema_warmup_samples=EMA_WARMUP_SAMPLES,
             streaming_gpu=True,
-            metrics_url=config.get("cluster", {}).get("kube_state_metrics_url"),
+            metrics_url=(
+                config.get("cluster", {}).get("kube_state_metrics_url")
+                if config.get("cluster", {}).get("resource_service_url") is None
+                else None
+            ),
+            resource_source=(
+                ResourceServiceCollector(
+                    str(config["cluster"]["resource_service_url"]),
+                    on_connect=lambda: stop_legacy_history_collector(config),
+                )
+                if config.get("cluster", {}).get("resource_service_url") is not None
+                else None
+            ),
             risk_average_samples=RISK_AVERAGE_SAMPLES,
         )
     )

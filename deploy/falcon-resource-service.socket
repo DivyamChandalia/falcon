@@ -1,0 +1,13 @@
+[Unit]
+Description=Falcon resource service socket
+Documentation=https://github.com/DivyamChandalia/falcon/blob/main/docs/resource-service.md
+
+[Socket]
+ListenStream=192.168.1.117:30081
+Accept=no
+NoDelay=true
+KeepAlive=true
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

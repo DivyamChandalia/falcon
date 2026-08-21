@@ -68,8 +68,18 @@ from .launcher import (
 from .models import GPURequest, JobRequest, NodeResources
 from .output import dumps, render_table
 from .planning import canonical_gpu, plan_cpu_resources, plan_resources
+from .resource_service import (
+    ResourceServiceClient,
+    ResourceServiceCollector,
+    ResourceServiceError,
+    snapshot_nodes,
+)
 from .resources import MetricsClusterCollector, fetch_nodes
-from .resources_history import ensure_history_collector, history_store
+from .resources_history import (
+    ensure_history_collector,
+    history_store,
+    stop_legacy_history_collector,
+)
 from .resources_ui import FalconResourcesApp
 from .theme import COLOR_MODES
 
@@ -546,6 +556,13 @@ def _planning_nodes(
     config: Mapping[str, Any],
     client: KubernetesClient,
 ) -> List[NodeResources]:
+    service_url = config.get("cluster", {}).get("resource_service_url")
+    if service_url is not None:
+        # The persisted last service snapshot is intentionally usable without
+        # an age limit. Kubernetes remains the final scheduling authority.
+        snapshot = ResourceServiceClient(str(service_url)).snapshot()
+        stop_legacy_history_collector(config)
+        return snapshot_nodes(snapshot)
     metrics_url = config.get("cluster", {}).get("kube_state_metrics_url")
     if metrics_url:
         try:
@@ -1609,6 +1626,17 @@ def _resource_snapshot(
     if args.demo:
         collector = DemoCollector(args.demo)
         return collector, collector.collect()
+    service_url = config.get("cluster", {}).get("resource_service_url")
+    if service_url is not None:
+        if args.output == "human" and sys.stdout.isatty():
+            service_collector = ResourceServiceCollector(str(service_url))
+            snapshot = service_collector.collect()
+            stop_legacy_history_collector(config)
+            return service_collector, snapshot
+        service_client = ResourceServiceClient(str(service_url))
+        snapshot = service_client.snapshot()
+        stop_legacy_history_collector(config)
+        return service_client, snapshot
     metrics_url = config.get("cluster", {}).get("kube_state_metrics_url")
     if metrics_url:
         metrics_collector = MetricsClusterCollector(str(metrics_url))
@@ -1646,16 +1674,26 @@ def _resources_command(
             config.get("resources", {}).get("history_hours", 24)
         )
         if not args.demo:
-            store = history_store(config)
-            try:
-                ensure_history_collector(config, config_file=config_file)
-            except OSError as exc:
-                history_warning = f"Could not start Resources history collector: {exc}"
-            def load_history():
-                return store.load(
-                    node_filter=args.node or "",
-                    gpu_filter=args.gpu or "",
-                )
+            service_url = config.get("cluster", {}).get("resource_service_url")
+            if isinstance(collector, ResourceServiceCollector) and service_url is not None:
+                service_client = ResourceServiceClient(str(service_url))
+
+                def load_history():
+                    return service_client.history(
+                        node=args.node or "", gpu=args.gpu or ""
+                    )
+            else:
+                store = history_store(config)
+                try:
+                    ensure_history_collector(config, config_file=config_file)
+                except OSError as exc:
+                    history_warning = f"Could not start Resources history collector: {exc}"
+
+                def load_history():
+                    return store.load(
+                        node_filter=args.node or "",
+                        gpu_filter=args.gpu or "",
+                    )
 
             loader = load_history
         app = FalconResourcesApp(
@@ -1931,6 +1969,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except CoderError as exc:
         print(f"falcon: {exc}", file=sys.stderr)
         return EXIT_CODER
+    except ResourceServiceError as exc:
+        print(f"falcon: {exc}", file=sys.stderr)
+        return EXIT_KUBERNETES
     except CliError as exc:
         print(f"falcon: {exc}", file=sys.stderr)
         return exc.code

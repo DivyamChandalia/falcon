@@ -27,6 +27,9 @@ DEFAULT_GPU_PRESET_MAX_COUNT = 8
 INFRASTRUCTURE_DEFAULTS: Dict[str, Any] = {
     "cluster": {
         "namespace": "default",
+        # Set to null to retain the legacy per-client kube-state-metrics and
+        # local allocation-history behavior on other deployments.
+        "resource_service_url": "http://node1.yoda.hyperverge.org:30081",
         # This is the same kube-state-metrics endpoint used by the original
         # resource command. It supplies cluster request headroom on
         # installations where ordinary users cannot list Nodes.
@@ -238,7 +241,7 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         result["cluster"] = {
             key: value for key, value in raw["cluster"].items()
             if key in {
-                "namespace", "kube_state_metrics_url", "gpu_label",
+                "namespace", "resource_service_url", "kube_state_metrics_url", "gpu_label",
                 "hostname_label",
             }
         }
@@ -310,6 +313,18 @@ def validate_config(config: Dict[str, Any]) -> None:
     runtime = config.get("runtime")
     if not isinstance(cluster, dict) or not cluster.get("namespace"):
         raise ValueError("cluster.namespace is required")
+    service_url = cluster.get("resource_service_url")
+    if service_url is not None:
+        parsed_service_url = urlsplit(str(service_url))
+        if (
+            not isinstance(service_url, str)
+            or parsed_service_url.scheme not in {"http", "https"}
+            or not parsed_service_url.netloc
+            or parsed_service_url.path not in {"", "/"}
+            or parsed_service_url.query
+            or parsed_service_url.fragment
+        ):
+            raise ValueError("cluster.resource_service_url must be an http URL or null")
     if not isinstance(runtime, dict) or not runtime.get("image"):
         raise ValueError("runtime.image is required")
     if not isinstance(runtime.get("volumes", []), list) or not all(

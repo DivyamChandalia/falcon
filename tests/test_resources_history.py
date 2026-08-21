@@ -71,6 +71,7 @@ class ResourceHistoryStoreTests(unittest.TestCase):
 class ResourceHistoryCollectorTests(unittest.TestCase):
     def test_ensure_starts_a_detached_collector(self) -> None:
         config = json.loads(json.dumps(DEFAULT_CONFIG))
+        config["cluster"]["resource_service_url"] = None
         with tempfile.TemporaryDirectory() as temporary, patch(
             "falcon.resources_history._state_root", return_value=Path(temporary)
         ), patch("falcon.resources_history.subprocess.Popen") as popen:
