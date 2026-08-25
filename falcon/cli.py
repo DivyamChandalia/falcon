@@ -255,9 +255,14 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     _namespace(event_parser)
     _output(event_parser)
 
-    log_parser = sub.add_parser("logs", help="Read bounded Job logs")
+    log_parser = sub.add_parser("logs", help="Read complete Job logs")
     log_parser.add_argument("job", nargs="?")
-    log_parser.add_argument("--tail", type=int, default=100)
+    log_parser.add_argument(
+        "--tail",
+        type=int,
+        default=-1,
+        help="Number of lines from the end (-1 means all lines; default: all)",
+    )
     log_follow = log_parser.add_mutually_exclusive_group()
     log_follow.add_argument(
         "--follow",
@@ -1039,8 +1044,8 @@ def _logs_command(
     args: argparse.Namespace,
     config: Mapping[str, Any],
 ) -> int:
-    if not 0 <= args.tail <= 100_000:
-        raise CliError("--tail must be between 0 and 100000")
+    if args.tail < -1 or args.tail > 100_000:
+        raise CliError("--tail must be -1 (all lines) or between 0 and 100000")
     if args.follow is True and args.output == "json":
         raise CliError("--follow cannot be combined with --output json")
     follow = (

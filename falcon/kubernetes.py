@@ -453,12 +453,12 @@ class KubernetesClient:
         job_name: str,
         *,
         namespace: Optional[str] = None,
-        tail: int = 100,
+        tail: int = -1,
         follow: bool = False,
         container: Optional[str] = None,
     ) -> ProcessResult:
-        if tail < 0 or tail > 100_000:
-            raise ValueError("log tail must be between 0 and 100000")
+        if tail < -1 or tail > 100_000:
+            raise ValueError("log tail must be -1 (all lines) or between 0 and 100000")
         args = [
             "logs", f"job.batch/{job_name}",
             "--namespace", namespace or self.namespace,

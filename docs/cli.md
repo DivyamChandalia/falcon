@@ -50,14 +50,16 @@ deadline.
 falcon jobs [--limit 50] [--status STATUS] [--gpu MODEL] [--node NODE]
 falcon get JOB
 falcon events JOB [--limit 50] [-f|--follow]
-falcon logs [JOB] [--tail 100] [--follow|--no-follow] [--output human|json]
+falcon logs [JOB] [--tail -1] [--follow|--no-follow] [--output human|json]
 falcon metrics JOB [--interval 10]
 falcon top [JOB]
 ```
 
 `jobs`, `get`, `events`, and logs support `--output human|json`. Human `logs`
 follows and stays attached by default;
-`--no-follow` prints one bounded tail. JSON logs are always bounded and exit.
+`--no-follow` prints the complete existing log and exits. Both human and JSON
+logs show the complete existing output by default; pass `--tail N` to request
+a bounded tail (`--tail -1` means all lines).
 `events -f` polls for new or updated Job/Pod events until interrupted.
 `get` deliberately excludes events; use the dedicated `events` command.
 `metrics` always returns JSON, observes one Job for the requested duration, and returns

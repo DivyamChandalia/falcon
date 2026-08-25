@@ -820,11 +820,13 @@ class InspectionCliTests(CliHarness):
             )
         self.assertEqual((code, stdout, stderr), (0, "", ""))
         self.assertTrue(calls[0]["follow"])
+        self.assertEqual(calls[0]["tail"], -1)
         self.assertEqual(
             (bounded_code, bounded_stdout, bounded_stderr),
             (0, "one-shot\n", ""),
         )
         self.assertFalse(calls[1]["follow"])
+        self.assertEqual(calls[1]["tail"], -1)
 
     def test_follow_cannot_emit_unbounded_json(self) -> None:
         code, _, stderr = self.invoke(

@@ -71,7 +71,7 @@ def logs(
     namespace: str,
     name: Optional[str],
     *,
-    tail: int = 100,
+    tail: int = -1,
     follow: bool = False,
     container: Optional[str] = None,
 ) -> int:
