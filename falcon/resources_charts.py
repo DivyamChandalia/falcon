@@ -191,6 +191,25 @@ def allocation_colors(values: Iterable[tuple[str, float]]) -> dict[str, str]:
     }
 
 
+def _history_series_order(
+    names: Iterable[str], latest_values: Mapping[str, float]
+) -> list[str]:
+    """Return history series from the smallest to the largest allocation.
+
+    Namespace paths are composited in draw order.  Drawing the lower current
+    allocation first lets the larger allocation remain visible when paths
+    share a cell.  ``natural_name_key`` makes equal values deterministic.
+    """
+
+    return sorted(
+        names,
+        key=lambda name: (
+            float(latest_values.get(name, 0.0)),
+            natural_name_key(name),
+        ),
+    )
+
+
 def _number(value: float, *, unit: str = "") -> str:
     if math.isclose(value, round(value), abs_tol=0.05):
         label = str(int(round(value)))
@@ -489,9 +508,17 @@ def render_gpu_history(
         )
 
     point_values = [point.values_for(basis) for point in sampled]
+    # Keep the legend's largest-first presentation, but composite graph paths
+    # from smallest to largest so higher allocation remains on top.
+    plot_names = _history_series_order(names, latest_values)
     series: list[tuple[str, list[float], str, int]] = [
-        (name, [values.get(name, 0) for values in point_values], colors[name], 1)
-        for name in names
+        (
+            name,
+            [values.get(name, 0) for values in point_values],
+            colors[name],
+            1,
+        )
+        for name in plot_names
     ]
     series.append(
         (

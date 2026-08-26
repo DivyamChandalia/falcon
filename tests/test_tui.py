@@ -1247,14 +1247,48 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                     app.console.options.update(width=136, height=30),
                 )
             )
-            self.assertLess(inspector_text.index("CPU capacity"), inspector_text.index("RAM capacity"))
-            self.assertLess(inspector_text.index("RAM capacity"), inspector_text.index("GPU model"))
+            self.assertLess(
+                inspector_text.index("CPU capacity"),
+                inspector_text.index("RAM capacity"),
+            )
+            self.assertLess(
+                inspector_text.index("RAM capacity"),
+                inspector_text.index("GPU model"),
+            )
             self.assertIn("CPU free / alloc", inspector_text)
             self.assertIn("RAM free / alloc", inspector_text)
             self.assertIn("GPU free / alloc", inspector_text)
             self.assertIn("27.5 / 64", inspector_text)
             self.assertIn("335G / 480G", inspector_text)
             self.assertNotIn("CPU used / alloc", inspector_text)
+
+    async def test_nodes_overview_collapses_left_metrics_before_gpu_summary(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(100, 22)) as pilot:
+            await pilot.pause(0.5)
+            base = next(node for node in app.nodes if node.gpu_model == "H100")
+
+            def model_node(model: str, name: str):
+                return replace(
+                    base,
+                    name=name,
+                    capacity=replace(base.capacity, gpu_model=model),
+                    allocatable=replace(base.allocatable, gpu_model=model),
+                    requested=replace(base.requested, gpu_model=model),
+                )
+
+            app.nodes = [
+                model_node("2080Ti 16GB", "node-2080ti"),
+                model_node("A6000 48GB", "node-a6000"),
+                model_node("PRO6000 96GB", "node-pro6000"),
+                model_node("H100 80GB HBM3", "node-h100"),
+            ]
+            app._render_overview()
+            overview = app.query_one("#cluster-overview").render().plain
+
+            self.assertIn("H100 80GB HBM3", overview)
+            self.assertNotIn("CPU", overview)
+            self.assertNotIn("MEM", overview)
 
     async def test_two_views_wrap_restore_persist_and_support_clicks(self) -> None:
         saved = []
@@ -1722,6 +1756,77 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.selected_node, app.nodes[-1].name)
             await pilot.press("home")
             self.assertEqual(app.state.selected_node, app.nodes[0].name)
+
+    async def test_resource_mouse_press_without_release_does_not_capture_pointer(self) -> None:
+        """A dropped terminal MouseUp must not make the TUI stop responding."""
+
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.5)
+            nodes = app.query_one("#nodes-pane", ResourcesPane)
+
+            # Some browser/tmux terminals can lose the release while an app
+            # focus transition is in flight.  Resources must not enter
+            # Textual's drag-selection state in response to that press.
+            self.assertTrue(await pilot.mouse_down("#nodes-pane", offset=(5, 4)))
+            await pilot.pause()
+            self.assertFalse(app.screen._selecting)
+            self.assertIs(app.focused, nodes)
+
+            clicked = await pilot.click("#node-pane", offset=(2, 2))
+            self.assertTrue(clicked)
+            self.assertIs(app.focused, app.query_one("#node-pane"))
+            self.assertEqual(app.state.active_pane, "node")
+
+    async def test_resource_view_selector_ignores_missing_mouse_offset(self) -> None:
+        """A resize race must not crash the TUI while hit-testing the tabs."""
+
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+
+        class MissingOffset:
+            @staticmethod
+            def get_content_offset(widget):
+                del widget
+                return None
+
+        async with app.run_test(size=(140, 40)):
+            selector = app.query_one("#resources-views")
+            selector.on_mouse_down(MissingOffset())
+            selector.on_click(MissingOffset())
+            self.assertIsNone(app._exception)
+
+    async def test_resource_reattach_reasserts_cursor_and_mouse_modes(self) -> None:
+        """tmux reconnects must leave the terminal cursor hidden and clickable."""
+
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+
+        class Driver:
+            is_headless = False
+            _mouse = True
+
+            def __init__(self):
+                self.writes = []
+                self.mouse_enabled = 0
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+            def _enable_mouse_support(self):
+                self.mouse_enabled += 1
+
+        async with app.run_test(size=(140, 40)):
+            original = app._driver
+            driver = Driver()
+            app._driver = driver
+            try:
+                app._restore_terminal_modes()
+            finally:
+                app._driver = original
+            self.assertIn("\x1b[?25l\x1b[?1004h", driver.writes)
+            self.assertEqual(driver.mouse_enabled, 1)
 
     async def test_resource_bottom_panel_hides_when_nodes_would_overflow(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")

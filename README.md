@@ -338,7 +338,6 @@ logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
 
 ## TODO
 
-- Fix the intermittent issue where `falcon resources` breaks.
 - Port the Falcon agent interface to an MCP server for long-running goal loops.
 
 Falcon is licensed under Apache-2.0. See [NOTICE](NOTICE) for attribution.

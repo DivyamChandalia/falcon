@@ -201,6 +201,15 @@ class ResourcesViewState:
 class ResourcesChrome(Static):
     """Non-scrollable Resources chrome that consumes terminal wheel input."""
 
+    # Resources is an interactive monitor, not a text editor.  Letting
+    # Textual start its built-in drag-to-select state on every Static widget
+    # means a terminal that loses the matching MouseUp can leave the screen
+    # in a captured-pointer state.  Subsequent presses then look like a dead
+    # TUI (and some terminals show their text cursor at the last rendered
+    # position).  Keep selection available to the shell after the app exits,
+    # but never start it inside this screen.
+    ALLOW_SELECT = False
+
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.prevent_default()
         event.stop()
@@ -212,6 +221,7 @@ class ResourcesChrome(Static):
 
 class ResourcesPane(Static):
     can_focus = True
+    ALLOW_SELECT = False
 
     def _activate(self) -> None:
         pane = self.id.replace("-pane", "") if self.id else "nodes"
@@ -232,6 +242,12 @@ class ResourcesPane(Static):
         # Activate on the first forwarded mouse event, rather than waiting for
         # mouse-up to synthesize a Click after terminal focus-in.
         self._activate()
+        # Do not depend on Screen's implicit focus-on-click path.  In
+        # browser/tmux terminals a press can be forwarded after an
+        # AppFocus transition, or its release can be dropped.  Focusing here
+        # makes the press authoritative and keeps refresh/layout callbacks
+        # from restoring the previous pane.
+        self.app.set_focus(self, scroll_visible=False)
         # Some tmux/iTerm combinations deliver the press immediately but
         # delay or omit the corresponding release while the pane is gaining
         # focus. Apply the same selection action on mouse-down so a click is
@@ -299,13 +315,16 @@ class ResourcesViewSelector(ResourcesChrome):
     def on_mouse_down(self, event: events.MouseDown) -> None:
         callback = getattr(self.app, "view_clicked", None)
         offset_for = getattr(event, "get_content_offset", None)
-        if callback and callable(offset_for):
-            callback(offset_for(self).x)
+        offset = offset_for(self) if callable(offset_for) else None
+        if callback and offset is not None:
+            callback(offset.x)
 
     def on_click(self, event: events.Click) -> None:
         callback = getattr(self.app, "view_clicked", None)
-        if callback:
-            callback(event.get_content_offset(self).x)
+        offset_for = getattr(event, "get_content_offset", None)
+        offset = offset_for(self) if callable(offset_for) else None
+        if callback and offset is not None:
+            callback(offset.x)
 
 
 CSS = f"""
@@ -471,6 +490,7 @@ class FalconResourcesApp(App[None]):
         yield ResourcesChrome(id="resources-footer")
 
     def on_mount(self) -> None:
+        self._restore_terminal_modes()
         self._set_titles()
         self._apply_layout(recompute_detail=True)
         self._request_update(force=True)
@@ -558,8 +578,43 @@ class FalconResourcesApp(App[None]):
         # leaves a one-row virtual overflow until the polling fallback runs.
         # Defer the layout pass until the next refresh, when ``self.size`` and
         # the widget regions agree.
+        self._restore_terminal_modes()
         self._last_terminal_size = (-1, -1)
         self.call_after_refresh(self._apply_resized_layout)
+
+    def _restore_terminal_modes(self) -> None:
+        """Re-assert modes that tmux may reset while reattaching a client.
+
+        Textual enables these once when the driver starts.  A tmux server or
+        terminal emulator can restore the pty with the cursor visible and
+        mouse reporting disabled after a detach/reattach, while the Python
+        process continues running.  Reasserting the modes is safe for normal
+        resizes and keeps the cursor from appearing at the compositor's
+        default origin (top-left).
+        """
+
+        driver = getattr(self, "_driver", None)
+        write = getattr(driver, "write", None)
+        if not callable(write) or getattr(driver, "is_headless", False):
+            return
+        try:
+            # Hide the terminal cursor and continue receiving focus events.
+            write("\x1b[?25l\x1b[?1004h")
+            if getattr(driver, "_mouse", True):
+                enable_mouse = getattr(driver, "_enable_mouse_support", None)
+                if callable(enable_mouse):
+                    enable_mouse()
+                else:
+                    # Keep this compatible with Textual drivers that don't
+                    # expose LinuxDriver's private helper.
+                    write("\x1b[?1000h\x1b[?1003h\x1b[?1015h\x1b[?1006h")
+            flush = getattr(driver, "flush", None)
+            if callable(flush):
+                flush()
+        except (AssertionError, OSError, RuntimeError):
+            # During shutdown the writer thread may already be closed.  Mode
+            # recovery is best-effort and must never terminate the TUI.
+            return
 
     def _apply_resized_layout(self) -> None:
         if not self.is_mounted:
@@ -591,6 +646,7 @@ class FalconResourcesApp(App[None]):
         current = (self.size.width, self.size.height)
         if current == self._last_terminal_size:
             return
+        self._restore_terminal_modes()
         self._last_terminal_size = current
         try:
             self.screen.scroll_to(y=0, animate=False)
@@ -625,6 +681,7 @@ class FalconResourcesApp(App[None]):
         if not self.is_mounted:
             return
         try:
+            self._restore_terminal_modes()
             if focused:
                 # A terminal reattach can restore the Screen with the
                 # previous scroll offset even though Resources has no root
@@ -1361,16 +1418,6 @@ class FalconResourcesApp(App[None]):
             stale=self.snapshot.stale,
             error=self.snapshot.error,
         )
-        left = Text(no_wrap=True, overflow="ellipsis")
-        left.append(
-            f"{snapshot.schedulable_nodes}/{snapshot.total_nodes} NODES  ",
-            style=f"bold {GREEN if snapshot.schedulable_nodes else YELLOW}",
-        )
-        if self.size.width >= 100:
-            left.append(
-                f"{snapshot.running_jobs} RUNNING  ",
-                style=f"bold {GREEN}",
-            )
         headroom = snapshot.request_headroom
         cpu_color = _resource_headroom_color(
             headroom.cpu_cores,
@@ -1380,24 +1427,6 @@ class FalconResourcesApp(App[None]):
             headroom.memory_bytes,
             snapshot.allocatable.memory_bytes,
         )
-        if self.size.width >= 100:
-            left.append("CPU ", style=f"bold {GRAY}")
-            left.append(
-                f"{_short_cpu(headroom.cpu_cores)}/"
-                f"{_short_cpu(snapshot.allocatable.cpu_cores)}  ",
-                style=f"bold {cpu_color}",
-            )
-        # Keep scheduler memory headroom visible even at the 80-column
-        # minimum. The compact Nodes layout still has room for a short
-        # ``free/allocatable`` value, and hiding it makes the top summary
-        # inconsistent with the per-node RAM column.
-        left.append("MEM ", style=f"bold {GRAY}")
-        left.append(
-            f"{_short_memory(headroom.memory_bytes)}/"
-            f"{_short_memory(snapshot.allocatable.memory_bytes)}",
-            style=f"bold {memory_color}",
-        )
-
         right = Text(
             "GPU AVAILABLE  " if self.size.width >= 130 else "",
             style=f"bold {GRAY}",
@@ -1418,7 +1447,50 @@ class FalconResourcesApp(App[None]):
             )
         if not availability:
             right.append("GPU —", style=f"bold {MUTED}")
-        gap = max(2, self.size.width - len(left.plain) - len(right.plain) - 4)
+
+        def render_left(metrics: set[str]) -> Text:
+            result = Text(no_wrap=True, overflow="ellipsis")
+            result.append(
+                f"{snapshot.schedulable_nodes}/{snapshot.total_nodes} NODES  ",
+                style=f"bold {GREEN if snapshot.schedulable_nodes else YELLOW}",
+            )
+            if "running" in metrics:
+                result.append(
+                    f"{snapshot.running_jobs} RUNNING  ",
+                    style=f"bold {GREEN}",
+                )
+            if "cpu" in metrics:
+                result.append("CPU ", style=f"bold {GRAY}")
+                result.append(
+                    f"{_short_cpu(headroom.cpu_cores)}/"
+                    f"{_short_cpu(snapshot.allocatable.cpu_cores)}  ",
+                    style=f"bold {cpu_color}",
+                )
+            if "memory" in metrics:
+                result.append("MEM ", style=f"bold {GRAY}")
+                result.append(
+                    f"{_short_memory(headroom.memory_bytes)}/"
+                    f"{_short_memory(snapshot.allocatable.memory_bytes)}",
+                    style=f"bold {memory_color}",
+                )
+            return result
+
+        # GPU availability is rendered at the right edge, so protect it from
+        # being cropped by the summary metrics on the left. Remove the longer
+        # metrics first as the terminal narrows; keep the existing compact
+        # 80-column summary whenever the GPU list still fits beside it.
+        metrics = {"memory"}
+        if self.size.width >= 100:
+            metrics.update(("running", "cpu"))
+        left = render_left(metrics)
+        content_width = max(1, self.size.width - 4)
+        for metric in ("cpu", "running", "memory"):
+            if len(left.plain) + len(right.plain) + 2 <= content_width:
+                break
+            if metric in metrics:
+                metrics.remove(metric)
+                left = render_left(metrics)
+        gap = max(2, content_width - len(left.plain) - len(right.plain))
         left.append(" " * gap)
         left.append_text(right)
         self.query_one("#cluster-overview", Static).update(left)

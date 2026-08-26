@@ -5,6 +5,7 @@ import unittest
 from falcon.resources_charts import (
     CHART_COLORS,
     GPUHistoryPoint,
+    _history_series_order,
     _pie_dimensions,
     _series_colors,
     allocation_colors,
@@ -69,6 +70,41 @@ class GPUHistoryRendererTests(unittest.TestCase):
             "1 persisted sample",
             render_gpu_history(self.points(1), width=50, height=8).plain,
         )
+
+    def test_history_series_draw_from_lowest_to_highest_allocation(self) -> None:
+        self.assertEqual(
+            _history_series_order(
+                ("high", "low", "middle"),
+                {"high": 8.0, "low": 1.0, "middle": 4.0},
+            ),
+            ["low", "middle", "high"],
+        )
+
+        points = [
+            GPUHistoryPoint.from_mapping(
+                1_700_000_000 + index * 60,
+                {"high": 1 if index == 0 else 2, "low": 1},
+            )
+            for index in range(3)
+        ]
+        chart = render_gpu_history(
+            points,
+            width=50,
+            height=8,
+            show_legend=False,
+            colors={"high": "blue", "low": "red"},
+        )
+        # Both paths overlap at the first sample.  The high-allocation path is
+        # drawn last, so the shared segment retains its colour.
+        overlap = next(line for line in chart.split("\n") if "┴" in line.plain)
+        transition = overlap.plain.index("┴")
+        styles = {
+            str(span.style)
+            for span in overlap.spans
+            if span.start < transition
+            if str(span.style) in {"blue", "red"}
+        }
+        self.assertEqual(styles, {"blue"})
 
     def test_narrow_and_wide_step_charts_fit_and_label_series(self) -> None:
         for width, height in ((24, 6), (80, 15), (160, 24)):
