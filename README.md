@@ -1,4 +1,6 @@
-# Falcon
+<h1 align="center">
+  <img src="./assets/falcon-logo.png" alt="" width="64" height="64"> Falcon
+</h1>
 
 Launch and monitor GPU workloads on Kubernetes without writing Job YAML.
 
