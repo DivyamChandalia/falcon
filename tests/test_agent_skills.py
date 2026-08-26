@@ -180,6 +180,30 @@ class AgentSkillTests(unittest.TestCase):
             )
             self.assertTrue((installed.path / METADATA_FILE).exists())
 
+    def test_forced_install_refreshes_modified_managed_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed = install_skill("opencode", home=directory)
+            skill_path = installed.path / "SKILL.md"
+            skill_path.write_text("my custom Falcon instructions\n", encoding="utf-8")
+
+            refreshed = install_skill("opencode", home=directory, force=True)
+            packaged = resources.files("falcon.skills").joinpath("falcon/SKILL.md")
+
+            self.assertEqual(refreshed.status, "updated")
+            self.assertEqual(skill_path.read_bytes(), packaged.read_bytes())
+
+    def test_forced_install_still_preserves_unmanaged_skill_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = agent_skill_path("codex", home=directory)
+            target.mkdir(parents=True)
+            skill = target / "SKILL.md"
+            skill.write_text("user-owned\n", encoding="utf-8")
+
+            forced = install_skill("codex", home=directory, force=True)
+
+            self.assertEqual(forced.status, "conflict")
+            self.assertEqual(skill.read_text(encoding="utf-8"), "user-owned\n")
+
     def test_unmanaged_existing_skill_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             target = agent_skill_path("codex", home=directory)

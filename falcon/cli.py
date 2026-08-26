@@ -10,6 +10,7 @@ import shlex
 import sys
 import time
 from dataclasses import replace
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -1855,7 +1856,7 @@ def _skills_setup(args: argparse.Namespace) -> int:
     if args.uninstall_skills:
         operations = uninstall_skills(args.uninstall_skills)
     elif args.install_skills:
-        operations = install_skills(args.install_skills)
+        operations = install_skills(args.install_skills, force=True)
     elif not args.skip_skills and not args.non_interactive:
         detected = detect_agents()
         if detected:
@@ -1870,7 +1871,7 @@ def _skills_setup(args: argparse.Namespace) -> int:
                 f"[{default}] (comma-separated, 'none' to skip): "
             ).strip()
             if response.lower() not in {"none", "no", "skip"}:
-                operations = install_skills(response or detected)
+                operations = install_skills(response or detected, force=True)
     conflict = False
     for operation in operations:
         print(f"Skill {operation.agent}: {operation.status} ({operation.path})")
@@ -1878,6 +1879,40 @@ def _skills_setup(args: argparse.Namespace) -> int:
             print(f"  {operation.detail}", file=sys.stderr)
         conflict = conflict or operation.status in {"conflict", "unmanaged"}
     return EXIT_CONFLICT if conflict else 0
+
+
+def _setup_ascii_art() -> Optional[str]:
+    """Load the setup welcome art from the source tree or installed package."""
+
+    candidates = [Path(__file__).resolve().parents[1] / "assets" / "ascii.txt"]
+    try:
+        installed = metadata.distribution("falcon-k8s")
+    except metadata.PackageNotFoundError:
+        installed = None
+    if installed is not None:
+        candidates.append(
+            Path(installed.locate_file("share/falcon-k8s/assets/ascii.txt"))
+        )
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8").rstrip()
+        except OSError:
+            continue
+    return None
+
+
+def _print_setup_welcome() -> None:
+    art = _setup_ascii_art()
+    if art:
+        print()
+        print(art)
+    print()
+    print("Millennium Falcon systems are online.")
+    print(
+        "You're all set — welcome aboard, pilot. "
+        "Let's make the Kessel Run in less than 12 parsecs!"
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1956,7 +1991,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Config: {target}")
             if rc:
                 print(f"Completion: {rc}")
-            return _skills_setup(args)
+            skills_code = _skills_setup(args)
+            _print_setup_welcome()
+            return skills_code
         if args.command_name == "completion":
             shell = args.shell or detect_shell()[0]
             print(shell_script(shell, config=config), end="")

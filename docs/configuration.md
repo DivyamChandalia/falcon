@@ -2,6 +2,11 @@
 
 Falcon reads YAML from `~/.falconrc`, `FALCON_CONFIG`, or `--config PATH`.
 `falcon setup` creates version 1 configuration atomically with mode `0600`.
+When rerun interactively, it uses the current `.falconrc` values as the
+prompt defaults: press Enter to keep a value or type a replacement to edit
+it. An all-empty rerun leaves the file untouched. Use
+`falcon setup --non-interactive` to validate an existing configuration
+without prompting or editing it.
 
 Core fields:
 

@@ -54,6 +54,7 @@ falcon = ["skills/falcon/*.md"]
     "deploy/falcon-resource-service.socket",
     "deploy/falcon-resource-service.service",
 ]
+"share/falcon-k8s/assets" = ["assets/ascii.txt"]
 "share/doc/falcon-k8s" = ["docs/resource-service.md"]
 
 [project.optional-dependencies]

@@ -239,9 +239,17 @@ def _conflict(agent: str, path: Path, detail: str) -> SkillOperation:
 
 
 def install_skill(
-    agent: str, *, home: Optional[Union[str, os.PathLike[str]]] = None
+    agent: str,
+    *,
+    home: Optional[Union[str, os.PathLike[str]]] = None,
+    force: bool = False,
 ) -> SkillOperation:
-    """Install or safely update Falcon's skill for one coding agent."""
+    """Install or update Falcon's skill for one coding agent.
+
+    By default, modified Falcon-owned files are protected.  ``force`` is used
+    by ``falcon setup`` to refresh that owned copy; unmanaged directories and
+    symlinks remain conflicts so unrelated user content is not overwritten.
+    """
 
     target = agent_skill_path(agent, home=home)
     normalized_agent = _normalize_agents([agent])[0]
@@ -262,7 +270,8 @@ def install_skill(
     current_metadata, error = _read_metadata(target, normalized_agent)
     if current_metadata is None:
         return _conflict(normalized_agent, target, error)
-    if not _managed_files_unchanged(target, current_metadata):
+    managed_unchanged = _managed_files_unchanged(target, current_metadata)
+    if not force and not managed_unchanged:
         return _conflict(
             normalized_agent,
             target,
@@ -273,7 +282,7 @@ def install_skill(
     assert isinstance(current_hashes, dict)
     for new_name in set(files) - set(current_hashes):
         untracked = target / new_name
-        if untracked.exists() or untracked.is_symlink():
+        if not force and (untracked.exists() or untracked.is_symlink()):
             return _conflict(
                 normalized_agent,
                 target,
@@ -283,13 +292,17 @@ def install_skill(
         current_hashes == desired_metadata["files"]
         and current_metadata.get("bundle_version") == SKILL_BUNDLE_VERSION
         and current_metadata.get("source_hash") == desired_metadata["source_hash"]
+        and managed_unchanged
     ):
         return SkillOperation(normalized_agent, target, "unchanged")
 
     for name, content in files.items():
         _atomic_write(target / name, content)
     for obsolete_name in set(current_hashes) - set(files):
-        (target / str(obsolete_name)).unlink()
+        try:
+            (target / str(obsolete_name)).unlink()
+        except FileNotFoundError:
+            pass
     _write_metadata(target, desired_metadata)
     return SkillOperation(normalized_agent, target, "updated")
 
@@ -299,15 +312,16 @@ def install_skills(
     *,
     home: Optional[Union[str, os.PathLike[str]]] = None,
     which: Callable[[str], Optional[str]] = shutil.which,
+    force: bool = False,
 ) -> List[SkillOperation]:
-    """Install selected agents, or auto-detect them when ``agents`` is omitted."""
+    """Install selected agents, optionally refreshing owned copies."""
 
     selected = (
         detect_agents(home=home, which=which)
         if agents is None
         else _normalize_agents(agents)
     )
-    return [install_skill(agent, home=home) for agent in selected]
+    return [install_skill(agent, home=home, force=force) for agent in selected]
 
 
 def uninstall_skill(

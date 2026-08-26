@@ -1303,6 +1303,85 @@ class SetupTests(unittest.TestCase):
             self.assertEqual((first, second), (target, target))
             self.assertEqual(target.read_text(encoding="utf-8"), content)
 
+    def test_interactive_setup_rerun_keeps_current_config_on_empty_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            run_setup(str(target), non_interactive=True, install_shell=False)
+            current = load_config(str(target))
+            before = target.read_bytes()
+            prompts = []
+
+            def keep_default(prompt: str) -> str:
+                prompts.append(prompt)
+                return ""
+
+            with patch("builtins.input", side_effect=keep_default):
+                run_setup(str(target), install_shell=False)
+            self.assertEqual(target.read_bytes(), before)
+            self.assertIn(
+                f"Kubernetes namespace [{current['cluster']['namespace']}]",
+                prompts[0],
+            )
+            self.assertIn(
+                f"Container image [{current['runtime']['image']}]",
+                prompts[1],
+            )
+
+    def test_interactive_setup_rerun_edits_only_supplied_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            run_setup(str(target), non_interactive=True, install_shell=False)
+            original = load_config(str(target))
+            with patch(
+                "builtins.input",
+                side_effect=["research", "", "", "", "", "", ""],
+            ):
+                run_setup(str(target), install_shell=False)
+            updated = load_config(str(target))
+
+        self.assertEqual(updated["cluster"]["namespace"], "research")
+        self.assertEqual(updated["runtime"]["image"], original["runtime"]["image"])
+        self.assertEqual(updated["runtime"]["volumes"], original["runtime"]["volumes"])
+
+    def test_setup_prints_falcon_welcome_art_after_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(
+                    [
+                        "--config", str(target), "setup", "--non-interactive",
+                        "--no-shell", "--skip-skills",
+                    ]
+                )
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        art = (Path(__file__).parents[1] / "assets" / "ascii.txt").read_text(
+            encoding="utf-8"
+        ).strip()
+        self.assertIn(art, stdout.getvalue())
+        self.assertIn("Millennium Falcon systems are online.", stdout.getvalue())
+        self.assertIn("welcome aboard, pilot", stdout.getvalue())
+
+    def test_setup_prints_welcome_after_skill_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch(
+                "falcon.cli._skills_setup", return_value=5
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = main([
+                    "--config", str(target), "setup", "--non-interactive",
+                    "--no-shell", "--skip-skills",
+                ])
+
+        self.assertEqual(code, 5)
+        self.assertIn("Millennium Falcon systems are online.", stdout.getvalue())
+
     def test_setup_config_loads_without_active_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / ".falconrc"

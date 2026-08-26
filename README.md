@@ -1,5 +1,6 @@
-<h1 align="center">
-  <img src="./assets/falcon-logo.png" alt="" width="64" height="64"> Falcon
+<h1>
+  Falcon
+  <img src="./assets/falcon-logo.png" alt="Falcon spacecraft logo" width="72" height="72" align="right">
 </h1>
 
 Launch and monitor GPU workloads on Kubernetes without writing Job YAML.
@@ -43,6 +44,10 @@ falcon kill quickstart
 > Falcon's default configuration targets NVIDIA GPU nodes labelled with
 > `gpu-type` and the KAI scheduler. `falcon setup` lets you change the namespace,
 > image, mounts, GPU presets, and scheduler for your cluster.
+
+Rerun `falcon setup` interactively to review the current values. Press Enter
+to keep a value, or type a replacement to edit it; use `--non-interactive` to
+leave an existing configuration unchanged.
 
 ## Why Falcon
 

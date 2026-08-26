@@ -684,42 +684,61 @@ def run_setup(
     non_interactive: bool = False,
     install_shell: bool = True,
 ) -> Tuple[Path, Optional[Path]]:
-    """Create or validate config, then idempotently install completion."""
+    """Create or edit config, then idempotently install completion.
+
+    Interactive reruns use the current config as each prompt's default.  An
+    all-empty rerun therefore leaves the file untouched, while a supplied
+    value updates only the corresponding setting.
+    """
     target = config_path(path)
-    if target.exists() and not force:
-        load_config(str(target), require_exists=True)
+    use_existing = target.exists() and not force
+    if use_existing:
+        config = load_config(str(target), require_exists=True)
     else:
         config = effective_defaults()
-        if not non_interactive:
-            print(f"Falcon setup for {_identity()}")
-            config["cluster"]["namespace"] = _ask(
-                "Kubernetes namespace", config["cluster"]["namespace"]
-            )
-            config["runtime"]["image"] = _ask(
-                "Container image", config["runtime"]["image"]
-            )
-            scheduler = _ask(
-                "Scheduler (blank uses Kubernetes default)",
-                config["runtime"].get("scheduler") or "",
-            )
-            config["runtime"]["scheduler"] = scheduler or None
-            config["runtime"]["volumes"] = _parse_csv(
-                _ask("Host paths to mount (comma-separated)", "")
-            )
-            config["runtime"]["mount_home"] = (
-                _ask("Mount the current home directory? (y/N)", "N").lower()
-                in {"y", "yes"}
-            )
-            environment = input(
-                "Environment variables (comma-separated KEY=VALUE) [none]: "
-            ).strip()
+    original = copy.deepcopy(config)
+    if not non_interactive:
+        print(f"Falcon setup for {_identity()}")
+        config["cluster"]["namespace"] = _ask(
+            "Kubernetes namespace", config["cluster"]["namespace"]
+        )
+        config["runtime"]["image"] = _ask(
+            "Container image", config["runtime"]["image"]
+        )
+        scheduler = _ask(
+            "Scheduler (blank uses Kubernetes default)",
+            config["runtime"].get("scheduler") or "",
+        )
+        config["runtime"]["scheduler"] = scheduler or None
+        volumes = ",".join(
+            str(value) for value in config["runtime"].get("volumes", [])
+        )
+        config["runtime"]["volumes"] = _parse_csv(
+            _ask("Host paths to mount (comma-separated)", volumes)
+        )
+        mount_home = "Y" if config["runtime"].get("mount_home") else "N"
+        config["runtime"]["mount_home"] = (
+            _ask("Mount the current home directory? (y/N)", mount_home).lower()
+            in {"y", "yes"}
+        )
+        environment_values = config["runtime"].get("environment", {})
+        environment_default = ",".join(
+            f"{key}={value}" for key, value in environment_values.items()
+        )
+        environment = input(
+            "Environment variables (comma-separated KEY=VALUE) "
+            f"[{environment_default or 'none'}]: "
+        ).strip()
+        if environment:
             config["runtime"]["environment"] = _parse_environment(environment)
-            config["resources"]["shared_memory_percent"] = float(
-                _ask(
-                    "Shared memory as % of requested RAM",
-                    config["resources"]["shared_memory_percent"],
-                )
+        config["resources"]["shared_memory_percent"] = float(
+            _ask(
+                "Shared memory as % of requested RAM",
+                config["resources"]["shared_memory_percent"],
             )
+        )
+    should_write = not use_existing or force or config != original
+    if should_write:
         validate_config(config)
         _atomic_yaml(target, config)
     rc_path = install_shell_integration() if install_shell else None

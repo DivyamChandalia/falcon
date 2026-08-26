@@ -33,5 +33,7 @@ return unless observation was explicitly requested; they must not add
 eviction averages—75% for H100/PRO6000 and 30% for A6000/2080Ti—and directs
 all other specific inspection to one targeted `kubectl` command.
 
-Managed installs are idempotent. Falcon updates unchanged copies, removes
-obsolete Falcon-owned skill files, and never overwrites user modifications.
+Managed installs are idempotent. `falcon setup` refreshes modified
+Falcon-owned skill copies and removes obsolete Falcon-owned skill files.
+Unmanaged directories and symlinks remain protected conflicts and are never
+overwritten.
