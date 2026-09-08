@@ -578,7 +578,8 @@ class CoderClient:
             if time.monotonic() >= deadline:
                 raise CoderError(
                     f"timed out after {timeout:g}s waiting for workspace {name}; "
-                    f"its current build status is {status or 'unknown'}"
+                    f"its current build status is {status or 'unknown'}. "
+                    "Restart the Coder workspace and try again."
                 )
             time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 

@@ -30,8 +30,9 @@ falcon kill run
 Launches are detached by default. After launch, agents report the Job name and
 return unless observation was explicitly requested; they must not add
 `-f`/`--follow` themselves. Metrics always emits JSON. The skill records the
-eviction averages—75% for H100/PRO6000 and 30% for A6000/2080Ti—and directs
-all other specific inspection to one targeted `kubectl` command.
+eviction averages—75% for H100/PRO6000 and 10% for A6000/2080Ti, applied to
+both GPU and VRAM utilization—and directs all other specific inspection to one
+targeted `kubectl` command.
 
 Managed installs are idempotent. `falcon setup` refreshes modified
 Falcon-owned skill copies and removes obsolete Falcon-owned skill files.

@@ -14,7 +14,12 @@ from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 from .coder import CoderClient, CoderError, resolve_connection
-from .config import DEFAULT_DASHBOARD_EMA_ALPHA, save_dashboard_sort, save_hidden_panes
+from .config import (
+    DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
+    DEFAULT_DASHBOARD_EMA_ALPHA,
+    save_dashboard_sort,
+    save_hidden_panes,
+)
 from .resource_service import ResourceServiceCollector
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
@@ -93,6 +98,10 @@ class JobUsage:
     gpu_devices: List[GpuDevice] = field(default_factory=list)
     gpu_risk_average: Optional[float] = None
     gpu_risk_threshold: Optional[float] = None
+    vram_risk_average: Optional[float] = None
+    vram_risk_threshold: Optional[float] = None
+    gpu_at_risk: bool = False
+    vram_at_risk: bool = False
     # Durable request data comes from the Job's pod template and remains
     # available after every Pod has terminated or been garbage-collected.
     gpu_requested_type: str = "-"
@@ -705,6 +714,7 @@ class UsageCollector:
         self.ema_samples: Dict[str, int] = {}
         self.risk_average_samples = max(1, risk_average_samples)
         self.risk_samples: Dict[str, Deque[float]] = {}
+        self.vram_risk_samples: Dict[str, Deque[float]] = {}
         self._items: Optional[List[Dict]] = None
         self._items_at = 0.0
         self._live: Optional[Dict[str, Tuple[float, float]]] = None
@@ -911,12 +921,27 @@ class UsageCollector:
         samples.append(utilization)
         return sum(samples) / len(samples)
 
-    def _eviction_risk(self, job: str, average: Optional[float], gpu_count: int, threshold: float) -> bool:
+    def _update_vram_risk_average(self, job: str, utilization: float) -> float:
+        samples = self.vram_risk_samples.setdefault(
+            job, deque(maxlen=self.risk_average_samples)
+        )
+        samples.append(utilization)
+        return sum(samples) / len(samples)
+
+    def _eviction_risk(
+        self,
+        job: str,
+        average: Optional[float],
+        gpu_count: int,
+        threshold: float,
+        sample_store: Optional[Mapping[str, Deque[float]]] = None,
+    ) -> bool:
         """Flag only a complete rolling arithmetic average, never an individual frame."""
+        samples = self.risk_samples if sample_store is None else sample_store
         return (
             average is not None
             and gpu_count > 0
-            and len(self.risk_samples.get(job, ())) >= self.risk_average_samples
+            and len(samples.get(job, ())) >= self.risk_average_samples
             and average < threshold
         )
 
@@ -1118,6 +1143,14 @@ class UsageCollector:
             if utilization is not None:
                 ema = self._update_ema(job, utilization)
                 risk_average = self._update_risk_average(job, utilization)
+            vram_utilization = _percent(
+                group["vram_used"], group["vram_total"]
+            )
+            vram_risk_average = None
+            if vram_utilization is not None:
+                vram_risk_average = self._update_vram_risk_average(
+                    job, vram_utilization
+                )
             active_attempts = [
                 pod for pod in group["pod_items"]
                 if pod.get("status", {}).get("phase")
@@ -1140,12 +1173,20 @@ class UsageCollector:
             threshold = self.thresholds.get(
                 canonical_gpu(requested_gpu_type), 30
             )
-            at_risk = self._eviction_risk(
+            gpu_at_risk = self._eviction_risk(
                 job,
                 risk_average,
                 group["allocated_gpu_count"],
                 threshold,
             )
+            vram_at_risk = self._eviction_risk(
+                job,
+                vram_risk_average,
+                group["allocated_gpu_count"],
+                threshold,
+                self.vram_risk_samples,
+            )
+            at_risk = gpu_at_risk or vram_at_risk
             statuses = group["statuses"]
             status = _job_status(group.get("job_item"), statuses)
             job_metadata = (group.get("job_item") or {}).get("metadata", {})
@@ -1203,7 +1244,11 @@ class UsageCollector:
                 completions=completions,
                 metrics_updated_at=(
                     time.time()
-                    if utilization is not None or cpu_metrics_available
+                    if (
+                        utilization is not None
+                        or vram_utilization is not None
+                        or cpu_metrics_available
+                    )
                     else 0.0
                 ),
                 gpu_metrics_available=utilization is not None,
@@ -1211,6 +1256,10 @@ class UsageCollector:
                 gpu_devices=group["gpu_devices"],
                 gpu_risk_average=risk_average,
                 gpu_risk_threshold=threshold,
+                vram_risk_average=vram_risk_average,
+                vram_risk_threshold=threshold,
+                gpu_at_risk=gpu_at_risk,
+                vram_at_risk=vram_at_risk,
                 gpu_requested_type=requested_gpu_type,
                 gpu_requested_count=group["requested_gpu_count"],
                 gpu_allocated_type=allocated_gpu_type,
@@ -1274,7 +1323,7 @@ class DemoUsageCollector:
                 75.0
                 if canonical_gpu(job.gpu_requested_model or "")
                 in {"h100", "pro6000"}
-                else 30.0
+                else 10.0
             )
             utilization = (
                 8.0
@@ -1283,6 +1332,15 @@ class DemoUsageCollector:
             )
             cpu_used = requested.cpu_cores * (0.25 + (index % 5) * 0.1) if running else 0.0
             memory_used = requested.memory_gib * (0.30 + (index % 4) * 0.1) if running else 0.0
+            vram_utilization = (
+                _percent(
+                    allocated.gpu_count * 21.5,
+                    allocated.gpu_count * 80.0,
+                )
+                if has_metrics and allocated.gpu_count
+                else None
+            )
+            gpu_at_risk = "eviction-risk" in job.name
             rows.append(
                 JobUsage(
                     job=job.name,
@@ -1318,6 +1376,10 @@ class DemoUsageCollector:
                     cpu_metrics_available=running,
                     gpu_risk_average=utilization,
                     gpu_risk_threshold=risk_threshold,
+                    vram_risk_average=vram_utilization,
+                    vram_risk_threshold=risk_threshold,
+                    gpu_at_risk=gpu_at_risk,
+                    vram_at_risk=False,
                     gpu_requested_type=job.gpu_requested_model or "-",
                     gpu_requested_count=job.gpu_requested,
                     gpu_allocated_type=job.gpu_allocated_model or "-",
@@ -1367,9 +1429,11 @@ def _coder_workspace_action(
     url, token = resolve_connection(config)
     coder_config = config.get("coder", {})
     timeout = float(
-        coder_config.get("wait_timeout_seconds", 600)
+        coder_config.get(
+            "wait_timeout_seconds", DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+        )
         if isinstance(coder_config, Mapping)
-        else 600
+        else DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
     )
     with CoderClient(url, token) as client:
         user = client.current_user()

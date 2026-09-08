@@ -1366,6 +1366,7 @@ class FalconDashboard(App):
                 ("Completions", row.completions or "—"),
                 ("GPU EMA", "—" if row.gpu_ema is None else f"{row.gpu_ema:.1f}%"),
                 ("GPU 60s average", "—" if row.gpu_risk_average is None else f"{row.gpu_risk_average:.1f}%"),
+                ("VRAM 60s average", "—" if row.vram_risk_average is None else f"{row.vram_risk_average:.1f}%"),
                 ("Eviction risk", "YES" if row.at_risk else "No"),
             ]
             for label, value in details:
@@ -1628,9 +1629,15 @@ class FalconDashboard(App):
         command = row.command or "—"
         risk = ""
         if row.at_risk:
-            average = "—" if row.gpu_risk_average is None else f"{row.gpu_risk_average:.1f}%"
             threshold = "—" if row.gpu_risk_threshold is None else f"{row.gpu_risk_threshold:.0f}%"
-            risk = f"! EVICTION RISK · 60s average {average} < {threshold}"
+            reasons = []
+            if row.gpu_at_risk or not row.vram_at_risk:
+                average = "—" if row.gpu_risk_average is None else f"{row.gpu_risk_average:.1f}%"
+                reasons.append(f"GPU {average} < {threshold}")
+            if row.vram_at_risk:
+                average = "—" if row.vram_risk_average is None else f"{row.vram_risk_average:.1f}%"
+                reasons.append(f"VRAM {average} < {threshold}")
+            risk = "! EVICTION RISK · " + " · ".join(reasons)
         text = Text()
         if layout == "wide":
             text.append("Selected job: ", style=GRAY)

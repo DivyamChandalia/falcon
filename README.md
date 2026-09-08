@@ -147,12 +147,15 @@ cluster.
 
 The default configuration includes these GPU presets and limits:
 
-| Preset | Maximum GPUs |
-| --- | ---: |
-| `h100` | 8 |
-| `2080ti` | 4 |
-| `a6000` | 2 |
-| `pro6000` | 2 |
+| Preset | Maximum GPUs | Minimum average GPU/VRAM utilization |
+| --- | ---: | ---: |
+| `h100` | 8 | 75% |
+| `2080ti` | 4 | 10% |
+| `a6000` | 2 | 10% |
+| `pro6000` | 2 | 75% |
+
+The dashboard flags a GPU Job when either its rolling GPU or VRAM utilization
+average falls below the preset floor.
 
 Append `xN` to request multiple GPUs, such as `2080tix4` or `pro6000x2`.
 
@@ -346,5 +349,14 @@ logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
 ## TODO
 
 - Port the Falcon agent interface to an MCP server for long-running goal loops.
+- Add job-log viewing and following directly in the Jobs dashboard.
+- Show workload age in the GPU Allocations and CPU Allocations views.
+- Add a Falcon command for launching bounded agent goal loops as Kubernetes
+  Jobs, with explicit read-only data mounts, a working directory, a selectable
+  Codex/Claude Code/OpenCode CLI, and a user prompt.
+- Add local-model support through shared vLLM instances so multiple users and
+  agent Jobs can discover and consume hosted models.
+- Make resource requests aware of Kubernetes Pod eviction policy.
+- Make it possible to launch workloads as long-running Kubernetes Services.
 
 Falcon is licensed under Apache-2.0. See [NOTICE](NOTICE) for attribution.

@@ -201,6 +201,31 @@ class MetricsCollectorTests(unittest.TestCase):
 
 
 class DashboardAvailabilityTests(unittest.TestCase):
+    def test_eviction_risk_uses_the_same_floor_for_gpu_and_vram(self) -> None:
+        collector = UsageCollector(
+            "research",
+            {"a6000": 10.0},
+            0.1,
+            risk_average_samples=3,
+        )
+        for value in (8.0, 9.0, 7.0):
+            gpu_average = collector._update_risk_average("job-a", value)
+        for value in (6.0, 11.0, 13.0):
+            vram_average = collector._update_vram_risk_average("job-a", value)
+
+        self.assertTrue(
+            collector._eviction_risk("job-a", gpu_average, 1, 10.0)
+        )
+        self.assertFalse(
+            collector._eviction_risk(
+                "job-a",
+                vram_average,
+                1,
+                10.0,
+                collector.vram_risk_samples,
+            )
+        )
+
     def test_dashboard_uses_metrics_headroom_without_listing_nodes(self) -> None:
         nodes = [
             NodeResources(

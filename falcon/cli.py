@@ -48,6 +48,7 @@ from .coder import (
 from .commands import attach, kill, remember_job, target_job, top
 from .completion import COMMAND_ALIASES, shell_script
 from .config import (
+    DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
     config_path,
     detect_shell,
     gpu_preset_max_count,
@@ -405,7 +406,10 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     coder.add_argument(
         "--timeout",
         type=float,
-        help="Seconds to wait for the Coder agent (default: config, 600)",
+        help=(
+            "Seconds to wait for the Coder agent "
+            f"(default: config, {DEFAULT_CODER_WAIT_TIMEOUT_SECONDS})"
+        ),
     )
 
     setup = sub.add_parser(
@@ -1196,6 +1200,7 @@ def _metrics_command(
         "memory_percent": _percent_summary(samples["memory"]),
     }
     gpu_average = utilization["gpu_percent"]["average"]
+    vram_average = utilization["vram_percent"]["average"]
     data = {
         "job": requested_job,
         "status": latest.status,
@@ -1220,6 +1225,12 @@ def _metrics_command(
                 None
                 if floor is None or gpu_average is None
                 else gpu_average >= floor
+            ),
+            "minimum_average_vram_utilization_percent": floor,
+            "observed_average_vram_meets_minimum": (
+                None
+                if floor is None or vram_average is None
+                else vram_average >= floor
             ),
         },
     }
@@ -1344,9 +1355,11 @@ def _delete_job_targets(
         url, token = _authenticated_coder_connection(config)
         coder_config = config.get("coder", {})
         timeout = float(
-            coder_config.get("wait_timeout_seconds", 600)
+            coder_config.get(
+                "wait_timeout_seconds", DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+            )
             if isinstance(coder_config, Mapping)
-            else 600
+            else DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
         )
 
         with CoderClient(url, token) as client:
@@ -1504,7 +1517,11 @@ def _coder_command(
     timeout = (
         args.timeout
         if args.timeout is not None
-        else float(coder_config.get("wait_timeout_seconds", 600))
+        else float(
+            coder_config.get(
+                "wait_timeout_seconds", DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+            )
+        )
     )
     if not 1 <= timeout <= 3600:
         raise CoderError("--timeout must be between 1 and 3600 seconds")

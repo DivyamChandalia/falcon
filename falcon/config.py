@@ -20,6 +20,7 @@ import yaml
 
 CONFIG_VERSION = 1
 DEFAULT_DASHBOARD_EMA_ALPHA = 0.1
+DEFAULT_CODER_WAIT_TIMEOUT_SECONDS = 30
 LEGACY_DASHBOARD_EMA_ALPHAS = {0.02, 0.08, 0.25}
 DEFAULT_GPU_PRESET_MAX_COUNT = 8
 
@@ -82,12 +83,12 @@ USER_DEFAULTS: Dict[str, Any] = {
         },
         "a6000": {
             "gpu_type": "a6000",
-            "minimum_utilization": 30,
+            "minimum_utilization": 10,
             "max_count": 2,
         },
         "2080ti": {
             "gpu_type": "2080ti",
-            "minimum_utilization": 30,
+            "minimum_utilization": 10,
             "max_count": 4,
         },
         "pro6000": {
@@ -104,7 +105,7 @@ USER_DEFAULTS: Dict[str, Any] = {
     "coder": {
         "url": "https://coder.yoda.hyperverge.org",
         "template": "IDEs",
-        "wait_timeout_seconds": 600,
+        "wait_timeout_seconds": DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
         # Null means auto-detect the conventional rich-parameter name.
         "parameters": {
             "cpu": None,
@@ -456,7 +457,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     template = coder.get("template")
     if template is not None and (not isinstance(template, str) or not template.strip()):
         raise ValueError("coder.template must be a non-empty string or null")
-    wait_timeout = coder.get("wait_timeout_seconds", 600)
+    wait_timeout = coder.get(
+        "wait_timeout_seconds", DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+    )
     if (
         isinstance(wait_timeout, bool)
         or not isinstance(wait_timeout, (int, float))

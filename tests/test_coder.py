@@ -26,7 +26,11 @@ from falcon.coder import (
     select_access_links,
     workspace_job_name,
 )
-from falcon.config import DEFAULT_CONFIG, validate_config
+from falcon.config import (
+    DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
+    DEFAULT_CONFIG,
+    validate_config,
+)
 from falcon.models import NodeResources
 from falcon.planning import plan_cpu_resources, plan_resources
 
@@ -252,6 +256,37 @@ class CoderClientTests(unittest.TestCase):
                 )
         finally:
             client.close()
+
+    def test_wait_timeout_recommends_restarting_workspace(self) -> None:
+        workspace = ready_workspace()
+        agent = workspace["latest_build"]["resources"][0]["agents"][0]
+        agent["status"] = "connecting"
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=workspace)
+
+        client = CoderClient(
+            "https://coder.example.test",
+            "session-token",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with self.assertRaisesRegex(
+                CoderError,
+                "timed out.*Restart the Coder workspace and try again",
+            ):
+                client.wait_until_ready(
+                    "divyam.c", "lime-gull-30", timeout=0, interval=0
+                )
+        finally:
+            client.close()
+
+    def test_default_coder_wait_timeout_is_30_seconds(self) -> None:
+        self.assertEqual(DEFAULT_CODER_WAIT_TIMEOUT_SECONDS, 30)
+        self.assertEqual(
+            DEFAULT_CONFIG["coder"]["wait_timeout_seconds"],
+            DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
+        )
 
     def test_delete_workspace_submits_native_coder_delete_build(self) -> None:
         requests = []
@@ -661,7 +696,9 @@ class CoderCliTests(unittest.TestCase):
             username="divyamc",
             workspaces=(workspace,),
         )
-        coder.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
+        coder.delete_workspace.assert_called_once_with(
+            workspace, timeout=DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+        )
         kubernetes_kill.assert_called_once_with(
             DEFAULT_CONFIG["cluster"]["namespace"],
             ["finished-training"],
@@ -695,7 +732,9 @@ class CoderCliTests(unittest.TestCase):
             username="divyamc",
             workspaces=(workspace,),
         )
-        client.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
+        client.delete_workspace.assert_called_once_with(
+            workspace, timeout=DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+        )
         kubernetes_kill.assert_not_called()
         self.assertIn("Deleting 1 Coder workspace", stdout.getvalue())
         self.assertIn("falcon (coder-divyam.c-falcon)", stdout.getvalue())
@@ -725,7 +764,9 @@ class CoderCliTests(unittest.TestCase):
             ])
 
         self.assertEqual((code, stderr.getvalue()), (0, ""))
-        client.delete_workspace.assert_called_once_with(workspace, timeout=600.0)
+        client.delete_workspace.assert_called_once_with(
+            workspace, timeout=DEFAULT_CODER_WAIT_TIMEOUT_SECONDS
+        )
         self.assertEqual(kubernetes_kill.call_args.args[1], ["training"])
         self.assertIn("Deleting 1 Coder workspace", stdout.getvalue())
         self.assertIn("Killed 1 Job(s): training", stdout.getvalue())

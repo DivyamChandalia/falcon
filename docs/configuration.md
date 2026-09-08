@@ -48,9 +48,11 @@ presets:
     max_count: 8
   a6000:
     gpu_type: a6000
+    minimum_utilization: 10
     max_count: 2
   2080ti:
     gpu_type: 2080ti
+    minimum_utilization: 10
     max_count: 4
   pro6000:
     gpu_type: pro6000
@@ -63,7 +65,7 @@ dashboard:
 coder:
   url: https://coder.yoda.hyperverge.org
   template: IDEs
-  wait_timeout_seconds: 600
+  wait_timeout_seconds: 30
   parameters:
     cpu: null
     cpu_limit: null

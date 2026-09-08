@@ -1108,6 +1108,17 @@ class InspectionCliTests(CliHarness):
         self.assertFalse(
             value["data"]["eviction_policy"]["observed_average_meets_minimum"]
         )
+        self.assertEqual(
+            value["data"]["eviction_policy"][
+                "minimum_average_vram_utilization_percent"
+            ],
+            75.0,
+        )
+        self.assertFalse(
+            value["data"]["eviction_policy"][
+                "observed_average_vram_meets_minimum"
+            ]
+        )
         self.assertTrue(collector.closed)
         sleeper.assert_called_once_with(1.0)
 
@@ -1215,6 +1226,12 @@ class SetupTests(unittest.TestCase):
         )
         self.assertEqual(
             DEFAULT_CONFIG["presets"]["pro6000"]["minimum_utilization"], 75
+        )
+        self.assertEqual(
+            DEFAULT_CONFIG["presets"]["a6000"]["minimum_utilization"], 10
+        )
+        self.assertEqual(
+            DEFAULT_CONFIG["presets"]["2080ti"]["minimum_utilization"], 10
         )
         for preset_name, maximum in (
             ("h100", 8),

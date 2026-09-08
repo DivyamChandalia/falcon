@@ -112,6 +112,9 @@ session. Non-interactive runs use `CODER_SESSION_TOKEN` or an existing Coder
 CLI login and never prompt.
 Template-managed JupyterLab apps are included through Coder's authenticated
 workspace-app proxy; `--access jupyter` and `--access notebook` select that link.
+Falcon waits up to 30 seconds by default for a workspace agent to connect. If
+that timeout is reached, restart the workspace in Coder and retry the command;
+override the wait with `--timeout SECONDS` when a slower build is expected.
 
 GPU presets use the same cluster-aware proportional CPU/RAM sizing as ordinary
 Falcon Jobs and populate the template's GPU model and count parameters. For
