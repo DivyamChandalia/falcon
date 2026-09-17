@@ -25,6 +25,7 @@ BASE_COMMANDS = [
     "setup",
     "config",
     "completion",
+    "update",
 ]
 PRIORITY_COMMANDS = ["logs", "top"]
 TOP_LEVEL_LAUNCH_OPTIONS = ["--cpu", "--memory", "--gpus"]
@@ -77,6 +78,7 @@ OPTIONS: Dict[str, List[str]] = {
         "--skip-skills", "--uninstall-skills",
     ],
     "completion": ["bash", "zsh"],
+    "update": ["--check"],
 }
 
 

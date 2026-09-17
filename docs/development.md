@@ -34,6 +34,13 @@ python -m venv /tmp/falcon-wheel-test
 /tmp/falcon-wheel-test/bin/falcon --help
 ```
 
+Versioning follows semantic `MAJOR.MINOR.PATCH` releases. The single source
+of truth is `falcon/__init__.py`; `pyproject.toml` reads that value dynamically
+when building wheels, so the CLI and package metadata cannot drift. For a
+release, update that value, add a matching `vMAJOR.MINOR.PATCH` Git tag, run
+the wheel checks above, and push the commit and tag together. The daily update
+check compares this metadata with the `main` branch before prompting.
+
 Confirm the wheel contains only `falcon`, bundled skills, and required
 metadata; it must not install another console entrypoint. Optional kind tests
 require explicit `FALCON_KIND_INTEGRATION=1` and a current `kind-*` context.

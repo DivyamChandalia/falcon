@@ -306,8 +306,24 @@ See [Configuration](docs/configuration.md) for all available settings.
 Update to the latest version from GitHub:
 
 ```console
+falcon update
+```
+
+The equivalent pip command is:
+
+```console
 pip install --user --upgrade git+https://github.com/DivyamChandalia/falcon.git@main
 ```
+
+When Falcon is run from an interactive terminal, it checks once every 24 hours
+whether a newer semantic version is available and asks before updating. The
+check is silent for JSON/non-interactive commands. Set
+`FALCON_NO_UPDATE_CHECK=1` to disable the prompt; `falcon update --check`
+reports the installed and remote versions without changing the installation.
+
+The package version is defined once in `falcon/__init__.py` and is exported to
+the build metadata. Releases use semantic versions and matching `vMAJOR.MINOR.PATCH`
+Git tags.
 
 Remove the package:
 
@@ -334,6 +350,7 @@ Run `falcon config` to print the active configuration path.
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md)
 - [CLI reference](docs/cli.md)
 - [Configuration](docs/configuration.md)
 - [TUI controls](docs/tui.md)

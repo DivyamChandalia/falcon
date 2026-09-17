@@ -49,6 +49,7 @@ from .commands import attach, capture_logs, kill, remember_job, target_job, top
 from .completion import COMMAND_ALIASES, shell_script
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
+    DEFAULT_CONFIG,
     config_path,
     detect_shell,
     gpu_preset_max_count,
@@ -84,12 +85,20 @@ from .resources_history import (
 )
 from .resources_ui import FalconResourcesApp
 from .theme import COLOR_MODES
+from .updates import (
+    UpdateError,
+    install_update,
+    latest_version,
+    maybe_prompt_for_update,
+    newer_version,
+)
 
 EXIT_USAGE = 2
 EXIT_KUBERNETES = 3
 EXIT_NOT_FOUND = 4
 EXIT_CONFLICT = 5
 EXIT_CODER = 6
+EXIT_UPDATE = 7
 
 _LAUNCH_SENTINEL = "__falcon_launch__"
 
@@ -434,6 +443,12 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     completion = sub.add_parser("completion", help="Print shell completion")
     completion.add_argument("shell", nargs="?", choices=("bash", "zsh"))
     sub.add_parser("config", help="Print the active config path")
+    update = sub.add_parser("update", help="Update Falcon from the official GitHub source")
+    update.add_argument(
+        "--check",
+        action="store_true",
+        help="Check the latest version without installing it",
+    )
     return parser
 
 
@@ -459,6 +474,15 @@ def _config_argument(argv: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _is_update_request(argv: Sequence[str]) -> bool:
+    """Recognize ``falcon update`` before reading a possibly stale config."""
+
+    before_command = list(argv)
+    if "--" in before_command:
+        before_command = before_command[: before_command.index("--")]
+    return "update" in before_command
+
+
 def _rewrite_shorthand(
     argv: List[str], config: Mapping[str, Any]
 ) -> List[str]:
@@ -473,7 +497,7 @@ def _rewrite_shorthand(
     public_commands = {
         "jobs", "get", "events", "logs", "attach", "top", "metrics",
         "kill", "clean", "dashboard", "resources", "coder", "setup",
-        "completion", "config", "shell-init",
+        "completion", "config", "update", "shell-init",
     }
     # Falcon 0.1 installed this command in shell startup files. Keep a hidden,
     # output-compatible migration alias so upgrading the executable cannot
@@ -1935,16 +1959,77 @@ def _print_setup_welcome() -> None:
     )
 
 
+def _update_command(args: argparse.Namespace) -> int:
+    """Check for or install the latest Falcon release."""
+
+    if args.check:
+        try:
+            available = latest_version()
+        except UpdateError as exc:
+            print(f"falcon update: {exc}", file=sys.stderr)
+            return EXIT_UPDATE
+        if newer_version(__version__, available):
+            print(
+                f"Falcon {available} is available (installed: {__version__})."
+            )
+        else:
+            print(f"Falcon is up to date ({__version__}).")
+        return 0
+
+    print(f"Updating Falcon {__version__} from GitHub…")
+    try:
+        status = install_update()
+    except UpdateError as exc:
+        print(f"falcon update: {exc}", file=sys.stderr)
+        return EXIT_UPDATE
+    if status:
+        print(
+            f"falcon update: pip exited with status {status}",
+            file=sys.stderr,
+        )
+        return EXIT_UPDATE
+    print("Falcon updated. Start a new shell or rerun the command.")
+    return 0
+
+
+def _maybe_auto_update(command_name: str, args: argparse.Namespace) -> None:
+    """Offer a daily update only for interactive, human-facing commands."""
+
+    if command_name in {"completion", "config", "setup", "update"}:
+        return
+    if getattr(args, "output", None) == "json":
+        return
+    interactive = bool(
+        getattr(sys.stdin, "isatty", lambda: False)()
+        and getattr(sys.stdout, "isatty", lambda: False)()
+    )
+    if not interactive:
+        return
+    # Update failures are intentionally handled inside the updater. A daily
+    # check must never prevent a normal Falcon command from running.
+    maybe_prompt_for_update(__version__, interactive=True, stream=sys.stdout)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     config_arg = _config_argument(raw)
     try:
-        config = load_config(config_arg)
+        try:
+            config = load_config(config_arg)
+        except (OSError, ValueError):
+            # Updating must remain available when an old release left an
+            # unreadable or now-invalid .falconrc behind. Other commands keep
+            # the original configuration error and exit normally below.
+            if not _is_update_request(raw):
+                raise
+            config = DEFAULT_CONFIG
         rewritten = _rewrite_shorthand(raw, config)
         if _LAUNCH_SENTINEL in rewritten:
             launch_argv = list(rewritten)
             launch_argv.remove(_LAUNCH_SENTINEL)
-            return _submit_command(_launch_parser().parse_args(launch_argv), config)
+            launch_args = _launch_parser().parse_args(launch_argv)
+            _maybe_auto_update("launch", launch_args)
+            return _submit_command(launch_args, config)
         if (
             "dashboard" in rewritten
             and any(token in {"--json", "--once"} for token in rewritten)
@@ -1958,6 +2043,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.command_name:
             parser.print_help()
             return 0
+        _maybe_auto_update(args.command_name, args)
         if args.command_name == "jobs":
             return _jobs_command(args, config)
         if args.command_name == "get":
@@ -2021,6 +2107,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command_name == "config":
             print(config_path(config_arg))
             return 0
+        if args.command_name == "update":
+            return _update_command(args)
         return 0
     except KeyboardInterrupt:
         return 130
@@ -2034,6 +2122,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ResourceServiceError as exc:
         print(f"falcon: {exc}", file=sys.stderr)
         return EXIT_KUBERNETES
+    except UpdateError as exc:
+        print(f"falcon update: {exc}", file=sys.stderr)
+        return EXIT_UPDATE
     except CliError as exc:
         print(f"falcon: {exc}", file=sys.stderr)
         return exc.code

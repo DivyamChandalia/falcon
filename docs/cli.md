@@ -151,9 +151,28 @@ falcon completion [bash|zsh]
 falcon config
 ```
 
+## Updates
+
+```text
+falcon update
+falcon update --check
+```
+
+`falcon update` upgrades the current interpreter's Falcon installation from
+the official `DivyamChandalia/falcon` GitHub repository. A virtualenv or Conda
+environment is updated in place; a system interpreter uses the user site and
+does not request administrator access. `--check` only compares the installed
+semantic version with the version declared on the repository's `main` branch.
+
+Interactive commands perform the same remote check at most once every 24
+hours and ask before installing. Set `FALCON_NO_UPDATE_CHECK=1` to suppress
+the daily prompt. JSON and non-interactive commands never emit an update
+prompt, so their output remains machine-readable.
+
 Exit codes are `0` success, `2` input/config error, `3` Kubernetes unavailable
 or operation failure, `4` object not found, `5` safe-install conflict, `6`
-Coder API/configuration failure, and `130` interrupted.
+Coder API/configuration failure, `7` update check/install failure, and `130`
+interrupted.
 
 ## Short aliases
 

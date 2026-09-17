@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "falcon-k8s"
-version = "0.2.0"
+dynamic = ["version"]
 authors = [
     { name = "Falcon contributors" }
 ]
@@ -27,6 +27,7 @@ license = "Apache-2.0"
 dependencies = [
     "PyYAML>=6.0",
     "httpx>=0.23.0",
+    "packaging>=23.0",
     "textual>=2.0,<8",
     "unique-names-generator>=1.0.2,<2",
 ]
@@ -45,6 +46,9 @@ falcon-resource-server = "falcon.resource_service:main"
 where = ["."]
 include = ["falcon*"]
 exclude = ["tests*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "falcon.__version__"}
 
 [tool.setuptools.package-data]
 falcon = ["skills/falcon/*.md"]
