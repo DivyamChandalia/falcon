@@ -349,7 +349,6 @@ logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
 ## TODO
 
 - Port the Falcon agent interface to an MCP server for long-running goal loops.
-- Add job-log viewing and following directly in the Jobs dashboard.
 - Show workload age in the GPU Allocations and CPU Allocations views.
 - Add a Falcon command for launching bounded agent goal loops as Kubernetes
   Jobs, with explicit read-only data mounts, a working directory, a selectable

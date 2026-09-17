@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .kubernetes import KubernetesClient, KubernetesError
+from .kubernetes import KubernetesClient, KubernetesError, ProcessResult
 
 
 def state_path() -> Path:
@@ -76,7 +76,8 @@ def logs(
     container: Optional[str] = None,
 ) -> int:
     target = target_job(name)
-    result = KubernetesClient(namespace).logs(
+    result = capture_logs(
+        namespace,
         target,
         tail=tail,
         follow=follow,
@@ -89,6 +90,39 @@ def logs(
     if result.returncode == 0:
         remember_job(target)
     return result.returncode
+
+
+def capture_logs(
+    namespace: str,
+    name: str,
+    *,
+    pod_name: Optional[str] = None,
+    tail: int = -1,
+    follow: bool = False,
+    container: Optional[str] = None,
+    client: Optional[KubernetesClient] = None,
+) -> ProcessResult:
+    """Capture output using the same implementation as ``falcon logs``.
+
+    The optional Pod target is used only by the dashboard's attempt selector;
+    the public command continues to resolve a Job target as before.
+    """
+
+    client = client or KubernetesClient(namespace)
+    if pod_name:
+        if follow:
+            raise ValueError("Pod log capture cannot follow a terminal attempt")
+        return client.pod_logs(
+            pod_name,
+            tail=tail,
+            container=container,
+        )
+    return client.logs(
+        name,
+        tail=tail,
+        follow=follow,
+        container=container,
+    )
 
 
 def attach(namespace: str, name: Optional[str]) -> int:

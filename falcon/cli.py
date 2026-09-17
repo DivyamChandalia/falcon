@@ -45,7 +45,7 @@ from .coder import (
     validate_workspace_name,
     workspace_job_name,
 )
-from .commands import attach, kill, remember_job, target_job, top
+from .commands import attach, capture_logs, kill, remember_job, target_job, top
 from .completion import COMMAND_ALIASES, shell_script
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
@@ -1059,12 +1059,15 @@ def _logs_command(
         else args.output == "human"
     )
     name = target_job(args.job)
-    client = KubernetesClient(_namespace_value(args, config))
-    result = client.logs(
+    namespace = _namespace_value(args, config)
+    client = KubernetesClient(namespace)
+    result = capture_logs(
+        namespace,
         name,
         tail=args.tail,
         follow=follow,
         container=args.container,
+        client=client,
     )
     if result.returncode:
         raise KubernetesError(

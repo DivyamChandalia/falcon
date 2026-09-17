@@ -475,6 +475,87 @@ class KubernetesClient:
             timeout=0 if follow else self.timeout,
         )
 
+    def pod_logs(
+        self,
+        pod_name: str,
+        *,
+        namespace: Optional[str] = None,
+        tail: int = -1,
+        container: Optional[str] = None,
+    ) -> ProcessResult:
+        """Return bounded, non-following logs for one Pod attempt.
+
+        ``falcon logs`` normally targets a Job so Kubernetes can resolve its
+        current Pod.  The dashboard's attempt selector needs the explicit Pod
+        form to inspect failed and succeeded retries without accidentally
+        showing a different attempt.
+        """
+
+        if not pod_name:
+            raise ValueError("Kubernetes Pod name must not be empty")
+        if tail < -1 or tail > 100_000:
+            raise ValueError("log tail must be -1 (all lines) or between 0 and 100000")
+        args = [
+            "logs", pod_name,
+            "--namespace", namespace or self.namespace,
+            "--tail", str(tail),
+        ]
+        if container:
+            args += ["--container", container]
+        return self._run(
+            args,
+            capture=True,
+            check=False,
+            timeout=self.timeout,
+        )
+
+    def attach_stream(
+        self,
+        pod_name: str,
+        *,
+        namespace: Optional[str] = None,
+        container: Optional[str] = None,
+    ) -> subprocess.Popen:
+        """Start a read-only attach process suitable for dashboard capture.
+
+        The normal :meth:`attach` method deliberately owns the terminal's
+        stdin/TTY.  This variant never does so: the dashboard receives only
+        the running container's stdout and stderr.
+        """
+
+        if not pod_name:
+            raise ValueError("Kubernetes Pod name must not be empty")
+        effective = namespace or self.namespace
+        args = [
+            self.executable,
+            "attach",
+            pod_name,
+            "--namespace", effective,
+            "--stdin=false",
+            "--tty=false",
+        ]
+        if container:
+            args += ["--container", container]
+        try:
+            return subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise KubernetesError(
+                f"{self.executable!r} was not found on PATH",
+                command=args,
+            ) from exc
+        except OSError as exc:
+            raise KubernetesError(
+                f"could not start Kubernetes attach stream: {exc}",
+                command=args,
+            ) from exc
+
     def attach(
         self,
         job_name: str,

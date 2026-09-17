@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 import subprocess
 import textwrap
 import threading
@@ -12,7 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean
-from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 from rich import box
 from rich.align import Align
@@ -23,22 +24,24 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Input, Static
+from textual.widgets import Button, Input, Static
 
 from .dashboard import (
     KUBERNETES_USAGE_SECONDS,
     JobEvent,
     JobUsage,
+    PodAttempt,
     _metric_color,
     _percent,
     _short_cpu,
     _short_memory,
     _timestamp,
 )
-from .planning import GPU_MODEL_DISPLAY_ORDER
+from .dashboard_logs import DashboardLogManager, LogSnapshot
+from .planning import GPU_MODEL_DISPLAY_ORDER, canonical_gpu
 from .theme import (
     BACKGROUND,
     BORDER,
@@ -122,6 +125,13 @@ class ViewState:
     loading_states: Dict[str, bool] = field(default_factory=dict)
     gpu_availability: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     hidden_panes: Set[str] = field(default_factory=set)
+    selected_section: str = "logs"
+    selected_attempt_index: int = -1
+    logs_collapsed: bool = False
+    # Keep the live log viewport pinned to the newest output until the user
+    # deliberately scrolls up.  This is separate from the selected section so
+    # refreshing the selected Job preserves tail-follow behaviour.
+    logs_auto_follow: bool = True
 
 
 @dataclass
@@ -144,6 +154,15 @@ def _truncate(value: str, width: int) -> str:
     if width <= 0:
         return ""
     return value if len(value) <= width else value[: max(1, width - 1)] + "…"
+
+
+MAX_DISPLAY_LOG_LINE_CHARS = 4096
+
+
+def _display_log_line(value: str) -> str:
+    """Keep pathological single-line output from dominating Rich layout."""
+
+    return _truncate(value, MAX_DISPLAY_LOG_LINE_CHARS)
 
 
 def _spark(values: List[Optional[float]], width: int = 12) -> str:
@@ -330,6 +349,213 @@ class DashboardPaneContent(Static):
         return height
 
 
+class SelectedJobScroll(VerticalScroll):
+    """A nested viewport that owns its mouse wheel and keyboard focus."""
+
+    can_focus = True
+    # Let FalconDashboard's context-aware bindings (Home/End, page movement,
+    # and the Pod arrows) handle keys instead of VerticalScroll's generic
+    # bindings, which would bypass the selected-section state.
+    BINDINGS = []
+
+    def _activate_section(self) -> None:
+        app = self.app
+        callback = getattr(app, "selected_section_focused", None)
+        if callback:
+            callback(self.id or "")
+
+    def _notify_scroll_position(self) -> None:
+        """Tell the dashboard whether this viewport is currently at its end."""
+
+        callback = getattr(self.app, "selected_section_scrolled", None)
+        if callback:
+            callback(self.id or "", self.scroll_y, self.max_scroll_y)
+
+    def on_focus(self, event: events.Focus) -> None:
+        if self.screen.focused is self:
+            self._activate_section()
+
+    def on_key(self, event: events.Key) -> None:
+        """Route navigation through the dashboard's selected-section logic."""
+
+        actions = {
+            "up": "action_up", "k": "action_up",
+            "down": "action_down", "j": "action_down",
+            "left": "action_left", "right": "action_right",
+            "pageup": "action_page_up", "pagedown": "action_page_down",
+            "home": "action_home", "end": "action_end",
+            "c": "action_toggle_selected_or_cleanup",
+            "ctrl+c": "action_copy_or_quit",
+            "command+c": "action_copy_or_quit",
+        }
+        action_name = actions.get(event.key)
+        if action_name is None:
+            return
+        event.prevent_default()
+        event.stop()
+        callback = getattr(self.app, action_name, None)
+        if callback:
+            callback()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._activate_section()
+        self.app.set_focus(self, scroll_visible=False)
+
+    def on_click(self, event: events.Click) -> None:
+        # DashboardPane also listens for clicks to focus the outer pane. Stop
+        # this event here so clicking Logs leaves the nested pane selected (and
+        # its focused border visible).
+        self._activate_section()
+        self.app.set_focus(self, scroll_visible=False)
+        event.stop()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        event.prevent_default()
+        event.stop()
+        self._activate_section()
+        self.scroll_relative(
+            y=1, animate=False, force=True, immediate=True
+        )
+        self._notify_scroll_position()
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        event.prevent_default()
+        event.stop()
+        self._activate_section()
+        self.scroll_relative(
+            y=-1, animate=False, force=True, immediate=True
+        )
+        self._notify_scroll_position()
+
+
+class SelectedCommandRow(Horizontal):
+    """A non-selectable command label with a value-column copy button."""
+
+    # The command itself is metadata, not a second scrollable inspector pane.
+    # Keep only the copy button interactive so clicking the label cannot steal
+    # focus from the Logs viewport.
+    can_focus = False
+    BINDINGS = []
+
+    def compose(self) -> ComposeResult:
+        yield Static("Command", id="selected-command-label", markup=False)
+        copy_button = Button(
+            "⧉",
+            id="selected-command-copy",
+            tooltip="Copy command",
+            compact=True,
+            flat=True,
+        )
+        # The icon is an action, not another selectable inspector pane. Keep
+        # focus on Logs when it is clicked so the details layout cannot enter
+        # a focus-within reflow while a dashboard refresh is rendering.
+        copy_button.can_focus = False
+        yield copy_button
+
+
+class SelectedJobInspector(Container):
+    """Compact metadata with a command affordance and a log-only lower half."""
+
+    can_focus = True
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="selected-details"):
+            with Vertical(classes="selected-detail-column"):
+                yield Static(id="selected-details-left", markup=False)
+                yield SelectedCommandRow(id="selected-command-row")
+            with Vertical(classes="selected-detail-column"):
+                yield Static(id="selected-details-right", markup=False)
+        with Horizontal(classes="selected-section-actions"):
+            yield Button(
+                "⧉",
+                id="selected-logs-copy",
+                tooltip="Ctrl/Cmd+C",
+                compact=True,
+                flat=True,
+            )
+        with SelectedJobScroll(id="selected-logs-scroll"):
+            yield DashboardPaneContent(
+                "No output yet", id="selected-logs-content", markup=False
+            )
+
+    def clear(self, message: str = "No Job selected") -> None:
+        self.query_one("#selected-details-left", Static).update(
+            Text(message, style=MUTED)
+        )
+        self.query_one("#selected-details-right", Static).update(
+            ""
+        )
+        self.query_one("#selected-logs-content", DashboardPaneContent).update(
+            "No output yet"
+        )
+        self.query_one("#selected-logs-scroll", SelectedJobScroll).remove_class(
+            "collapsed"
+        )
+        self.query_one("#selected-logs-scroll", SelectedJobScroll).remove_class(
+            "selected"
+        )
+        self.query_one("#selected-logs-scroll", SelectedJobScroll).border_title = " LOGS "
+
+    def update_view(
+        self,
+        detail_columns,
+        logs: LogSnapshot,
+        *,
+        logs_collapsed: bool,
+        attempt_label: str,
+    ) -> None:
+        left_details, right_details = detail_columns
+        self.query_one("#selected-details-left", Static).update(left_details)
+        self.query_one("#selected-details-right", Static).update(right_details)
+        log_text = (
+            "\n".join(_display_log_line(line) for line in logs.lines)
+            if logs.lines
+            else "No output yet"
+        )
+        if logs.error:
+            log_text += f"\n\n[{logs.error}]"
+        self.query_one("#selected-logs-content", DashboardPaneContent).update(
+            log_text
+        )
+        logs_scroll = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+        logs_scroll.border_title = f" LOGS · {attempt_label} "
+        logs_scroll.set_class(logs_collapsed, "collapsed")
+
+        # ``update`` invalidates the content height, so Textual may not know
+        # the new maximum until the next layout pass.  Scroll immediately for
+        # an already-laid-out viewport and once more after refresh to ensure a
+        # newly appended line can never leave a following subscriber above
+        # the tail.
+        app = self.app
+        if getattr(getattr(app, "state", None), "logs_auto_follow", True):
+            logs_scroll.scroll_end(
+                animate=False, force=True, immediate=True
+            )
+
+            def follow_tail() -> None:
+                if not self.is_mounted:
+                    return
+                if not getattr(getattr(app, "state", None), "logs_auto_follow", True):
+                    return
+                try:
+                    current = self.query_one(
+                        "#selected-logs-scroll", SelectedJobScroll
+                    )
+                except NoMatches:
+                    return
+                current.scroll_end(
+                    animate=False, force=True, immediate=True
+                )
+
+            app.call_after_refresh(follow_tail)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        callback = getattr(self.app, "selected_button_pressed", None)
+        if callback:
+            callback(event.button.id or "")
+        event.stop()
+
+
 class DashboardPane(VerticalScroll):
     can_focus = True
 
@@ -338,6 +564,15 @@ class DashboardPane(VerticalScroll):
         self._pane_content = ""
 
     def compose(self) -> ComposeResult:
+        if self.id == "selected-pane":
+            yield DashboardPaneContent(
+                self._pane_content,
+                id="selected-pane-content",
+                classes="dashboard-pane-content",
+                markup=False,
+            )
+            yield SelectedJobInspector(id="selected-inspector")
+            return
         yield DashboardPaneContent(
             self._pane_content,
             id=f"{self.id}-content" if self.id else None,
@@ -713,6 +948,22 @@ DashboardPane:focus {{ border: solid {CYAN}; }}
 #selected-pane {{ height: 3; min-height: 3; }}
 #resources-pane {{ height: 6; min-height: 6; }}
 #selected-pane, #resources-pane {{ overflow-y: auto; scrollbar-size-vertical: 1; }}
+#selected-inspector {{ display: none; width: 1fr; height: 1fr; }}
+#selected-details {{ width: 1fr; min-width: 0; height: auto; padding: 0 1; }}
+.selected-detail-column {{ width: 1fr; min-width: 0; height: auto; }}
+#selected-details-left, #selected-details-right {{ width: 1fr; min-width: 0; height: auto; }}
+.selected-section-actions {{ width: 1fr; height: 1; min-height: 1; padding: 0 1; align: right middle; }}
+.selected-section-actions Button {{ width: 3; min-width: 3; height: 1; min-height: 1; padding: 0 1; border: none; color: {CYAN}; background: {BACKGROUND}; }}
+.selected-section-actions Button:hover, .selected-section-actions Button:focus {{ color: {WHITE}; background: {BORDER}; }}
+#selected-command-row {{ width: 1fr; min-width: 0; height: 1; min-height: 1; padding: 0; align: left middle; }}
+#selected-command-label {{ width: 18; min-width: 18; height: 1; min-height: 1; color: {GRAY}; }}
+#selected-command-row Button {{ width: 3; min-width: 3; height: 1; min-height: 1; padding: 0 1; border: none; color: {CYAN}; background: {BACKGROUND}; }}
+#selected-command-row Button:hover, #selected-command-row Button:focus {{ color: {WHITE}; background: {BORDER}; }}
+SelectedJobScroll {{ width: 1fr; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
+SelectedJobScroll:focus {{ border: solid {CYAN}; }}
+SelectedJobScroll.selected {{ border: solid {CYAN}; }}
+#selected-logs-scroll {{ width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
+#selected-logs-scroll.collapsed {{ height: 4; min-height: 4; max-height: 4; }}
 #events-pane {{ height: 7; min-height: 3; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #falcon-footer {{ height: 1; color: {GRAY}; padding: 0 1; }}
@@ -724,7 +975,10 @@ class FalconDashboard(App):
     ENABLE_COMMAND_PALETTE = False
     CSS = CSS
     BINDINGS = [
-        Binding("q", "quit", "Quit"), Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
+        Binding("q", "quit", "Quit"),
+        Binding("ctrl+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
+        Binding("command+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
+        Binding("cmd+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("tab", "next_pane", "Next pane", priority=True),
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
         Binding("1", "focus_jobs", "Jobs", show=False), Binding("2", "focus_resources", "Resources", show=False),
@@ -740,7 +994,7 @@ class FalconDashboard(App):
         Binding("space", "toggle_mark", "Mark", show=False), Binding("shift+space", "mark_next", "Mark next", show=False),
         Binding("a", "mark_all", "Mark all", show=False), Binding("A", "clear_marks", "Clear marks", show=False),
         Binding("m", "marked_only", "Marked only", show=False), Binding("f9", "kill", "Kill", show=False),
-        Binding("c", "cleanup", "Clean succeeded", show=False),
+        Binding("c", "toggle_selected_or_cleanup", "Collapse / expand", show=False),
         Binding("/", "search", "Search", show=False), Binding("f", "filters", "Filters", show=False),
         Binding("v", "panes", "Visible panes", show=False),
         Binding("s", "cycle_sort", "Sort", show=False), Binding("?", "help", "Help", show=False),
@@ -759,6 +1013,8 @@ class FalconDashboard(App):
         coder_workspace_action: Optional[Callable[[str, str], None]] = None,
         clock: Optional[Callable[[], str]] = None,
         color_mode: Optional[str] = None,
+        log_manager: Optional[DashboardLogManager] = None,
+        launch_config: Optional[Mapping[str, Any]] = None,
     ):
         super().__init__()
         self.color_mode = configure_color(self.console, color_mode)
@@ -774,6 +1030,8 @@ class FalconDashboard(App):
         self._persist_sort = persist_sort
         self._coder_workspace_action = coder_workspace_action
         self._clock = clock or (lambda: datetime.now().strftime("%H:%M:%S"))
+        self.log_manager = log_manager
+        self.launch_config: Mapping[str, Any] = launch_config or {}
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
@@ -790,6 +1048,7 @@ class FalconDashboard(App):
         self._expanded_resource_charts: Dict[str, _ResourceHistoryChart] = {}
         self._expanded_resource_uid: Optional[str] = None
         self._building_expanded_resource = False
+        self._selected_log_view_key: Optional[Tuple[str, str, int]] = None
 
     @property
     def selected(self) -> int:
@@ -829,6 +1088,8 @@ class FalconDashboard(App):
         self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
+        if self.log_manager is not None:
+            self.set_interval(0.2, self._render_log_updates)
         # Textual delivers terminal Resize to the active Screen rather than
         # reliably bubbling it to App in every supported version.  A cheap
         # size watcher makes live resize deterministic across that range.
@@ -837,6 +1098,8 @@ class FalconDashboard(App):
         self._render_all()
 
     def on_unmount(self) -> None:
+        if self.log_manager is not None:
+            self.log_manager.close()
         close = getattr(self.collector, "close", None)
         if close:
             close()
@@ -930,7 +1193,10 @@ class FalconDashboard(App):
                 self._move_cursor(amount)
         elif pane == "selected":
             if self.state.expanded_pane == "selected":
-                self._scroll_expanded_pane("selected", amount)
+                if self.log_manager is None:
+                    self._scroll_expanded_pane("selected", amount)
+                else:
+                    self._scroll_selected_section(amount)
             else:
                 self._move_cursor(amount)
         elif pane == "events":
@@ -1122,6 +1388,8 @@ class FalconDashboard(App):
             self._stale = bool(error)
             self._record_history()
             self._filter_rows()
+            if self.log_manager is not None:
+                self.log_manager.reconcile(self.rows)
             if error:
                 self.notify(f"API error: {error} · retrying…", severity="warning")
             if event_uid != self.state.cursor_job_uid:
@@ -1323,22 +1591,415 @@ class FalconDashboard(App):
             lines.extend(textwrap.wrap(source_line, width=width, replace_whitespace=False) or [""])
         return lines
 
+    def _selected_attempts(self, row: JobUsage) -> List[PodAttempt]:
+        attempts = list(row.attempt_details)
+        if attempts:
+            return attempts
+        if row.active_pod:
+            return [
+                PodAttempt(
+                    name=row.active_pod,
+                    uid=row.active_pod_uid or row.active_pod,
+                    phase=(
+                        "Running"
+                        if row.active_pod_state.lower() == "running"
+                        else "Unknown"
+                    ),
+                )
+            ]
+        return []
+
+    def _selected_attempt(self, row: JobUsage) -> Optional[PodAttempt]:
+        attempts = self._selected_attempts(row)
+        if not attempts:
+            self.state.selected_attempt_index = -1
+            return None
+        index = self.state.selected_attempt_index
+        if index < 0:
+            active = [
+                attempt_index
+                for attempt_index, attempt in enumerate(attempts)
+                if not attempt.terminal
+            ]
+            index = active[-1] if active else len(attempts) - 1
+        index = max(0, min(len(attempts) - 1, index))
+        self.state.selected_attempt_index = index
+        return attempts[index]
+
+    @staticmethod
+    def _command_quantity(value: float, suffix: str = "") -> str:
+        if float(value).is_integer():
+            return f"{int(value)}{suffix}"
+        return f"{value:g}{suffix}"
+
+    def _reconstructed_command(self, row: JobUsage) -> str:
+        """Build the shortest valid Falcon invocation for a Job.
+
+        The Job inventory contains resolved manifest values, while Falcon's
+        CLI intentionally supplies most of those values from configuration or
+        planner defaults.  Prefer the public GPU-preset shorthand, omit the
+        generated name and default image, and only retain arguments that a
+        caller must provide to express this workload.
+        """
+
+        command: List[str] = ["falcon"]
+        if row.gpu_requested_count > 0 and row.gpu_requested_type not in {"", "-"}:
+            model = canonical_gpu(row.gpu_requested_type) or row.gpu_requested_type
+            preset = self._gpu_preset_name(model, row.gpu_requested_count)
+            if preset:
+                token = preset
+                if row.gpu_requested_count != 1:
+                    token = f"{token}x{row.gpu_requested_count}"
+                command.append(token)
+            else:
+                # An inventory can outlive a changed preset list or count
+                # limit.  The explicit form remains valid for custom models
+                # and avoids emitting a shorthand that the current config
+                # would reject.
+                command.extend(["--gpu", row.gpu_requested_type])
+                if row.gpu_requested_count != 1:
+                    command.extend(["--gpus", str(row.gpu_requested_count)])
+        else:
+            # CPU-only launches have no planner shorthand; both values are
+            # required by the CLI even when their limits default to requests.
+            command.extend(
+                [
+                    "--cpu",
+                    self._command_quantity(row.cpu_requested),
+                    "--memory",
+                    self._command_quantity(row.memory_requested_gib, "Gi"),
+                ]
+            )
+
+        default_image = self._configured_default_image()
+        if row.image and row.image != default_image:
+            command.extend(["--image", row.image])
+        try:
+            command_argv = shlex.split(row.command) if row.command else []
+        except ValueError:
+            command_argv = [row.command] if row.command else []
+        if command_argv:
+            command.extend(["--", *command_argv])
+        return shlex.join(command)
+
+    def _configured_default_image(self) -> Optional[str]:
+        runtime = self.launch_config.get("runtime", {})
+        if isinstance(runtime, Mapping):
+            image = runtime.get("image")
+            return str(image) if image else None
+        return None
+
+    def _gpu_preset_name(self, model: str, count: int) -> Optional[str]:
+        presets = self.launch_config.get("presets", {})
+        if not isinstance(presets, Mapping):
+            return None
+        wanted = canonical_gpu(model)
+        for name, preset in presets.items():
+            if not isinstance(preset, Mapping):
+                continue
+            configured = preset.get("gpu_type", name)
+            if canonical_gpu(str(configured)) == wanted:
+                try:
+                    maximum = int(preset.get("max_count", 8))
+                except (TypeError, ValueError):
+                    maximum = 8
+                if count <= maximum:
+                    return str(name)
+                return None
+        return None
+
+    def selected_section_focused(self, section_id: str) -> None:
+        # A nested inspector viewport is still part of the Selected Job pane.
+        # Record both levels of focus here.  In particular, after a terminal
+        # reconnect Textual may restore the last top-level pane (usually
+        # Jobs) without changing the widget under the mouse; relying only on
+        # ``screen.focused`` would then leave arrows and the footer routed to
+        # the wrong pane even though Logs visibly received the click.
+        self.state.focused_pane = "selected"
+        if section_id == "selected-logs-scroll":
+            self.state.selected_section = "logs"
+        self._set_titles()
+        self._set_selected_subtitle()
+        self._render_footer()
+
+    def selected_section_scrolled(
+        self, section_id: str, scroll_y: float, max_scroll_y: float
+    ) -> None:
+        """Track whether a manually scrolled Logs viewport should follow."""
+
+        if section_id != "selected-logs-scroll":
+            return
+        self.state.logs_auto_follow = float(scroll_y) >= float(max_scroll_y) - 0.01
+        self._set_selected_subtitle()
+
+    def _selected_attempt_label(self, row: Optional[JobUsage]) -> str:
+        if row is None:
+            return "No Pod attempt"
+        attempts = self._selected_attempts(row)
+        attempt = self._selected_attempt(row)
+        if attempt is None:
+            return "No Pod attempt"
+        index = attempts.index(attempt) if attempt in attempts else -1
+        return (
+            f"Pod {index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+            if index >= 0
+            else f"Pod · {attempt.name} · {attempt.phase}"
+        )
+
+    def _set_selected_subtitle(self) -> None:
+        """Show the active inspector section and selected Pod in its border."""
+
+        try:
+            target = self.query_one("#selected-pane", DashboardPane)
+        except NoMatches:
+            return
+        if self.state.expanded_pane != "selected":
+            target.border_subtitle = ""
+            return
+        # Keep the selected section visibly marked even when the terminal
+        # itself is unfocused (Textual may clear its :focus pseudo-class while
+        # a tmux pane is being reattached).
+        for section, selector in (("logs", "#selected-logs-scroll"),):
+            try:
+                widget = self.query_one(selector)
+                widget.set_class(
+                    self.state.selected_section == section, "selected"
+                )
+            except NoMatches:
+                pass
+        row = self._selected_row()
+        section = self.state.selected_section.upper()
+        target.border_subtitle = f" {section} · {self._selected_attempt_label(row)} "
+
+    def _focus_selected_section(self) -> None:
+        """Give the active Logs viewport the real keyboard focus."""
+
+        if self.state.expanded_pane != "selected":
+            return
+        self.state.focused_pane = "selected"
+        target_id = "#selected-logs-scroll"
+        try:
+            target = self.query_one(target_id)
+        except NoMatches:
+            return
+        self.set_focus(target, scroll_visible=False)
+        self._set_selected_subtitle()
+
+    def _selected_inspector_active(self) -> bool:
+        return (
+            self.log_manager is not None
+            and self.state.expanded_pane == "selected"
+            and self._selected_row() is not None
+        )
+
+    def _copy_selected_content(self, section: Optional[str] = None) -> None:
+        """Copy the focused Logs pane or the command copy affordance."""
+
+        row = self._selected_row()
+        if row is None:
+            self.notify("No Job selected", severity="warning")
+            return
+        requested_section = section
+        if section == "logs":
+            self.state.selected_section = "logs"
+        section = requested_section or self.state.selected_section
+        if section == "command":
+            value = self._reconstructed_command(row)
+            label = "command"
+        else:
+            attempt = self._selected_attempt(row)
+            if self.log_manager is None or attempt is None:
+                self.notify("Logs unavailable", severity="warning")
+                return
+            self._ensure_selected_terminal_logs(row)
+            snapshot = self.log_manager.snapshot(row, attempt)
+            value = "\n".join(snapshot.lines)
+            if snapshot.error:
+                value += f"\n\n[{snapshot.error}]" if value else f"[{snapshot.error}]"
+            if not value:
+                self.notify("No log output yet", severity="warning")
+                return
+            label = "logs"
+        try:
+            self.copy_to_clipboard(value)
+        except Exception as exc:
+            self.notify(
+                f"Could not copy {label}: {exc}",
+                severity="warning",
+            )
+        else:
+            self.notify(f"Copied {label}")
+        self._set_selected_subtitle()
+
+    def selected_button_pressed(self, button_id: str) -> None:
+        if button_id == "selected-command-copy":
+            self._copy_selected_content("command")
+            # Command is a metadata action, not a selectable inspector pane.
+            # Return focus to Logs after the click so the copy action cannot
+            # leave the outer inspector in a transient focus-within layout.
+            self.call_after_refresh(self._focus_selected_section)
+            return
+        elif button_id == "selected-logs-copy":
+            self._copy_selected_content("logs")
+        else:
+            return
+        self.call_after_refresh(self._focus_selected_section)
+
+    def action_copy_or_quit(self) -> None:
+        if self._selected_inspector_active():
+            self._copy_selected_content()
+            return
+        self.action_quit()
+
+    def action_toggle_selected_or_cleanup(self) -> None:
+        if self._selected_inspector_active():
+            if self.state.selected_section != "logs":
+                return
+            self.state.logs_collapsed = not self.state.logs_collapsed
+            # Re-opening a log viewport starts at its newest output.
+            self.state.logs_auto_follow = True
+            self._render_selected()
+            self.call_after_refresh(self._focus_selected_section)
+            return
+        self.action_cleanup()
+
+    def _ensure_selected_terminal_logs(self, row: JobUsage) -> None:
+        if self.log_manager is None:
+            return
+        attempt = self._selected_attempt(row)
+        if attempt is not None and attempt.terminal:
+            self.log_manager.ensure_terminal_logs(row, attempt)
+
+    def _ensure_selected_terminal_logs_for_current(self) -> None:
+        row = self._selected_row()
+        if row is not None:
+            self._ensure_selected_terminal_logs(row)
+
+    def _render_log_updates(self) -> None:
+        if self.log_manager is not None and self.is_mounted:
+            prune = getattr(self.log_manager, "prune", None)
+            if callable(prune):
+                prune()
+        if (
+            self.log_manager is not None
+            and self.is_mounted
+            and self.state.expanded_pane == "selected"
+        ):
+            try:
+                row = self._selected_row()
+                attempt = self._selected_attempt(row) if row is not None else None
+                revision_for = getattr(
+                    self.log_manager, "snapshot_revision", None
+                )
+                if row is not None and attempt is not None and callable(revision_for):
+                    view_key = (
+                        row.uid,
+                        attempt.uid or attempt.name,
+                        int(revision_for(row, attempt)),
+                    )
+                    if view_key == self._selected_log_view_key:
+                        return
+                else:
+                    view_key = None
+                self._render_selected()
+                if view_key is not None:
+                    self._selected_log_view_key = view_key
+            except NoMatches:
+                return
+
+    def _scroll_selected_section(self, amount: int) -> None:
+        target_id = "#selected-logs-scroll"
+        try:
+            target = self.query_one(target_id, SelectedJobScroll)
+        except NoMatches:
+            return
+        target.scroll_relative(
+            y=amount,
+            animate=False,
+            force=True,
+            immediate=True,
+        )
+        if self.state.selected_section == "logs":
+            self.state.logs_auto_follow = (
+                float(target.scroll_y) >= float(target.max_scroll_y) - 0.01
+            )
+        self._set_selected_subtitle()
+
+    def _page_selected_section(self, direction: int) -> None:
+        target_id = "#selected-logs-scroll"
+        try:
+            target = self.query_one(target_id, SelectedJobScroll)
+        except NoMatches:
+            return
+        self._scroll_selected_section(max(1, target.size.height - 1) * direction)
+
+    def _jump_selected_section(self, end: bool) -> None:
+        target_id = "#selected-logs-scroll"
+        try:
+            target = self.query_one(target_id, SelectedJobScroll)
+        except NoMatches:
+            return
+        if end:
+            target.scroll_end(animate=False, force=True, immediate=True)
+        else:
+            target.scroll_home(animate=False, force=True, immediate=True)
+        if self.state.selected_section == "logs":
+            self.state.logs_auto_follow = end
+        self._set_selected_subtitle()
+
+    def _move_selected_attempt(self, amount: int) -> None:
+        row = self._selected_row()
+        if row is None:
+            return
+        attempts = self._selected_attempts(row)
+        if not attempts:
+            return
+        current = self._selected_attempt(row)
+        index = attempts.index(current) if current in attempts else len(attempts) - 1
+        next_index = max(0, min(len(attempts) - 1, index + amount))
+        if next_index == index:
+            return
+        self.state.selected_attempt_index = next_index
+        self.state.logs_auto_follow = True
+        self._ensure_selected_terminal_logs(row)
+        try:
+            self.query_one("#selected-logs-scroll", SelectedJobScroll).scroll_home(
+                animate=False, force=True, immediate=True
+            )
+        except NoMatches:
+            pass
+        self._set_selected_subtitle()
+        self._render_selected()
+
     def _render_selected(self) -> None:
         row = self._selected_row()
         target = self.query_one("#selected-pane", DashboardPane)
+        compact_content = target.query_one(
+            "#selected-pane-content", DashboardPaneContent
+        )
+        inspector = target.query_one("#selected-inspector", SelectedJobInspector)
         if not row:
-            target.update(Text("No Job selected", style=MUTED))
+            self._selected_log_view_key = None
+            compact_content.update(Text("No Job selected", style=MUTED))
+            inspector.clear()
+            compact_content.display = True
+            inspector.display = False
             return
         if self.state.expanded_pane == "selected":
+            compact_content.display = False
+            inspector.display = True
             status_icon, status_color = _status_style(row.status)
-            overview = Table.grid(expand=True, padding=(0, 2))
-            overview.add_column(style=GRAY, width=18)
-            overview.add_column(style=WHITE, ratio=1)
+            attempt = self._selected_attempt(row)
+            attempts = self._selected_attempts(row)
+            attempt_index = attempts.index(attempt) if attempt in attempts else -1
+            selected_pod = attempt.name if attempt is not None else (row.active_pod or "—")
+            pod_phase = attempt.phase if attempt is not None else (row.active_pod_state or "—")
+            pod_uid = _truncate(attempt.uid, 16) if attempt is not None and attempt.uid else "—"
+            pod_container = attempt.container if attempt is not None and attempt.container else "—"
             details = [
                 ("Job", row.job), ("Status", f"{status_icon} {row.status}"),
                 ("Active pod state", row.active_pod_state), ("Active pod", row.active_pod or "—"),
                 ("Node", row.nodes), ("Age", row.age),
-                ("Created", row.created_at or "—"), ("Started", row.started_at or "—"),
                 (
                     "GPU requested",
                     _gpu_display(
@@ -1355,6 +2016,8 @@ class FalconDashboard(App):
                 ),
                 ("CPU request", f"{_short_cpu(row.cpu_requested)} vCPU"),
                 ("RAM request", _short_memory(row.memory_requested_gib)),
+            ]
+            right_details = [
                 ("Container restarts", str(row.container_restarts)),
                 ("Pod attempts", str(row.pod_attempts)),
                 ("Succeeded attempts", str(row.succeeded_attempts)),
@@ -1369,27 +2032,116 @@ class FalconDashboard(App):
                 ("VRAM 60s average", "—" if row.vram_risk_average is None else f"{row.vram_risk_average:.1f}%"),
                 ("Eviction risk", "YES" if row.at_risk else "No"),
             ]
-            for label, value in details:
-                value_style = status_color if label == "Status" else (RED if label == "Eviction risk" and row.at_risk else WHITE)
-                overview.add_row(label, Text(value, style=value_style))
-            command_lines = self._wrapped_command(row)
-            command = Panel(
-                Text("\n".join(command_lines), style=WHITE),
-                title=Text(" COMMAND ", style=f"bold {CYAN}"),
-                border_style=BORDER, box=box.SQUARE,
+            # Real dashboards have a selected attempt and log manager, so
+            # expose the Pod identity alongside the Job-level metrics.  The
+            # deterministic demo collector keeps its legacy single-page
+            # layout for visual fixtures and does not pretend its synthetic
+            # Pod metadata came from Kubernetes.
+            if self.log_manager is not None:
+                details[4:4] = [
+                    ("Selected pod", selected_pod),
+                    ("Pod phase", pod_phase),
+                ]
+                right_details[0:0] = [
+                    ("Pod UID", pod_uid),
+                    ("Pod container", pod_container),
+                    (
+                        "Pod selection",
+                        f"{attempt_index + 1}/{len(attempts)}"
+                        if attempt_index >= 0
+                        else "—",
+                    ),
+                ]
+            def detail_table(values: List[Tuple[str, str]]) -> Table:
+                table = Table.grid(expand=True, padding=(0, 1))
+                table.add_column(style=GRAY, width=18)
+                table.add_column(style=WHITE, ratio=1)
+                for label, value in values:
+                    value_style = (
+                        status_color
+                        if label == "Status"
+                        else RED
+                        if label == "Eviction risk" and row.at_risk
+                        else WHITE
+                    )
+                    table.add_row(label, Text(value, style=value_style))
+                return table
+
+            detail_columns = (detail_table(details), detail_table(right_details))
+            # Demo collectors do not own a Kubernetes log manager. Keep their
+            # expanded rendering as a single Rich page so the deterministic
+            # visual/scroll fixtures remain useful without starting fake
+            # subprocesses; real dashboards use the nested inspector below.
+            if self.log_manager is None:
+                compact_content.display = True
+                inspector.display = False
+                legacy_overview = Table.grid(expand=True, padding=(0, 2))
+                legacy_overview.add_column(style=GRAY, width=18)
+                legacy_overview.add_column(style=WHITE, ratio=1)
+                legacy_values = (
+                    details[:6]
+                    + [("Created", row.created_at or "—"), ("Started", row.started_at or "—")]
+                    + details[6:]
+                    + right_details
+                )
+                for label, value in legacy_values:
+                    value_style = (
+                        status_color
+                        if label == "Status"
+                        else RED
+                        if label == "Eviction risk" and row.at_risk
+                        else WHITE
+                    )
+                    legacy_overview.add_row(label, Text(value, style=value_style))
+                target.update(
+                    Group(
+                        Panel(
+                            legacy_overview,
+                            title=Text(" JOB DETAILS ", style=f"bold {CYAN}"),
+                            border_style=BORDER,
+                            box=box.SQUARE,
+                        ),
+                        Panel(
+                            Text("\n".join(self._wrapped_command(row)), style=WHITE),
+                            title=Text(" COMMAND ", style=f"bold {CYAN}"),
+                            border_style=BORDER,
+                            box=box.SQUARE,
+                        ),
+                    )
+                )
+                target.border_subtitle = ""
+                return
+            if attempt is not None:
+                self._ensure_selected_terminal_logs(row)
+            if self.log_manager is not None and attempt is not None:
+                logs = self.log_manager.snapshot(row, attempt)
+                self._selected_log_view_key = (
+                    row.uid,
+                    attempt.uid or attempt.name,
+                    int(getattr(logs, "revision", 0)),
+                )
+            else:
+                logs = LogSnapshot(
+                    pod_name=attempt.name if attempt else "",
+                    status="unavailable",
+                    error="Logs unavailable in demo mode" if self.log_manager is None else "",
+                )
+                self._selected_log_view_key = None
+            attempt_label = (
+                f"Pod {attempt_index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+                if attempt is not None
+                else "No Pod attempt"
             )
-            content = Group(
-                Panel(
-                    overview,
-                    title=Text(" JOB DETAILS ", style=f"bold {CYAN}"),
-                    border_style=BORDER,
-                    box=box.SQUARE,
-                ),
-                command,
+            inspector.update_view(
+                detail_columns,
+                logs,
+                logs_collapsed=self.state.logs_collapsed,
+                attempt_label=attempt_label,
             )
-            target.border_subtitle = ""
-            target.update(content)
+            self._set_selected_subtitle()
             return
+        compact_content.display = True
+        inspector.display = False
         command = _truncate(row.command or "—", max(8, self.size.width // 3))
         marked = len(self.state.marked_job_uids)
         text = Text(row.job, style=f"bold {WHITE}")
@@ -2007,7 +2759,7 @@ class FalconDashboard(App):
                 )
         elif self.state.focused_pane == "selected":
             value = (
-                "↑/↓ Scroll   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
+                "↑/↓ Scroll   ←/→ Pods   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
                 if self.state.expanded_pane == "selected"
                 else f"↑/↓ Change Job   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
             )
@@ -2141,15 +2893,27 @@ class FalconDashboard(App):
 
     def action_expand(self) -> None:
         self.state.expanded_pane = self.state.focused_pane
+        if self.state.expanded_pane == "selected":
+            self.state.selected_section = "logs"
+            self.state.logs_auto_follow = True
+            self._ensure_selected_terminal_logs_for_current()
         self._apply_layout()
         self._render_all()
         self.call_after_refresh(self._render_all)
+        if self.state.expanded_pane == "selected" and self.log_manager is not None:
+            self.call_after_refresh(self._focus_selected_section)
 
     def action_toggle_expand(self) -> None:
         self.state.expanded_pane = None if self.state.expanded_pane else self.state.focused_pane
+        if self.state.expanded_pane == "selected":
+            self.state.selected_section = "logs"
+            self.state.logs_auto_follow = True
+            self._ensure_selected_terminal_logs_for_current()
         self._apply_layout()
         self._render_all()
         self.call_after_refresh(self._render_all)
+        if self.state.expanded_pane == "selected" and self.log_manager is not None:
+            self.call_after_refresh(self._focus_selected_section)
 
     def action_escape(self) -> None:
         # Application bindings remain active while a ModalScreen is mounted in
@@ -2184,6 +2948,10 @@ class FalconDashboard(App):
         self.state.events_scroll_offset = 0
         self.state.events_auto_follow = True
         self.state.resource_scroll_offset = 0
+        self.state.selected_attempt_index = -1
+        self.state.selected_section = "logs"
+        self.state.logs_collapsed = False
+        self.state.logs_auto_follow = True
         for pane in ("selected", "resources"):
             self.query_one(f"#{pane}-pane", DashboardPane).scroll_home(
                 animate=False,
@@ -2195,7 +2963,10 @@ class FalconDashboard(App):
 
     def action_up(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_expanded_pane("selected", -1)
+            if self.log_manager is None:
+                self._scroll_expanded_pane("selected", -1)
+            else:
+                self._scroll_selected_section(-1)
             return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(-1)
@@ -2208,7 +2979,10 @@ class FalconDashboard(App):
 
     def action_down(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._scroll_expanded_pane("selected", 1)
+            if self.log_manager is None:
+                self._scroll_expanded_pane("selected", 1)
+            else:
+                self._scroll_selected_section(1)
             return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(1)
@@ -2226,11 +3000,15 @@ class FalconDashboard(App):
             self.action_up()
 
     def action_left(self) -> None:
-        if self.state.focused_pane == "resources":
+        if self.log_manager is not None and self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
+            self._move_selected_attempt(-1)
+        elif self.state.focused_pane == "resources":
             self._scroll_history(1)
 
     def action_right(self) -> None:
-        if self.state.focused_pane == "resources":
+        if self.log_manager is not None and self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
+            self._move_selected_attempt(1)
+        elif self.state.focused_pane == "resources":
             self._scroll_history(-1)
 
     def _scroll_events(self, amount: int) -> None:
@@ -2284,7 +3062,10 @@ class FalconDashboard(App):
 
     def action_page_up(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._page_expanded_pane("selected", -1)
+            if self.log_manager is None:
+                self._page_expanded_pane("selected", -1)
+            else:
+                self._page_selected_section(-1)
         elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
             self._page_expanded_pane("resources", -1)
         elif self.state.focused_pane == "resources":
@@ -2296,7 +3077,10 @@ class FalconDashboard(App):
 
     def action_page_down(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._page_expanded_pane("selected", 1)
+            if self.log_manager is None:
+                self._page_expanded_pane("selected", 1)
+            else:
+                self._page_selected_section(1)
         elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
             self._page_expanded_pane("resources", 1)
         elif self.state.focused_pane == "resources":
@@ -2308,7 +3092,10 @@ class FalconDashboard(App):
 
     def action_home(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._jump_expanded_pane("selected", False)
+            if self.log_manager is None:
+                self._jump_expanded_pane("selected", False)
+            else:
+                self._jump_selected_section(False)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = False
             self.state.events_scroll_offset = 0
@@ -2323,7 +3110,10 @@ class FalconDashboard(App):
 
     def action_end(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
-            self._jump_expanded_pane("selected", True)
+            if self.log_manager is None:
+                self._jump_expanded_pane("selected", True)
+            else:
+                self._jump_selected_section(True)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = True
             self._render_events()

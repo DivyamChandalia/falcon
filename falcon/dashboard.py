@@ -20,6 +20,7 @@ from .config import (
     save_dashboard_sort,
     save_hidden_panes,
 )
+from .dashboard_logs import DashboardLogManager
 from .resource_service import ResourceServiceCollector
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
@@ -63,6 +64,30 @@ class GpuSample:
     memory_total_gib: float = 0.0
     gpu_count: int = 0
     devices: List[GpuDevice] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PodAttempt:
+    """Identity and lifecycle data for one Job Pod attempt.
+
+    The dashboard keeps this separate from the aggregate attempt counters so
+    the log inspector can move between active and terminal Pods without
+    issuing another inventory query for every arrow press.
+    """
+
+    name: str
+    uid: str = ""
+    phase: str = "Unknown"
+    created_at: str = ""
+    container: str = "main"
+
+    @property
+    def running(self) -> bool:
+        return self.phase.lower() == "running"
+
+    @property
+    def terminal(self) -> bool:
+        return self.phase.lower() in {"succeeded", "failed"}
 
 
 @dataclass
@@ -118,6 +143,8 @@ class JobUsage:
     failed_attempts: int = 0
     backoff_limit: Optional[int] = None
     attempt_pods: List[str] = field(default_factory=list)
+    attempt_details: Tuple[PodAttempt, ...] = ()
+    image: str = ""
 
     @property
     def gpu_memory_percent(self) -> Optional[float]:
@@ -191,6 +218,19 @@ def _active_pod(pods: List[Dict]) -> Optional[Dict]:
     nonterminal = [pod for pod in pods if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}]
     choices = nonterminal or pods
     return max(choices, key=lambda pod: _timestamp(pod.get("metadata", {}).get("creationTimestamp", "")))
+
+
+def _main_container_name(pod: Mapping[str, Any]) -> str:
+    """Return the user workload container, preferring the conventional name."""
+
+    containers = (pod.get("spec") or {}).get("containers") or []
+    for container in containers:
+        name = str(container.get("name") or "")
+        if name == "main":
+            return name
+    if containers:
+        return str(containers[0].get("name") or "main")
+    return "main"
 
 
 def _job_status(job_item: Optional[Dict], pod_states: List[str]) -> str:
@@ -1076,6 +1116,7 @@ class UsageCollector:
                         + (primary.get("args") or [])
                     )
                 ),
+                "image": str(primary.get("image") or ""),
             }
 
         groups: Dict[str, Dict] = {
@@ -1107,6 +1148,7 @@ class UsageCollector:
                         + (primary.get("args") or [])
                     )
                 )
+                group["image"] = str(primary.get("image") or "")
             if is_running:
                 if spec.get("nodeName"):
                     group["active_nodes"].add(spec["nodeName"])
@@ -1215,6 +1257,22 @@ class UsageCollector:
             )
             failed_attempts = sum(value == "Failed" for value in statuses)
             completions = str(job_spec.get("completions", 1)) if group.get("job_item") else "—"
+            attempt_details = tuple(
+                PodAttempt(
+                    name=str((pod.get("metadata") or {}).get("name") or ""),
+                    uid=str((pod.get("metadata") or {}).get("uid") or ""),
+                    phase=str((pod.get("status") or {}).get("phase") or "Unknown"),
+                    created_at=str((pod.get("metadata") or {}).get("creationTimestamp") or ""),
+                    container=_main_container_name(pod),
+                )
+                for pod in sorted(
+                    group["pod_items"],
+                    key=lambda item: _timestamp(
+                        str((item.get("metadata") or {}).get("creationTimestamp") or "")
+                    ),
+                )
+                if (pod.get("metadata") or {}).get("name")
+            )
             result.append(JobUsage(
                 job=job,
                 status=status,
@@ -1276,13 +1334,22 @@ class UsageCollector:
                     for pod in group["pod_items"]
                     if pod.get("metadata", {}).get("name")
                 ],
+                attempt_details=attempt_details,
+                image=str(group.get("image") or ""),
             ))
         return sorted(result, key=_job_sort_key)
 
 
 # The full-screen implementation lives separately so collection remains
-# testable without initializing Textual view state.
-from .dashboard_ui import FalconDashboard as FalconDashboard  # noqa: E402
+# testable without initializing Textual view state.  Keep the public
+# ``falcon.dashboard.FalconDashboard`` import lazy: importing ``dashboard_ui``
+# directly otherwise creates a cycle while the collector module is loading.
+def __getattr__(name: str):
+    if name == "FalconDashboard":
+        from .dashboard_ui import FalconDashboard
+
+        return FalconDashboard
+    raise AttributeError(name)
 
 
 class DemoUsageCollector:
@@ -1392,6 +1459,15 @@ class DemoUsageCollector:
                     failed_attempts=job.attempts.failed_attempts,
                     backoff_limit=job.attempts.backoff_limit,
                     attempt_pods=list(job.attempts.active_pods),
+                    attempt_details=tuple(
+                        PodAttempt(
+                            name=name,
+                            uid=name,
+                            phase="Running" if name == job.attempts.active_pod else "Unknown",
+                        )
+                        for name in job.attempts.active_pods
+                    ),
+                    image="",
                 )
             )
         return sorted(rows, key=_job_sort_key)
@@ -1463,6 +1539,7 @@ def run_dashboard(
     color_mode: Optional[str] = None,
 ) -> None:
     from .resources_history import stop_legacy_history_collector
+    from .dashboard_ui import FalconDashboard
 
     namespace = namespace or config["cluster"]["namespace"]
     thresholds = {
@@ -1494,6 +1571,11 @@ def run_dashboard(
             risk_average_samples=RISK_AVERAGE_SAMPLES,
         )
     )
+    log_manager = (
+        None
+        if demo_state
+        else DashboardLogManager(namespace)
+    )
 
     FalconDashboard(
         collector,
@@ -1510,4 +1592,6 @@ def run_dashboard(
             )
         ),
         color_mode=color_mode,
+        log_manager=log_manager,
+        launch_config=config,
     ).run(mouse=True)

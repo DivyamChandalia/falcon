@@ -19,7 +19,7 @@ keeps nodes, running Jobs, and free GPU/CPU/memory headroom on one line.
 - `/`: search; `f`: filters; `s`: sort
 - `Space`: mark; `a`: mark all; `A`: clear marks
 - `k` / `F9`: kill the marked Jobs, or the selected Job when none are marked
-- `c`: clean succeeded Jobs within the marked set; with no marks, clean all succeeded Jobs
+- `c`: clean succeeded Jobs within the marked set; with no marks, clean all succeeded Jobs. In the expanded Selected Job inspector, it switches Logs between full height and a two-line view.
 - `v`: choose visible panes
 - `r`: refresh; `q`: quit
 
@@ -27,9 +27,20 @@ Events follow the newest entry until the user scrolls backward. New events do
 not move a manually positioned viewport. `End` (or scrolling back to the last
 page) resumes follow. Changing Jobs resets event position predictably.
 
-The expanded Selected Job inspector scrolls as one page, including Job details
-and the full command. Use `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, or the
-mouse wheel; resizing is not required to reach fields below the fold.
+The expanded Selected Job inspector keeps compact two-column details above a
+full-height Logs viewport. A small, left-aligned Command row sits below RAM
+request, aligned with the metadata values; its copy icon is in the same value
+column as entries such as RAM and age. The label is informational and does not
+select a second pane. Logs are full-height by default and `c` switches them to
+a two-line viewport. `Ctrl/Cmd+C` copies the selected Logs viewport. The log
+viewport opens at the newest line and follows new output; `Home` or scrolling
+upward pauses follow until `End` resumes it. Click the Logs viewport to select
+it; it owns the keyboard and mouse-wheel scrolling.
+Running Pods stream non-interactive `attach` output; for
+succeeded or failed attempts Falcon loads the equivalent of
+`falcon logs --no-follow --tail 200`. `←`/`→` switches between Pod attempts,
+with the newest active Pod selected initially. Captured output is bounded to
+200 lines per Pod and expires from memory after 24 hours.
 
 The expanded Resource Usage inspector also scrolls as one page. When the mouse
 is over a GPU, VRAM, CPU, or RAM utilization card, the wheel moves through that
