@@ -943,6 +943,11 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
 DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; scrollbar-visibility: hidden; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
+# Keep the Selected Job frame highlighted while its nested Logs viewport owns
+# focus; otherwise clicking inside the inspector makes the parent frame look
+# inactive even though it is still the active pane.
+#selected-pane:focus-within {{ border: solid {CYAN}; }}
+#selected-pane.selected-active {{ border: solid {CYAN}; }}
 .dashboard-pane-content {{ width: 1fr; height: auto; }}
 #jobs-pane {{ height: 1fr; min-height: 7; }}
 #selected-pane {{ height: 3; min-height: 3; }}
@@ -950,7 +955,7 @@ DashboardPane:focus {{ border: solid {CYAN}; }}
 #selected-pane, #resources-pane {{ overflow-y: auto; scrollbar-size-vertical: 1; }}
 #selected-inspector {{ display: none; width: 1fr; height: 1fr; }}
 #selected-details {{ width: 1fr; min-width: 0; height: auto; padding: 0 1; }}
-.selected-detail-column {{ width: 1fr; min-width: 0; height: auto; }}
+.selected-detail-column {{ width: 50%; max-width: 50%; min-width: 0; height: auto; }}
 #selected-details-left, #selected-details-right {{ width: 1fr; min-width: 0; height: auto; }}
 .selected-section-actions {{ width: 1fr; height: 1; min-height: 1; padding: 0 1; align: right middle; }}
 .selected-section-actions Button {{ width: 3; min-width: 3; height: 1; min-height: 1; padding: 0 1; border: none; color: {CYAN}; background: {BACKGROUND}; }}
@@ -1753,6 +1758,7 @@ class FalconDashboard(App):
             target = self.query_one("#selected-pane", DashboardPane)
         except NoMatches:
             return
+        target.set_class(self.state.expanded_pane == "selected", "selected-active")
         if self.state.expanded_pane != "selected":
             target.border_subtitle = ""
             return
@@ -1974,6 +1980,7 @@ class FalconDashboard(App):
     def _render_selected(self) -> None:
         row = self._selected_row()
         target = self.query_one("#selected-pane", DashboardPane)
+        target.set_class(self.state.expanded_pane == "selected", "selected-active")
         compact_content = target.query_one(
             "#selected-pane-content", DashboardPaneContent
         )
@@ -2042,9 +2049,17 @@ class FalconDashboard(App):
                     ("Selected pod", selected_pod),
                     ("Pod phase", pod_phase),
                 ]
+                # Keep both detail columns at the same fixed row budget.  A
+                # separate UID and container row made the right column one
+                # line taller than the left column; its final Eviction-risk
+                # line then overlapped the left Command row at the exact same
+                # screen coordinate, causing Rich/Textual to composite the
+                # line with a changing horizontal offset on clicks.
+                pod_identity = pod_uid
+                if pod_container not in {"", "—"}:
+                    pod_identity = f"{pod_uid} · {_truncate(pod_container, 12)}"
                 right_details[0:0] = [
-                    ("Pod UID", pod_uid),
-                    ("Pod container", pod_container),
+                    ("Pod identity", pod_identity),
                     (
                         "Pod selection",
                         f"{attempt_index + 1}/{len(attempts)}"
@@ -2054,8 +2069,15 @@ class FalconDashboard(App):
                 ]
             def detail_table(values: List[Tuple[str, str]]) -> Table:
                 table = Table.grid(expand=True, padding=(0, 1))
-                table.add_column(style=GRAY, width=18)
-                table.add_column(style=WHITE, ratio=1)
+                # Keep each metadata item to one terminal row.  In addition
+                # to avoiding wrapped pod names, this guarantees that the
+                # Command row cannot overlap the right column's last row.
+                table.add_column(
+                    style=GRAY, width=18, no_wrap=True, overflow="ellipsis"
+                )
+                table.add_column(
+                    style=WHITE, ratio=1, no_wrap=True, overflow="ellipsis"
+                )
                 for label, value in values:
                     value_style = (
                         status_color

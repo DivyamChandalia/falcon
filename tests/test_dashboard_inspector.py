@@ -135,6 +135,7 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
             command_copy = app.query_one("#selected-command-copy")
             details_left = app.query_one("#selected-details-left")
             details_right = app.query_one("#selected-details-right")
+            selected_pane = app.query_one("#selected-pane")
             logs = app.query_one("#selected-logs-scroll")
             self.assertEqual(app.query_one("#selected-command-label").content, "Command")
             self.assertFalse(command.can_focus)
@@ -143,6 +144,14 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
             # The icon's glyph has one cell of Button padding, placing it at
             # the same value-column origin as the RAM and Age values.
             self.assertEqual(command_copy.region.x + 1, details_left.region.x + 19)
+            # The command row must be below both metadata columns. If the
+            # right column is taller, Rich/Textual composites its final row
+            # with Command and the Eviction-risk text visibly jitters when
+            # focus changes.
+            self.assertGreaterEqual(
+                command.region.y,
+                details_right.region.y + details_right.region.height,
+            )
             details_right_x = details_right.region.x
             self.assertGreater(logs.max_scroll_y, 0)
             self.assertEqual(int(logs.scroll_y), int(logs.max_scroll_y))
@@ -175,6 +184,8 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
                 offset=(10, max(0, logs_content.region.height - 2)),
             )
             self.assertIs(app.screen.focused, logs)
+            self.assertIn("focus-within", selected_pane.pseudo_classes)
+            self.assertIn("selected-active", selected_pane.classes)
             app.selected_section_focused("selected-logs-scroll")
             self.assertEqual(app.state.focused_pane, "selected")
             self.assertIn("selected", logs.classes)
