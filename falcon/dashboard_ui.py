@@ -30,7 +30,7 @@ from textual.geometry import NULL_OFFSET, Region, Size
 from textual.layout import ArrangeResult, Layout, WidgetPlacement
 from textual.layouts.vertical import VerticalLayout
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, RichLog, Static
 
 from .dashboard import (
     KUBERNETES_USAGE_SECONDS,
@@ -472,14 +472,145 @@ class DashboardPaneContent(Static):
         return height
 
 
-class SelectedJobScroll(VerticalScroll):
-    """A nested viewport that owns its mouse wheel and keyboard focus."""
+class SelectedJobScroll(RichLog):
+    """A virtualized log viewport that owns its mouse wheel and focus."""
 
     can_focus = True
     # Let FalconDashboard's context-aware bindings (Home/End, page movement,
     # and the Pod arrows) handle keys instead of VerticalScroll's generic
     # bindings, which would bypass the selected-section state.
     BINDINGS = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(
+            *args,
+            max_lines=None,
+            min_width=1,
+            wrap=True,
+            highlight=False,
+            markup=False,
+            auto_scroll=False,
+            **kwargs,
+        )
+        self._source_key = ""
+        self._source_lines: Tuple[str, ...] = ()
+        self._source_line_heights: List[int] = []
+        self._render_width = 0
+        self._rewrap_pending = False
+
+    @staticmethod
+    def _overlap(old: Tuple[str, ...], new: Tuple[str, ...]) -> int:
+        """Return the longest retained suffix/prefix shared by two snapshots."""
+
+        for count in range(min(len(old), len(new)), 0, -1):
+            if old[-count:] == new[:count]:
+                return count
+        return 0
+
+    def replace_content(
+        self,
+        source_key: str,
+        lines: Tuple[str, ...],
+        *,
+        follow: bool,
+    ) -> None:
+        """Apply a bounded snapshot, appending only newly captured lines."""
+
+        previous = self._source_lines if source_key == self._source_key else ()
+        if previous == lines:
+            if follow:
+                self.scroll_end(animate=False, force=True, immediate=False)
+            return
+
+        overlap = self._overlap(previous, lines)
+        if (
+            not previous
+            or (lines and overlap == 0)
+            or (len(lines) < len(previous) and overlap == len(lines))
+        ):
+            super().clear()
+            self._source_line_heights = []
+            overlap = 0
+        elif not lines:
+            super().clear()
+            self._source_line_heights = []
+            overlap = 0
+        else:
+            self._discard_source_prefix(len(previous) - overlap)
+
+        for line in lines[overlap:]:
+            self._write_source_line(line)
+        self._source_key = source_key
+        self._source_lines = lines
+        self._render_width = self.scrollable_content_region.width
+        if follow:
+            self.scroll_end(animate=False, force=True, immediate=False)
+
+    def _write_source_line(self, line: str) -> None:
+        before = len(self.lines)
+        self.write(
+            _display_log_line(line),
+            expand=True,
+            shrink=True,
+            scroll_end=False,
+        )
+        self._source_line_heights.append(len(self.lines) - before)
+
+    def _discard_source_prefix(self, count: int) -> None:
+        """Drop rendered strips belonging to logical lines leaving retention."""
+
+        if count <= 0:
+            return
+        strip_count = sum(self._source_line_heights[:count])
+        del self._source_line_heights[:count]
+        if not strip_count:
+            return
+        del self.lines[:strip_count]
+        self._start_line += strip_count
+        self._line_cache.clear()
+        self.virtual_size = Size(self._widest_line_width, len(self.lines))
+        self.scroll_y = max(0, self.scroll_y - strip_count)
+        self.scroll_target_y = max(0, self.scroll_target_y - strip_count)
+        self.refresh()
+
+    def on_resize(self, event: events.Resize) -> None:
+        super().on_resize(event)
+        if not self._source_lines or self._rewrap_pending:
+            return
+        self._rewrap_pending = True
+        self.call_after_refresh(self._rewrap_content)
+
+    def _rewrap_content(self) -> None:
+        """Reflow retained logical lines after the viewport width changes."""
+
+        self._rewrap_pending = False
+        width = self.scrollable_content_region.width
+        if width <= 0 or (
+            width == self._render_width
+            and len(self._source_line_heights) == len(self._source_lines)
+            and all(self._source_line_heights)
+        ):
+            return
+        maximum = float(self.max_scroll_y)
+        position = 1.0 if maximum <= 0 else float(self.scroll_y) / maximum
+        follow = getattr(
+            getattr(self.app, "state", None), "logs_auto_follow", True
+        )
+        retained = self._source_lines
+        super().clear()
+        self._source_line_heights = []
+        self._render_width = width
+        for line in retained:
+            self._write_source_line(line)
+        if follow:
+            self.scroll_end(animate=False, force=True, immediate=False)
+        else:
+            self.scroll_to(
+                y=round(position * self.max_scroll_y),
+                animate=False,
+                force=True,
+                immediate=False,
+            )
 
     def _activate_section(self) -> None:
         app = self.app
@@ -538,7 +669,7 @@ class SelectedJobScroll(VerticalScroll):
         if getattr(getattr(self.app, "state", None), "focused_pane", None) != "selected":
             self._activate_section()
         self.scroll_relative(
-            y=1, animate=False, force=True, immediate=True
+            y=1, animate=False, force=True, immediate=False
         )
         self._notify_scroll_position()
 
@@ -548,7 +679,7 @@ class SelectedJobScroll(VerticalScroll):
         if getattr(getattr(self.app, "state", None), "focused_pane", None) != "selected":
             self._activate_section()
         self.scroll_relative(
-            y=-1, animate=False, force=True, immediate=True
+            y=-1, animate=False, force=True, immediate=False
         )
         self._notify_scroll_position()
 
@@ -598,10 +729,7 @@ class SelectedJobInspector(Container):
                 compact=True,
                 flat=True,
             )
-        with SelectedJobScroll(id="selected-logs-scroll"):
-            yield DashboardPaneContent(
-                "No output yet", id="selected-logs-content", markup=False
-            )
+        yield SelectedJobScroll(id="selected-logs-scroll")
 
     def clear(self, message: str = "No Job selected") -> None:
         self.query_one("#selected-details-left", Static).update(
@@ -610,16 +738,11 @@ class SelectedJobInspector(Container):
         self.query_one("#selected-details-right", Static).update(
             ""
         )
-        self.query_one("#selected-logs-content", DashboardPaneContent).update(
-            "No output yet"
-        )
-        self.query_one("#selected-logs-scroll", SelectedJobScroll).remove_class(
-            "collapsed"
-        )
-        self.query_one("#selected-logs-scroll", SelectedJobScroll).remove_class(
-            "selected"
-        )
-        self.query_one("#selected-logs-scroll", SelectedJobScroll).border_title = " LOGS "
+        logs_scroll = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+        logs_scroll.replace_content("", ("No output yet",), follow=True)
+        logs_scroll.remove_class("collapsed")
+        logs_scroll.remove_class("selected")
+        logs_scroll.border_title = " LOGS "
 
     def update_view(
         self,
@@ -632,47 +755,33 @@ class SelectedJobInspector(Container):
         left_details, right_details = detail_columns
         self.query_one("#selected-details-left", Static).update(left_details)
         self.query_one("#selected-details-right", Static).update(right_details)
-        log_text = (
-            "\n".join(_display_log_line(line) for line in logs.lines)
-            if logs.lines
-            else "No output yet"
+        self.update_logs(
+            logs,
+            logs_collapsed=logs_collapsed,
+            attempt_label=attempt_label,
         )
-        if logs.error:
-            log_text += f"\n\n[{logs.error}]"
-        self.query_one("#selected-logs-content", DashboardPaneContent).update(
-            log_text
-        )
+
+    def update_logs(
+        self,
+        logs: LogSnapshot,
+        *,
+        logs_collapsed: bool,
+        attempt_label: str,
+    ) -> None:
+        """Update only the virtualized log body and its frame metadata."""
+
         logs_scroll = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+        log_lines = logs.lines or ("No output yet",)
+        if logs.error:
+            log_lines += ("", f"[{logs.error}]")
+        app = self.app
+        logs_scroll.replace_content(
+            logs.pod_name,
+            tuple(log_lines),
+            follow=getattr(getattr(app, "state", None), "logs_auto_follow", True),
+        )
         logs_scroll.border_title = f" LOGS · {attempt_label} "
         logs_scroll.set_class(logs_collapsed, "collapsed")
-
-        # ``update`` invalidates the content height, so Textual may not know
-        # the new maximum until the next layout pass.  Scroll immediately for
-        # an already-laid-out viewport and once more after refresh to ensure a
-        # newly appended line can never leave a following subscriber above
-        # the tail.
-        app = self.app
-        if getattr(getattr(app, "state", None), "logs_auto_follow", True):
-            logs_scroll.scroll_end(
-                animate=False, force=True, immediate=True
-            )
-
-            def follow_tail() -> None:
-                if not self.is_mounted:
-                    return
-                if not getattr(getattr(app, "state", None), "logs_auto_follow", True):
-                    return
-                try:
-                    current = self.query_one(
-                        "#selected-logs-scroll", SelectedJobScroll
-                    )
-                except NoMatches:
-                    return
-                current.scroll_end(
-                    animate=False, force=True, immediate=True
-                )
-
-            app.call_after_refresh(follow_tail)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         callback = getattr(self.app, "selected_button_pressed", None)
@@ -1090,7 +1199,7 @@ DashboardPane:focus {{ border: solid {CYAN}; }}
 #selected-command-label {{ width: 18; min-width: 18; height: 1; min-height: 1; color: {GRAY}; }}
 #selected-command-row Button {{ width: 3; min-width: 3; height: 1; min-height: 1; padding: 0 1; border: none; color: {CYAN}; background: {BACKGROUND}; }}
 #selected-command-row Button:hover, #selected-command-row Button:focus {{ color: {WHITE}; background: {BORDER}; }}
-SelectedJobScroll {{ width: 1fr; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
+SelectedJobScroll {{ width: 1fr; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; overflow-x: hidden; color: {WHITE}; background: {BACKGROUND}; }}
 SelectedJobScroll:focus {{ border: solid {CYAN}; }}
 SelectedJobScroll.selected {{ border: solid {CYAN}; }}
 #selected-logs-scroll {{ width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
@@ -1184,6 +1293,8 @@ class FalconDashboard(App):
         self._resource_pane_scroll_callback_pending = False
         self._building_expanded_resource = False
         self._selected_log_view_key: Optional[Tuple[str, str, int]] = None
+        self._jobs_render_pending = False
+        self._selection_render_pending = False
 
     @property
     def selected(self) -> int:
@@ -1678,8 +1789,32 @@ class FalconDashboard(App):
 
     def _scroll_jobs_view(self, amount: int) -> None:
         maximum = max(0, len(self.filtered_rows) - self._visible_job_count())
-        self.state.jobs_scroll_offset = max(0, min(maximum, self.state.jobs_scroll_offset + amount))
-        self._render_jobs(layout=False)
+        next_offset = max(
+            0,
+            min(maximum, self.state.jobs_scroll_offset + amount),
+        )
+        if next_offset == self.state.jobs_scroll_offset:
+            return
+        self.state.jobs_scroll_offset = next_offset
+        self._schedule_jobs_render()
+
+    def _schedule_jobs_render(self) -> None:
+        """Coalesce repeated Jobs-table movement into one render per frame."""
+
+        if self._jobs_render_pending:
+            return
+        self._jobs_render_pending = True
+
+        def flush() -> None:
+            self._jobs_render_pending = False
+            if not self.is_mounted:
+                return
+            try:
+                self._render_jobs(layout=False)
+            except NoMatches:
+                return
+
+        self.call_after_refresh(flush)
 
     def _render_jobs(self, *, layout: bool = True) -> None:
         target = self.query_one("#jobs-pane", DashboardPane)
@@ -2136,7 +2271,17 @@ class FalconDashboard(App):
                         return
                 else:
                     view_key = None
-                self._render_selected()
+                if row is None or attempt is None:
+                    return
+                snapshot = self.log_manager.snapshot(row, attempt)
+                inspector = self.query_one(
+                    "#selected-inspector", SelectedJobInspector
+                )
+                inspector.update_logs(
+                    snapshot,
+                    logs_collapsed=self.state.logs_collapsed,
+                    attempt_label=self._selected_attempt_label(row),
+                )
                 if view_key is not None:
                     self._selected_log_view_key = view_key
             except NoMatches:
@@ -2152,7 +2297,7 @@ class FalconDashboard(App):
             y=amount,
             animate=False,
             force=True,
-            immediate=True,
+            immediate=False,
         )
         if self.state.selected_section == "logs":
             self.state.logs_auto_follow = (
@@ -3212,7 +3357,10 @@ class FalconDashboard(App):
 
     def _move_cursor(self, amount: int) -> None:
         if self.filtered_rows:
+            previous_uid = self.state.cursor_job_uid
             self.selected = self.selected + amount
+            if self.state.cursor_job_uid == previous_uid:
+                return
             self._ensure_cursor_visible()
             self._selection_changed()
 
@@ -3228,10 +3376,35 @@ class FalconDashboard(App):
             self.query_one(f"#{pane}-pane", DashboardPane).scroll_home(
                 animate=False,
                 force=True,
-                immediate=True,
+                immediate=False,
             )
         self._request_update()
-        self._render_all()
+        self._schedule_selection_render()
+
+    def _schedule_selection_render(self) -> None:
+        """Render the latest cursor selection once per terminal frame."""
+
+        if self._selection_render_pending:
+            return
+        self._selection_render_pending = True
+
+        def flush() -> None:
+            self._selection_render_pending = False
+            if not self.is_mounted:
+                return
+            try:
+                # Header, summary, controls, and layout do not change when
+                # only the cursor moves. Avoid rebuilding them—and coalesce
+                # quick wheel/key bursts—while keeping all Job-dependent
+                # panes synchronized to the newest cursor position.
+                self._render_jobs(layout=False)
+                self._render_selected()
+                self._render_resources()
+                self._render_events()
+            except NoMatches:
+                return
+
+        self.call_after_refresh(flush)
 
     def action_up(self) -> None:
         if self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":

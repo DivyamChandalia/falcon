@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-09-18
+
+- Made Dashboard log scrolling smoother with a virtualized, incrementally
+  updated log viewport that retains line wrapping and auto-follow behavior.
+- Removed the log widget's gray surface by restoring Falcon's black background
+  and white foreground in both normal and focused states.
+- Coalesced rapid Jobs scrolling and selection changes into one render per
+  terminal frame, avoiding unnecessary full-dashboard rebuilds.
+
 ## 0.4.0 — 2026-09-18
 
 - Added the responsive Resources layout, with Nodes and Selected Node on the

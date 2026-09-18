@@ -62,6 +62,7 @@ from falcon.resources_ui import (
     _short_cpu,
 )
 from falcon.theme import (
+    BACKGROUND,
     CYAN,
     GREEN,
     MUTED,
@@ -707,10 +708,28 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause(0.5)
             logs = app.query_one("#selected-logs-scroll", SelectedJobScroll)
-            app.query_one("#selected-logs-content").update(
-                "\n".join(f"line-{index}" for index in range(200))
+            self.assertEqual(logs.styles.background.hex, BACKGROUND)
+            logs.replace_content(
+                "test-pod",
+                tuple(f"line-{index}" for index in range(200)),
+                follow=False,
             )
             await pilot.pause()
+            with patch.object(logs, "write", wraps=logs.write) as write:
+                logs.replace_content(
+                    "test-pod",
+                    tuple(f"line-{index}" for index in range(1, 201)),
+                    follow=False,
+                )
+                self.assertEqual(write.call_count, 1)
+            self.assertEqual(len(logs.lines), 200)
+            logs.replace_content(
+                "wrapped-pod",
+                ("long-value " * 500,),
+                follow=False,
+            )
+            await pilot.pause()
+            self.assertGreater(len(logs.lines), 1)
             app.state.focused_pane = "selected"
 
             class Wheel:
@@ -749,7 +768,33 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             )
             with patch.object(content, "update", wraps=content.update) as update:
                 app._scroll_jobs_view(1)
+                app._scroll_jobs_view(1)
+                await pilot.pause()
+                self.assertEqual(update.call_count, 1)
                 self.assertFalse(update.call_args.kwargs["layout"])
+
+    async def test_job_cursor_burst_coalesces_dependent_pane_renders(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("many"), refresh_seconds=999)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.5)
+            with (
+                patch.object(app, "_request_update"),
+                patch.object(
+                    app, "_render_selected", wraps=app._render_selected
+                ) as selected,
+                patch.object(
+                    app, "_render_resources", wraps=app._render_resources
+                ) as resources,
+                patch.object(app, "_render_events", wraps=app._render_events) as events,
+            ):
+                app._move_cursor(1)
+                app._move_cursor(1)
+                app._move_cursor(1)
+                selected.assert_not_called()
+                await pilot.pause()
+                self.assertEqual(selected.call_count, 1)
+                self.assertEqual(resources.call_count, 1)
+                self.assertEqual(events.call_count, 1)
 
     async def test_expanded_resources_routes_hovered_history_and_page_scroll(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)

@@ -176,12 +176,11 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(command.can_focus)
             self.assertEqual(app.state.selected_section, "logs")
             self.assertEqual(details_right.region.x, details_right_x)
-            logs_content = app.query_one("#selected-logs-content")
             # The selected log content is taller than its viewport and is
             # scrolled to the tail, so click a visible line near its bottom.
             await pilot.click(
-                "#selected-logs-content",
-                offset=(10, max(0, logs_content.region.height - 2)),
+                "#selected-logs-scroll",
+                offset=(10, max(0, logs.region.height - 2)),
             )
             self.assertIs(app.screen.focused, logs)
             self.assertIn("focus-within", selected_pane.pseudo_classes)
