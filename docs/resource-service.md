@@ -2,9 +2,10 @@
 
 Falcon clients use the read-only service at
 `http://node1.yoda.hyperverge.org:30081`. It is the sole poller of the local
-kube-state-metrics endpoint and the sole owner of the new 24-hour GPU
-allocation history. Existing per-user SQLite databases are neither migrated
-nor deleted.
+kube-state-metrics endpoint and the sole owner of the 24-hour allocation
+history (GPU count, VRAM, CPU cores, and memory). Existing per-user SQLite
+databases are neither migrated nor deleted; their additive CPU/memory columns
+are upgraded in place when opened by a new client.
 
 ## Installation on node1
 

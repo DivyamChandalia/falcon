@@ -72,11 +72,18 @@ _HEAVY_LINE_GLYPHS = {
 
 @dataclass(frozen=True)
 class GPUHistoryPoint:
-    """One namespace GPU-allocation observation."""
+    """One namespace resource-allocation observation.
+
+    ``usage_by_namespace`` and ``vram_by_namespace`` are the original
+    schema-v1 series.  CPU and memory series are optional so points loaded
+    from an older service or SQLite database remain valid.
+    """
 
     timestamp: float
     usage_by_namespace: tuple[tuple[str, float], ...]
     vram_by_namespace: tuple[tuple[str, float], ...] = ()
+    cpu_cores_by_namespace: tuple[tuple[str, float], ...] = ()
+    memory_gib_by_namespace: tuple[tuple[str, float], ...] = ()
 
     @classmethod
     def from_mapping(
@@ -84,6 +91,8 @@ class GPUHistoryPoint:
         timestamp: float,
         values: Mapping[str, float],
         vram_values: Mapping[str, float] | None = None,
+        cpu_values: Mapping[str, float] | None = None,
+        memory_values: Mapping[str, float] | None = None,
     ) -> "GPUHistoryPoint":
         def ordered(source: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
             return tuple(
@@ -91,6 +100,7 @@ class GPUHistoryPoint:
                     (
                         (str(name), max(0.0, float(value)))
                         for name, value in source.items()
+                        if float(value) > 0
                     ),
                     key=lambda item: natural_name_key(item[0]),
                 )
@@ -100,6 +110,8 @@ class GPUHistoryPoint:
             float(timestamp),
             ordered(values),
             ordered(vram_values or {}),
+            ordered(cpu_values or {}),
+            ordered(memory_values or {}),
         )
 
     @property
@@ -118,11 +130,39 @@ class GPUHistoryPoint:
     def vram_total(self) -> float:
         return sum(value for _, value in self.vram_by_namespace)
 
+    @property
+    def cpu_values(self) -> dict[str, float]:
+        return dict(self.cpu_cores_by_namespace)
+
+    @property
+    def cpu_total(self) -> float:
+        return sum(value for _, value in self.cpu_cores_by_namespace)
+
+    @property
+    def memory_values(self) -> dict[str, float]:
+        return dict(self.memory_gib_by_namespace)
+
+    @property
+    def memory_total(self) -> float:
+        return sum(value for _, value in self.memory_gib_by_namespace)
+
     def values_for(self, basis: str) -> dict[str, float]:
-        return self.vram_values if basis == "vram" else self.values
+        if basis == "vram":
+            return self.vram_values
+        if basis == "cpu":
+            return self.cpu_values
+        if basis == "memory":
+            return self.memory_values
+        return self.values
 
     def total_for(self, basis: str) -> float:
-        return self.vram_total if basis == "vram" else self.total
+        if basis == "vram":
+            return self.vram_total
+        if basis == "cpu":
+            return self.cpu_total
+        if basis == "memory":
+            return self.memory_total
+        return self.total
 
     @property
     def usage_by_node(self) -> tuple[tuple[str, float], ...]:
@@ -394,17 +434,21 @@ def render_gpu_history(
     categories: Sequence[tuple[str, float]] | None = None,
     colors: Mapping[str, str] | None = None,
     show_legend: bool = True,
+    log_scale: bool = False,
 ) -> Text:
     """Render a width-aware namespace allocation step chart.
 
     The legend is deliberately placed to the left of the graph. This keeps
     namespace names out of the chart's x-axis and gives the same percentage
-    treatment as the namespace pie.
+    treatment as the namespace pie. ``log_scale`` uses ``log1p`` so zero
+    allocations remain drawable while large request spikes do not flatten
+    smaller changes against the baseline.
     """
 
     width = max(1, int(width))
     height = max(1, int(height))
-    basis = "vram" if basis == "vram" else "gpu"
+    if basis not in {"gpu", "vram", "cpu", "memory"}:
+        basis = "gpu"
     selected = [point.values_for(basis) for point in points]
     category_names = {
         str(name) for name, value in (categories or ()) if value > 0
@@ -425,8 +469,17 @@ def render_gpu_history(
             return dict(result)
 
         selected = [grouped(values) for values in selected]
-    if basis == "vram" and not any(selected):
-        return Text("VRAM allocation history unavailable"[:width], style=MUTED, justify="center")
+    if basis in {"vram", "cpu", "memory"} and not any(selected):
+        label = {
+            "vram": "VRAM",
+            "cpu": "CPU",
+            "memory": "Memory",
+        }[basis]
+        return Text(
+            f"{label} allocation history unavailable"[:width],
+            style=MUTED,
+            justify="center",
+        )
     if len(points) < 2 or width < 18 or height < 5:
         count = len(points)
         message = (
@@ -456,7 +509,7 @@ def render_gpu_history(
     )
     if "System/hidden" in colors:
         colors["System/hidden"] = MUTED
-    unit = "G" if basis == "vram" else ""
+    unit = "G" if basis in {"vram", "memory"} else "c" if basis == "cpu" else ""
     longest_label = max(
         len(name) + len(_number(latest_values.get(name, 0), unit=unit)) + 7
         for name in names
@@ -483,12 +536,14 @@ def render_gpu_history(
         *(point.total_for(basis) for point in sampled),
         *(value for point in sampled for value in point.values_for(basis).values()),
     )
+    plot_maximum = math.log1p(maximum) if log_scale else maximum
     cells: list[list[tuple[int, str, int] | None]] = [
         [None for _ in range(chart_width)] for _ in range(chart_height)
     ]
 
     def row_for(value: float) -> int:
-        return chart_height - 1 - round(max(0, value) / maximum * (chart_height - 1))
+        scaled = math.log1p(max(0, value)) if log_scale else max(0, value)
+        return chart_height - 1 - round(scaled / plot_maximum * (chart_height - 1))
 
     def put(x: int, y: int, connection: int, color: str, priority: int) -> None:
         if not (0 <= x < chart_width and 0 <= y < chart_height):
@@ -656,7 +711,14 @@ def render_namespace_pie(
     total = sum(value for _, value in values)
     if not total:
         return Text(empty_label[:width], style=MUTED, justify="center")
-    if width < 16 or height < 5:
+    # A standalone pie (the Resources layout supplies its legend separately)
+    # only needs the nine-cell diameter used below.  The combined renderer
+    # passes ``show_legend=False`` with a deliberately compact inner panel;
+    # requiring the wider legend minimum there reduced the pie to a numeric
+    # total even though a drawable chart still fit. Keep the wider minimum
+    # for the self-contained legend form.
+    minimum_width = 16 if show_legend else 9
+    if width < minimum_width or height < 5:
         return Text(_number(total, unit=unit)[:width], style=CYAN, justify="center")
 
     if show_legend:

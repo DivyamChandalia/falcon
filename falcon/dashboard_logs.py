@@ -18,7 +18,6 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 from .commands import capture_logs
 from .kubernetes import KubernetesClient
 
-
 MAX_LOG_LINES = 200
 LOG_RETENTION_SECONDS = 24 * 60 * 60
 ATTACH_RETRY_SECONDS = 5.0

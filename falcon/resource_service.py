@@ -196,25 +196,57 @@ class SharedHistoryStore:
             CREATE TABLE IF NOT EXISTS transitions (
               timestamp REAL NOT NULL, node TEXT NOT NULL, gpu_model TEXT NOT NULL,
               namespace TEXT NOT NULL, gpu_count REAL NOT NULL, vram_gib REAL NOT NULL,
+              cpu_cores REAL NOT NULL DEFAULT 0,
+              memory_gib REAL NOT NULL DEFAULT 0,
               PRIMARY KEY(timestamp, node, gpu_model, namespace)
             );
             CREATE INDEX IF NOT EXISTS transitions_time ON transitions(timestamp);
         """)
+        # Keep service-owned history databases from older releases usable. The
+        # new series are additive and default to zero for historical rows.
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(transitions)")
+        }
+        for name, definition in (
+            ("cpu_cores", "REAL NOT NULL DEFAULT 0"),
+            ("memory_gib", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE transitions ADD COLUMN {name} {definition}"
+                )
         return connection
 
     @staticmethod
-    def _allocations(nodes: Sequence[NodeSnapshot]) -> dict[tuple[str, str, str], tuple[float, float]]:
-        result: dict[tuple[str, str, str], tuple[float, float]] = {}
+    def _allocations(
+        nodes: Sequence[NodeSnapshot],
+    ) -> dict[tuple[str, str, str], tuple[float, float, float, float]]:
+        result: dict[tuple[str, str, str], tuple[float, float, float, float]] = {}
         for node in nodes:
             if node.ready is not True or not node.schedulable:
                 continue
             counts: defaultdict[str, float] = defaultdict(float)
+            cpus: defaultdict[str, float] = defaultdict(float)
+            memories: defaultdict[str, float] = defaultdict(float)
             for consumer in node.consumers:
                 counts[consumer.namespace] += max(0, int(consumer.requested.gpu_count))
+                cpus[consumer.namespace] += max(0.0, float(consumer.requested.cpu_cores))
+                memories[consumer.namespace] += max(
+                    0.0, consumer.requested.memory_bytes / (1024**3)
+                )
             per_device = (node.gpu_memory_bytes_per_device or 0) / (1024 ** 3)
-            for namespace, count in counts.items():
-                if count:
-                    result[(node.name, node.gpu_model or "", namespace)] = (count, count * per_device)
+            for namespace in set(counts) | set(cpus) | set(memories):
+                count = counts.get(namespace, 0.0)
+                cpu = cpus.get(namespace, 0.0)
+                memory = memories.get(namespace, 0.0)
+                if count or cpu or memory:
+                    result[(node.name, node.gpu_model or "", namespace)] = (
+                        count,
+                        count * per_device,
+                        cpu,
+                        memory,
+                    )
         return result
 
     def record(self, snapshot: ClusterSnapshot) -> bool:
@@ -223,21 +255,30 @@ class SharedHistoryStore:
         now = float(snapshot.collected_at)
         current = self._allocations(snapshot.nodes)
         with self._lock, self._connect() as connection:
-            latest: dict[tuple[str, str, str], tuple[float, float]] = {}
-            for node, model, namespace, count, vram in connection.execute("""
-                SELECT t.node,t.gpu_model,t.namespace,t.gpu_count,t.vram_gib
+            latest: dict[tuple[str, str, str], tuple[float, float, float, float]] = {}
+            for node, model, namespace, count, vram, cpu, memory in connection.execute("""
+                SELECT t.node,t.gpu_model,t.namespace,t.gpu_count,t.vram_gib,
+                       t.cpu_cores,t.memory_gib
                 FROM transitions t JOIN (
                   SELECT node,gpu_model,namespace,MAX(timestamp) timestamp
                   FROM transitions GROUP BY node,gpu_model,namespace
                 ) x USING(node,gpu_model,namespace,timestamp)
             """):
-                latest[(node, model, namespace)] = (float(count), float(vram))
+                latest[(node, model, namespace)] = (
+                    float(count),
+                    float(vram),
+                    float(cpu),
+                    float(memory),
+                )
             changed = False
             for key in sorted(set(latest) | set(current)):
-                value = current.get(key, (0.0, 0.0))
-                if value != latest.get(key, (0.0, 0.0)):
+                value = current.get(key, (0.0, 0.0, 0.0, 0.0))
+                if value != latest.get(key, (0.0, 0.0, 0.0, 0.0)):
                     connection.execute(
-                        "INSERT INTO transitions VALUES (?,?,?,?,?,?)",
+                        """INSERT INTO transitions(
+                            timestamp,node,gpu_model,namespace,gpu_count,vram_gib,
+                            cpu_cores,memory_gib
+                        ) VALUES (?,?,?,?,?,?,?,?)""",
                         (now, *key, *value),
                     )
                     changed = True
@@ -268,34 +309,50 @@ class SharedHistoryStore:
         cutoff = end - self.seconds
         with self._lock, self._connect() as connection:
             rows = list(connection.execute("""
-                SELECT timestamp,node,gpu_model,namespace,gpu_count,vram_gib
+                SELECT timestamp,node,gpu_model,namespace,gpu_count,vram_gib,
+                       cpu_cores,memory_gib
                 FROM transitions
                 WHERE instr(lower(node),lower(?))>0 AND instr(lower(gpu_model),lower(?))>0
                 ORDER BY timestamp,node,gpu_model,namespace
             """, (node, gpu)))
-        state: dict[tuple[str, str, str], tuple[float, float]] = {}
-        by_time: defaultdict[float, list[tuple[str, str, str, float, float]]] = defaultdict(list)
-        for timestamp, node_name, model, namespace, count, vram in rows:
+        state: dict[tuple[str, str, str], tuple[float, float, float, float]] = {}
+        by_time: defaultdict[
+            float, list[tuple[str, str, str, float, float, float, float]]
+        ] = defaultdict(list)
+        for timestamp, node_name, model, namespace, count, vram, cpu, memory in rows:
             key = (str(node_name), str(model), str(namespace))
             if timestamp < cutoff:
-                state[key] = (float(count), float(vram))
+                state[key] = (
+                    float(count),
+                    float(vram),
+                    float(cpu),
+                    float(memory),
+                )
             else:
-                by_time[float(timestamp)].append((*key, float(count), float(vram)))
+                by_time[float(timestamp)].append(
+                    (*key, float(count), float(vram), float(cpu), float(memory))
+                )
 
         def point(timestamp: float) -> GPUHistoryPoint:
             counts: defaultdict[str, float] = defaultdict(float)
             vrams: defaultdict[str, float] = defaultdict(float)
-            for (_node, _model, namespace), (count, vram) in state.items():
+            cpus: defaultdict[str, float] = defaultdict(float)
+            memories: defaultdict[str, float] = defaultdict(float)
+            for (_node, _model, namespace), (count, vram, cpu, memory) in state.items():
                 counts[namespace] += count
                 vrams[namespace] += vram
-            return GPUHistoryPoint.from_mapping(timestamp, counts, vrams)
+                cpus[namespace] += cpu
+                memories[namespace] += memory
+            return GPUHistoryPoint.from_mapping(
+                timestamp, counts, vrams, cpus, memories
+            )
 
         points: list[GPUHistoryPoint] = []
         if state:
             points.append(point(cutoff))
         for timestamp, changes in sorted(by_time.items()):
-            for node_name, model, namespace, count, vram in changes:
-                state[(node_name, model, namespace)] = (count, vram)
+            for node_name, model, namespace, count, vram, cpu, memory in changes:
+                state[(node_name, model, namespace)] = (count, vram, cpu, memory)
             points.append(point(timestamp))
         if points and points[-1].timestamp < end:
             points.append(point(end))
@@ -507,7 +564,13 @@ class _ResourceHandler(BaseHTTPRequestHandler):
                 node=parameters.get("node", [""])[0], gpu=parameters.get("gpu", [""])[0]
             )
             self._json(200, {"schema": SCHEMA, "history": [
-                {"timestamp": p.timestamp, "values": p.values, "vram_values": p.vram_values}
+                {
+                    "timestamp": p.timestamp,
+                    "values": p.values,
+                    "vram_values": p.vram_values,
+                    "cpu_values": p.cpu_values,
+                    "memory_values": p.memory_values,
+                }
                 for p in points
             ]})
             return
@@ -677,7 +740,11 @@ class ResourceServiceClient:
         if value.get("schema") != SCHEMA or not isinstance(value.get("history"), list):
             raise ResourceServiceError("resource service returned malformed history")
         return [GPUHistoryPoint.from_mapping(
-            float(item["timestamp"]), item.get("values", {}), item.get("vram_values", {})
+            float(item["timestamp"]),
+            item.get("values", {}),
+            item.get("vram_values", {}),
+            item.get("cpu_values", {}),
+            item.get("memory_values", {}),
         ) for item in value["history"]]
 
 

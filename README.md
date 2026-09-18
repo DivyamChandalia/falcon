@@ -215,18 +215,29 @@ falcon resources
 ![Falcon cluster resources dashboard](./assets/falcon-resources.svg)
 
 The **Nodes** view shows free resources for every node. Select a node and press
-<kbd>Enter</kbd> to inspect the jobs using it.
+<kbd>Enter</kbd> to inspect the jobs using it. At terminals at least `160×30`,
+Nodes and GPU Allocations are shown together in equal-width sides, with Nodes
+on the left and GPU Allocations on the right; smaller terminals retain the
+separate views.
 
 Use <kbd>←</kbd>/<kbd>→</kbd> to switch views, <kbd>Tab</kbd> to move focus,
-and <kbd>Enter</kbd> to expand the selected pane. Falcon remembers your last
-view and keeps GPU allocation history in the background.
+and <kbd>Enter</kbd> to expand the selected pane. In the wide layout, Tab
+visits Allocation History, the GPU-by-namespace pie, GPU-requesting Jobs,
+Nodes, and Selected Node; <kbd>Shift</kbd>+<kbd>Tab</kbd> reverses that order.
+Press <kbd>s</kbd> to cycle the shared workload sort used by GPU-requesting Jobs
+and Selected Node. Falcon remembers your last view and keeps GPU allocation
+history in the background.
 
-**GPU Allocations: history, namespaces, and active GPU jobs**
+**GPU by Namespace: history and active GPU jobs**
 
 ![Falcon GPU allocation history](./assets/falcon-resources-allocations.svg)
 
-In **GPU Allocations**, press <kbd>v</kbd> to switch namespace shares between
-GPU count and requested VRAM.
+In **GPU Allocations**, the pie shows GPU by Namespace. Press <kbd>v</kbd> to
+switch between GPU count and requested VRAM. Press <kbd>m</kbd> to switch the
+charts to requested memory or CPU cores; the two mode pairs retain their
+selections independently. Press <kbd>l</kbd> to toggle Allocation History
+between linear and logarithmic scale when request spikes would otherwise hide
+smaller changes.
 
 Resource values are based on Kubernetes requests and allocations. Falcon does
 not present them as measured GPU compute utilization.

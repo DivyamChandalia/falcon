@@ -1,9 +1,9 @@
-"""Scheduler allocation accounting for the Resources GPU page.
+"""Scheduler allocation accounting for the Resources allocation page.
 
 The Resources endpoint exposes Kubernetes allocation/request data, not device
-utilization.  Keep that distinction explicit: the two selectable bases are
-GPU-count allocation and allocated VRAM (GPU request count multiplied by the
-node's per-device VRAM label).
+utilization.  Keep that distinction explicit: GPU-count allocation and
+allocated VRAM are derived from GPU requests, while CPU and memory allocation
+are derived from the corresponding scheduler requests.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ class GpuTelemetrySnapshot:
     effective_gpus_by_node: tuple[tuple[str, float], ...] = ()
     effective_gpus_by_namespace: tuple[tuple[str, float], ...] = ()
     vram_gib_by_namespace: tuple[tuple[str, float], ...] = ()
+    cpu_cores_by_namespace: tuple[tuple[str, float], ...] = ()
+    memory_gib_by_namespace: tuple[tuple[str, float], ...] = ()
     target_pods: int = 0
     sampled_pods: int = 0
     stale: bool = False
@@ -52,6 +54,8 @@ class GpuTelemetrySnapshot:
         vram_gib_by_namespace: Mapping[str, float],
         target_pods: int,
         sampled_pods: int,
+        cpu_cores_by_namespace: Mapping[str, float] | None = None,
+        memory_gib_by_namespace: Mapping[str, float] | None = None,
     ) -> "GpuTelemetrySnapshot":
         return cls(
             collected_at=float(collected_at),
@@ -60,6 +64,8 @@ class GpuTelemetrySnapshot:
                 effective_gpus_by_namespace
             ),
             vram_gib_by_namespace=cls._ordered(vram_gib_by_namespace),
+            cpu_cores_by_namespace=cls._ordered(cpu_cores_by_namespace or {}),
+            memory_gib_by_namespace=cls._ordered(memory_gib_by_namespace or {}),
             target_pods=max(0, int(target_pods)),
             sampled_pods=max(0, int(sampled_pods)),
         )
@@ -75,16 +81,20 @@ def allocation_snapshot(
     stale: bool = False,
     error: str = "",
 ) -> GpuTelemetrySnapshot:
-    """Calculate GPU-count and allocated-VRAM shares from node consumers.
+    """Calculate scheduler-request shares from node consumers.
 
     This is intentionally based only on the same scheduler-facing snapshot
-    used by ``falcon resources``.  It never claims to measure GPU compute or
-    physical memory occupancy.
+    used by ``falcon resources``. It never claims to measure GPU compute or
+    physical memory occupancy. GPU pod counts retain their historical meaning;
+    CPU and memory include every active resource consumer, including CPU-only
+    workloads.
     """
 
     by_node: defaultdict[str, float] = defaultdict(float)
     by_namespace: defaultdict[str, float] = defaultdict(float)
     vram_by_namespace: defaultdict[str, float] = defaultdict(float)
+    cpu_by_namespace: defaultdict[str, float] = defaultdict(float)
+    memory_by_namespace: defaultdict[str, float] = defaultdict(float)
     pod_count = 0
     for node in nodes:
         if node.ready is not True or not node.schedulable:
@@ -95,6 +105,12 @@ def allocation_snapshot(
             else 0.0
         )
         for consumer in node.consumers:
+            cpu = max(0.0, float(consumer.requested.cpu_cores))
+            memory_gib = max(0.0, consumer.requested.memory_bytes / (1024**3))
+            if cpu > 0:
+                cpu_by_namespace[consumer.namespace] += cpu
+            if memory_gib > 0:
+                memory_by_namespace[consumer.namespace] += memory_gib
             count = max(0, int(consumer.requested.gpu_count))
             if count <= 0:
                 continue
@@ -111,5 +127,7 @@ def allocation_snapshot(
         vram_gib_by_namespace=vram_by_namespace,
         target_pods=pod_count,
         sampled_pods=pod_count,
+        cpu_cores_by_namespace=cpu_by_namespace,
+        memory_gib_by_namespace=memory_by_namespace,
     )
     return replace(snapshot, stale=stale, error=error)

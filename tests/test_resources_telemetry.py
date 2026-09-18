@@ -24,6 +24,17 @@ class AllocationTelemetryTests(unittest.TestCase):
         self.assertAlmostEqual(vram["team-a"], 2 * h100_gib)
         self.assertAlmostEqual(vram["team-b"], h100_gib)
 
+    def test_cpu_and_memory_bases_include_cpu_only_consumers(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        telemetry = allocation_snapshot(snapshot.nodes, collected_at=123.0)
+
+        cpu = dict(telemetry.cpu_cores_by_namespace)
+        memory = dict(telemetry.memory_gib_by_namespace)
+        self.assertAlmostEqual(cpu["data"], 12.0)
+        self.assertAlmostEqual(memory["data"], 48.0)
+        self.assertGreater(cpu["team-a"], 0.0)
+        self.assertGreater(memory["team-a"], 0.0)
+
     def test_stale_inventory_is_retained_but_not_presented_as_a_new_point(self) -> None:
         snapshot = demo_cluster_snapshot("mixed")
         stale = replace(snapshot, stale=True, error="metrics endpoint unavailable")

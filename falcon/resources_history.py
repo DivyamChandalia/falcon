@@ -94,6 +94,8 @@ class ResourceHistoryStore:
                 namespace TEXT NOT NULL,
                 gpu_count REAL NOT NULL,
                 vram_gib REAL NOT NULL,
+                cpu_cores REAL NOT NULL DEFAULT 0,
+                memory_gib REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (source_id, node, namespace),
                 FOREIGN KEY (source_id) REFERENCES snapshots(source_id)
                     ON DELETE CASCADE
@@ -102,14 +104,29 @@ class ResourceHistoryStore:
                 ON allocations(timestamp);
             """
         )
+        # ``CREATE TABLE IF NOT EXISTS`` does not evolve databases made by
+        # older Falcon clients. Add the optional resource series in place so
+        # the same history file remains readable and writable after upgrade.
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(allocations)")
+        }
+        for name, definition in (
+            ("cpu_cores", "REAL NOT NULL DEFAULT 0"),
+            ("memory_gib", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE allocations ADD COLUMN {name} {definition}"
+                )
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     @staticmethod
     def _rows(
         nodes: Sequence[NodeSnapshot],
-    ) -> list[tuple[str, str, str, float, float]]:
-        rows: list[tuple[str, str, str, float, float]] = []
+    ) -> list[tuple[str, str, str, float, float, float, float]]:
+        rows: list[tuple[str, str, str, float, float, float, float]] = []
         for node in nodes:
             if node.ready is not True or not node.schedulable:
                 continue
@@ -119,11 +136,21 @@ class ResourceHistoryStore:
                 else 0.0
             )
             namespaces: defaultdict[str, float] = defaultdict(float)
+            cpus: defaultdict[str, float] = defaultdict(float)
+            memories: defaultdict[str, float] = defaultdict(float)
             for consumer in node.consumers:
                 count = max(0, int(consumer.requested.gpu_count))
                 if count:
                     namespaces[consumer.namespace] += count
-            for namespace, count in sorted(namespaces.items()):
+                cpu = max(0.0, float(consumer.requested.cpu_cores))
+                memory = max(0.0, consumer.requested.memory_bytes / (1024**3))
+                if cpu:
+                    cpus[consumer.namespace] += cpu
+                if memory:
+                    memories[consumer.namespace] += memory
+            all_namespaces = set(namespaces) | set(cpus) | set(memories)
+            for namespace in sorted(all_namespaces):
+                count = namespaces.get(namespace, 0.0)
                 rows.append(
                     (
                         node.name,
@@ -131,6 +158,8 @@ class ResourceHistoryStore:
                         namespace,
                         count,
                         count * per_device_gib if per_device_gib > 0 else 0.0,
+                        cpus.get(namespace, 0.0),
+                        memories.get(namespace, 0.0),
                     )
                 )
         return rows
@@ -163,12 +192,22 @@ class ResourceHistoryStore:
                 """
                 INSERT INTO allocations(
                     source_id, timestamp, node, gpu_model, namespace,
-                    gpu_count, vram_gib
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    gpu_count, vram_gib, cpu_cores, memory_gib
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (source_id, timestamp, node, model, namespace, count, vram)
-                    for node, model, namespace, count, vram in rows
+                    (
+                        source_id,
+                        timestamp,
+                        node,
+                        model,
+                        namespace,
+                        count,
+                        vram,
+                        cpu,
+                        memory,
+                    )
+                    for node, model, namespace, count, vram, cpu, memory in rows
                 ],
             )
             connection.execute(
@@ -199,7 +238,8 @@ class ResourceHistoryStore:
         cutoff = float(now if now is not None else time.time()) - self.history_seconds
         query = """
             SELECT s.timestamp, a.namespace,
-                   SUM(a.gpu_count), SUM(a.vram_gib)
+                   SUM(a.gpu_count), SUM(a.vram_gib),
+                   SUM(a.cpu_cores), SUM(a.memory_gib)
             FROM snapshots AS s
             LEFT JOIN allocations AS a
               ON a.source_id = s.source_id
@@ -209,19 +249,31 @@ class ResourceHistoryStore:
             GROUP BY s.timestamp, a.namespace
             ORDER BY s.timestamp, a.namespace
         """
-        grouped: dict[float, tuple[dict[str, float], dict[str, float]]] = {}
+        grouped: dict[
+            float,
+            tuple[
+                dict[str, float],
+                dict[str, float],
+                dict[str, float],
+                dict[str, float],
+            ],
+        ] = {}
         with self._connect() as connection:
-            for timestamp, namespace, count, vram in connection.execute(
+            for timestamp, namespace, count, vram, cpu, memory in connection.execute(
                 query,
                 (node_filter, gpu_filter, cutoff),
             ):
-                counts, vrams = grouped.setdefault(float(timestamp), ({}, {}))
+                counts, vrams, cpus, memories = grouped.setdefault(
+                    float(timestamp), ({}, {}, {}, {})
+                )
                 if namespace is not None:
                     counts[str(namespace)] = float(count or 0.0)
                     vrams[str(namespace)] = float(vram or 0.0)
+                    cpus[str(namespace)] = float(cpu or 0.0)
+                    memories[str(namespace)] = float(memory or 0.0)
         return [
-            GPUHistoryPoint.from_mapping(timestamp, counts, vrams)
-            for timestamp, (counts, vrams) in grouped.items()
+            GPUHistoryPoint.from_mapping(timestamp, counts, vrams, cpus, memories)
+            for timestamp, (counts, vrams, cpus, memories) in grouped.items()
         ]
 
 

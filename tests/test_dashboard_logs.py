@@ -10,7 +10,7 @@ from unittest.mock import patch
 from falcon.commands import capture_logs
 from falcon.dashboard import PodAttempt
 from falcon.dashboard_logs import DashboardLogManager
-from falcon.kubernetes import ProcessResult, KubernetesClient
+from falcon.kubernetes import KubernetesClient, ProcessResult
 
 
 class _Process:

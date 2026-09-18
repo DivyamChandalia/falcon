@@ -1538,8 +1538,8 @@ def run_dashboard(
     demo_state: Optional[str] = None,
     color_mode: Optional[str] = None,
 ) -> None:
-    from .resources_history import stop_legacy_history_collector
     from .dashboard_ui import FalconDashboard
+    from .resources_history import stop_legacy_history_collector
 
     namespace = namespace or config["cluster"]["namespace"]
     thresholds = {

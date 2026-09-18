@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -91,6 +92,28 @@ class ResourceStateTests(unittest.TestCase):
 
 
 class SharedHistoryTests(unittest.TestCase):
+    def test_old_history_schema_loads_with_empty_new_series(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "history.sqlite3"
+            with sqlite3.connect(path) as connection:
+                connection.execute("""
+                    CREATE TABLE transitions (
+                      timestamp REAL NOT NULL, node TEXT NOT NULL,
+                      gpu_model TEXT NOT NULL, namespace TEXT NOT NULL,
+                      gpu_count REAL NOT NULL, vram_gib REAL NOT NULL,
+                      PRIMARY KEY(timestamp, node, gpu_model, namespace)
+                    )
+                """)
+                connection.execute(
+                    "INSERT INTO transitions VALUES (?, ?, ?, ?, ?, ?)",
+                    (2_000_000_000, "node-a", "h100", "team-a", 2, 80),
+                )
+            points = SharedHistoryStore(path).load(now=2_000_000_001)
+
+        self.assertEqual(points[0].values, {"team-a": 2.0})
+        self.assertEqual(points[0].cpu_values, {})
+        self.assertEqual(points[0].memory_values, {})
+
     def test_records_only_allocation_changes_and_extends_final_step(self) -> None:
         snapshot = replace(demo_cluster_snapshot("mixed"), collected_at=2_000_000_000)
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,6 +125,8 @@ class SharedHistoryTests(unittest.TestCase):
             points = store.load(now=2_000_000_020)
         self.assertEqual([point.timestamp for point in points], [2_000_000_000, 2_000_000_010, 2_000_000_020])
         self.assertEqual(points[0].total, 5)
+        self.assertGreater(points[0].cpu_total, 0)
+        self.assertGreater(points[0].memory_total, 0)
         self.assertEqual(points[-1].total, 0)
 
     def test_retention_keeps_pre_window_baseline(self) -> None:

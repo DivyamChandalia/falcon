@@ -124,6 +124,63 @@ class GPUHistoryRendererTests(unittest.TestCase):
         )
         self.assertIn("G", vram.plain)
 
+    def test_log_scale_compresses_large_history_spikes_without_losing_zero(self) -> None:
+        points = [
+            GPUHistoryPoint.from_mapping(
+                1_700_000_000 + index * 60,
+                {"small": value, "spike": spike},
+            )
+            for index, (value, spike) in enumerate(
+                ((0, 0), (1, 1000), (2, 1000), (0, 10))
+            )
+        ]
+        linear = render_gpu_history(
+            points,
+            width=60,
+            height=8,
+            show_legend=False,
+        )
+        logarithmic = render_gpu_history(
+            points,
+            width=60,
+            height=8,
+            show_legend=False,
+            log_scale=True,
+        )
+        self.assertNotEqual(linear.plain, logarithmic.plain)
+        self.assertEqual(len(logarithmic.plain.splitlines()), 8)
+        self.assertTrue(all(len(line) <= 60 for line in logarithmic.plain.splitlines()))
+        self.assertRegex(logarithmic.plain, r"[━┃]")
+
+    def test_cpu_and_memory_history_series_are_independent_from_gpu_series(self) -> None:
+        point = GPUHistoryPoint.from_mapping(
+            1_700_000_000,
+            {"gpu-team": 2},
+            {"gpu-team": 80},
+            {"cpu-team": 3.5},
+            {"memory-team": 12},
+        )
+        self.assertEqual(point.values_for("gpu"), {"gpu-team": 2.0})
+        self.assertEqual(point.values_for("vram"), {"gpu-team": 80.0})
+        self.assertEqual(point.values_for("cpu"), {"cpu-team": 3.5})
+        self.assertEqual(point.values_for("memory"), {"memory-team": 12.0})
+
+        cpu = render_gpu_history(
+            [point, GPUHistoryPoint.from_mapping(
+                1_700_000_060,
+                {"gpu-team": 2},
+                {"gpu-team": 80},
+                {"cpu-team": 4},
+                {"memory-team": 14},
+            )],
+            width=60,
+            height=8,
+            basis="cpu",
+            show_legend=False,
+        )
+        self.assertIn("c", cpu.plain)
+        self.assertNotIn("gpu-team", cpu.plain)
+
     def test_history_chart_omits_timestamp_axis(self) -> None:
         chart = render_gpu_history(
             self.points(),
@@ -208,6 +265,13 @@ class NamespacePieRendererTests(unittest.TestCase):
             ).plain,
             "2G",
         )
+
+    def test_standalone_pie_keeps_a_drawable_minimum_footprint(self) -> None:
+        pie = render_namespace_pie(
+            [("team", 2)], width=10, height=5, show_legend=False
+        )
+        self.assertEqual(len(pie.plain.splitlines()), 5)
+        self.assertIn("█", pie.plain)
 
     def test_legend_percentages_use_the_selected_allocation_total(self) -> None:
         gpu_pie = render_namespace_pie(

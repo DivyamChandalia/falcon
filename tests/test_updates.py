@@ -102,10 +102,11 @@ class UpdateTests(unittest.TestCase):
 
     def test_json_and_noninteractive_update_paths_are_silent(self) -> None:
         output = io.StringIO()
-        with patch("falcon.cli.latest_version", return_value="0.4.0"), redirect_stdout(output):
+        available = "99.0.0"
+        with patch("falcon.cli.latest_version", return_value=available), redirect_stdout(output):
             code = main(["update", "--check"])
         self.assertEqual(code, 0)
-        self.assertIn("Falcon 0.4.0 is available", output.getvalue())
+        self.assertIn(f"Falcon {available} is available", output.getvalue())
 
     def test_auto_prompt_skips_json_and_noninteractive_commands(self) -> None:
         args = type("Args", (), {"output": "json"})()

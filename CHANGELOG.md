@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — 2026-09-18
+
+- Added the responsive Resources layout, with Nodes and Selected Node on the
+  left and GPU Allocations on the right at `160×30` and above.
+- Added shared Namespace, CPU, memory, and GPU sorting for GPU-requesting Jobs
+  and Selected Node workloads, including expanded panes.
+- Added GPU, requested-memory, and requested-CPU allocation modes and the
+  aspect-correct GPU-by-namespace chart layout, including a toggleable
+  logarithmic Allocation History scale.
+- Kept GPU request and mark columns visible in narrow Dashboard tables and
+  refreshed deterministic TUI captures and documentation.
+
 ## 0.3.0 — 2026-09-17
 
 - Added `falcon update` and `falcon update --check` for GitHub-based upgrades.

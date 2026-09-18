@@ -26,6 +26,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.geometry import NULL_OFFSET, Region, Size
+from textual.layout import ArrangeResult, Layout, WidgetPlacement
+from textual.layouts.vertical import VerticalLayout
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
 
@@ -158,11 +161,130 @@ def _truncate(value: str, width: int) -> str:
 
 MAX_DISPLAY_LOG_LINE_CHARS = 4096
 
+WIDE_LAYOUT_MIN_WIDTH = 160
+WIDE_LAYOUT_MIN_HEIGHT = 30
+RESOURCE_PANE_HEIGHT = 6
+
+# Dashboard Jobs columns are intentionally fixed. These widths cover the
+# longest labels Falcon renders for each field while leaving the flexible NAME
+# column to absorb the remaining pane width.
+# Rich applies the shared one-cell horizontal padding outside the declared
+# width. Reserve those cells so the four-character header and the ``>[ ]``
+# selected/mark indicator are both rendered in full.
+JOBS_MARK_WIDTH = 6
+JOBS_STATUS_WIDTH = 15  # ``● Eviction risk``
+JOBS_ACTIVE_POD_WIDTH = 13  # ``No active pod``
+JOBS_NODE_WIDTH = 12
+JOBS_GPU_WIDTH = 9  # ``pro6000x2``
+JOBS_RESTARTS_WIDTH = 8
+JOBS_COMPLETIONS_WIDTH = 11
+JOBS_AGE_WIDTH = 4
+
 
 def _display_log_line(value: str) -> str:
     """Keep pathological single-line output from dominating Rich layout."""
 
     return _truncate(value, MAX_DISPLAY_LOG_LINE_CHARS)
+
+
+class DashboardBodyLayout(Layout):
+    """Arrange Dashboard panes as a stack or two independent columns."""
+
+    name = "falcon-dashboard-body"
+
+    def __init__(self) -> None:
+        self._vertical = VerticalLayout()
+
+    def arrange(
+        self,
+        parent,
+        children,
+        size: Size,
+        greedy: bool = True,
+    ) -> ArrangeResult:
+        if not getattr(parent.app, "_wide_layout", False):
+            return self._vertical.arrange(parent, children, size, greedy)
+
+        parent.pre_layout(self)
+        by_id = {child.id: child for child in children if child.id}
+        if not by_id or size.width <= 0 or size.height <= 0:
+            return []
+
+        left_ids = [pane_id for pane_id in ("jobs-pane", "events-pane") if pane_id in by_id]
+        right_ids = [pane_id for pane_id in ("selected-pane", "resources-pane") if pane_id in by_id]
+        if left_ids and right_ids:
+            left_width = size.width // 2
+            right_x = left_width
+            right_width = size.width - left_width
+        else:
+            left_width = size.width if left_ids else 0
+            right_x = 0 if not left_ids else left_width
+            right_width = size.width if right_ids else 0
+
+        placements: list[WidgetPlacement] = []
+
+        def place(pane_id: str, x: int, y: int, width: int, height: int) -> None:
+            if width <= 0 or height <= 0:
+                return
+            widget = by_id[pane_id]
+            styles = widget.styles
+            placements.append(
+                WidgetPlacement(
+                    Region(x, y, width, height),
+                    NULL_OFFSET,
+                    styles.margin,
+                    widget,
+                    len(placements),
+                    False,
+                    styles.overlay == "screen",
+                    styles.position == "absolute",
+                )
+            )
+
+        if left_ids:
+            if len(left_ids) == 2:
+                jobs_height = (size.height + 1) // 2
+                place("jobs-pane", 0, 0, left_width, jobs_height)
+                place(
+                    "events-pane",
+                    0,
+                    jobs_height,
+                    left_width,
+                    size.height - jobs_height,
+                )
+            else:
+                place(left_ids[0], 0, 0, left_width, size.height)
+
+        if right_ids:
+            if len(right_ids) == 2:
+                resource_height = min(RESOURCE_PANE_HEIGHT, size.height)
+                selected_height = size.height - resource_height
+                place("selected-pane", right_x, 0, right_width, selected_height)
+                place(
+                    "resources-pane",
+                    right_x,
+                    selected_height,
+                    right_width,
+                    resource_height,
+                )
+            else:
+                place(right_ids[0], right_x, 0, right_width, size.height)
+
+        return placements
+
+
+class DashboardBody(Container):
+    """Container whose layout switches between stack and split modes."""
+
+    def __init__(self, *children, **kwargs) -> None:
+        super().__init__(*children, **kwargs)
+        self._default_layout = DashboardBodyLayout()
+
+    @property
+    def layout(self) -> Layout:
+        # Container's default CSS requests a vertical layout. This body owns
+        # the responsive layout, so always return the dedicated dispatcher.
+        return self._default_layout
 
 
 def _spark(values: List[Optional[float]], width: int = 12) -> str:
@@ -327,7 +449,8 @@ class DashboardPaneContent(Static):
 
     def update(self, content="", *, layout: bool = True) -> None:
         self._natural_content = content
-        self._natural_height_cache = None
+        if layout:
+            self._natural_height_cache = None
         super().update(content, layout=layout)
 
     def get_content_height(self, container, viewport, width: int) -> int:
@@ -412,7 +535,8 @@ class SelectedJobScroll(VerticalScroll):
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.prevent_default()
         event.stop()
-        self._activate_section()
+        if getattr(getattr(self.app, "state", None), "focused_pane", None) != "selected":
+            self._activate_section()
         self.scroll_relative(
             y=1, animate=False, force=True, immediate=True
         )
@@ -421,7 +545,8 @@ class SelectedJobScroll(VerticalScroll):
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         event.prevent_default()
         event.stop()
-        self._activate_section()
+        if getattr(getattr(self.app, "state", None), "focused_pane", None) != "selected":
+            self._activate_section()
         self.scroll_relative(
             y=-1, animate=False, force=True, immediate=True
         )
@@ -941,6 +1066,7 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; padding: 0 1; }}
 #controls {{ height: 1; color: {GRAY}; padding: 0 1; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
+#dashboard-body {{ width: 1fr; height: 1fr; }}
 DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; scrollbar-visibility: hidden; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
 # Keep the Selected Job frame highlighted while its nested Logs viewport owns
@@ -1049,9 +1175,13 @@ class FalconDashboard(App):
         self._result_queue = __import__("queue").Queue(maxsize=1)
         self._last_terminal_size: Tuple[int, int] = (-1, -1)
         self._responsive_hidden_panes: Set[str] = set()
+        self._wide_layout = False
         self._resource_graph_regions: List[Tuple[int, int, int, int]] = []
         self._expanded_resource_charts: Dict[str, _ResourceHistoryChart] = {}
         self._expanded_resource_uid: Optional[str] = None
+        self._resource_history_refresh_pending = False
+        self._resource_pane_scroll_pending = 0
+        self._resource_pane_scroll_callback_pending = False
         self._building_expanded_resource = False
         self._selected_log_view_key: Optional[Tuple[str, str, int]] = None
 
@@ -1073,10 +1203,11 @@ class FalconDashboard(App):
         yield Static(id="summary")
         yield Static(id="controls")
         yield Input(placeholder="Search jobs…", id="search-input")
-        yield DashboardPane(id="jobs-pane")
-        yield DashboardPane(id="selected-pane")
-        yield DashboardPane(id="resources-pane")
-        yield DashboardPane(id="events-pane")
+        with DashboardBody(id="dashboard-body"):
+            yield DashboardPane(id="jobs-pane")
+            yield DashboardPane(id="selected-pane")
+            yield DashboardPane(id="resources-pane")
+            yield DashboardPane(id="events-pane")
         yield Static(id="resize-message")
         yield Static(id="falcon-footer")
 
@@ -1202,6 +1333,8 @@ class FalconDashboard(App):
                     self._scroll_expanded_pane("selected", amount)
                 else:
                     self._scroll_selected_section(amount)
+            elif self._selected_inspector_active() and self._selected_logs_focused():
+                self._scroll_selected_section(amount)
             else:
                 self._move_cursor(amount)
         elif pane == "events":
@@ -1224,6 +1357,36 @@ class FalconDashboard(App):
             self._scroll_history(amount)
 
     def _scroll_expanded_pane(self, pane: str, amount: int) -> None:
+        if pane == "resources" and self.state.expanded_pane == "resources":
+            # Mouse wheels can deliver several events before Textual has had
+            # a chance to paint the previous scroll. Apply their combined
+            # delta in one compositor update instead of forcing a full Rich
+            # inspector repaint for every tick.
+            self._resource_pane_scroll_pending += amount
+            if self._resource_pane_scroll_callback_pending:
+                return
+            self._resource_pane_scroll_callback_pending = True
+
+            def flush() -> None:
+                self._resource_pane_scroll_callback_pending = False
+                amount_to_scroll = self._resource_pane_scroll_pending
+                self._resource_pane_scroll_pending = 0
+                if (
+                    not amount_to_scroll
+                    or not self.is_mounted
+                    or self.state.expanded_pane != "resources"
+                ):
+                    return
+                target = self.query_one("#resources-pane", DashboardPane)
+                target.scroll_relative(
+                    y=amount_to_scroll,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+
+            self.call_after_refresh(flush)
+            return
         target = self.query_one(f"#{pane}-pane", DashboardPane)
         target.scroll_relative(
             y=amount,
@@ -1516,49 +1679,86 @@ class FalconDashboard(App):
     def _scroll_jobs_view(self, amount: int) -> None:
         maximum = max(0, len(self.filtered_rows) - self._visible_job_count())
         self.state.jobs_scroll_offset = max(0, min(maximum, self.state.jobs_scroll_offset + amount))
-        self._render_jobs()
+        self._render_jobs(layout=False)
 
-    def _render_jobs(self) -> None:
+    def _render_jobs(self, *, layout: bool = True) -> None:
         target = self.query_one("#jobs-pane", DashboardPane)
         if not self.rows:
-            target.update(Align.center("No Jobs found.\nPress f to change filters or r to refresh.", vertical="middle"))
+            target.update(
+                Align.center(
+                    "No Jobs found.\nPress f to change filters or r to refresh.",
+                    vertical="middle",
+                ),
+                layout=layout,
+            )
             return
         if not self.filtered_rows:
-            target.update(Align.center(
-                f"No Jobs match “{self.state.search_query}”.\nPress Esc to clear search.", vertical="middle"
-            ))
+            target.update(
+                Align.center(
+                    f"No Jobs match “{self.state.search_query}”.\nPress Esc to clear search.",
+                    vertical="middle",
+                ),
+                layout=layout,
+            )
             return
         width = max(1, target.content_size.width or self.size.width - 4)
         expanded = self.state.expanded_pane == "jobs"
+        gpu_header = "GPUs"
+        # Keep these fixed rather than resizing on every refresh or changing
+        # widths as Jobs scroll. GPU request values remain visible within the
+        # supported Falcon GPU model/count range.
+        mark_width = JOBS_MARK_WIDTH
+        status_width = JOBS_STATUS_WIDTH
+        active_pod_width = JOBS_ACTIVE_POD_WIDTH
+        node_width = JOBS_NODE_WIDTH
+        gpu_width = JOBS_GPU_WIDTH
+        restart_width = JOBS_RESTARTS_WIDTH
+        completion_width = JOBS_COMPLETIONS_WIDTH
+        age_width = JOBS_AGE_WIDTH
+        # GPU requests remain useful even in the half-width Jobs pane. They
+        # take precedence over the active Pod and timestamp when the minimum
+        # supported Dashboard width cannot hold every identity column.
+        show_gpu = width >= 72
         show_active_pod = width >= 72 and not (expanded and width < 95)
+        if show_gpu and width < 80:
+            show_active_pod = False
         show_node = width >= 95
-        show_gpu = width >= 130
+        show_age = width >= 80
         show_restarts = expanded and width >= 95
         show_completions = expanded and width >= 115
         table = Table(
             box=box.SIMPLE_HEAD,
             expand=True,
+            # Use one shared horizontal cell space between every adjacent
+            # column, rather than two spaces from both cells' padding.
             padding=(0, 1),
+            collapse_padding=True,
             show_edge=False,
             show_header=True,
             header_style=f"bold {CYAN_2}",
         )
-        table.add_column("MARK", width=5, no_wrap=True)
+        table.add_column("MARK", width=mark_width, no_wrap=True)
         table.add_column(
             "NAME", ratio=3, min_width=16, no_wrap=True, overflow="ellipsis"
         )
-        table.add_column("STATUS", width=16, no_wrap=True)
+        table.add_column("STATUS", width=status_width, no_wrap=True)
         if show_active_pod:
-            table.add_column("ACTIVE POD", width=18, no_wrap=True)
+            table.add_column("ACTIVE POD", width=active_pod_width, no_wrap=True)
         if show_node:
-            table.add_column("NODE", width=12, no_wrap=True)
+            table.add_column("NODE", width=node_width, no_wrap=True)
         if show_gpu:
-            table.add_column("GPU REQUEST", width=13, no_wrap=True)
+            table.add_column(
+                gpu_header,
+                width=gpu_width,
+                no_wrap=False,
+                overflow="fold",
+            )
         if show_restarts:
-            table.add_column("RESTARTS", width=8, justify="right")
+            table.add_column("RESTARTS", width=restart_width, justify="right")
         if show_completions:
-            table.add_column("COMPLETIONS", width=11, justify="right")
-        table.add_column("AGE", width=7, justify="right")
+            table.add_column("COMPLETIONS", width=completion_width, justify="right")
+        if show_age:
+            table.add_column("AGE", width=age_width, justify="right")
         count = self._visible_job_count()
         start = self.state.jobs_scroll_offset
         jobs_focused = self.app_focus and self.state.focused_pane == "jobs"
@@ -1583,11 +1783,12 @@ class FalconDashboard(App):
                 cells.append(Text(str(row.restarts), style=WHITE))
             if show_completions:
                 cells.append(Text(row.completions, style=WHITE))
-            cells.append(Text(row.age, style=WHITE))
+            if show_age:
+                cells.append(Text(row.age, style=WHITE))
             table.add_row(*cells)
         position = f" {min(start + 1, len(self.filtered_rows))}-{min(start + count, len(self.filtered_rows))}/{len(self.filtered_rows)} "
         target.border_subtitle = position if len(self.filtered_rows) > count else ""
-        target.update(table)
+        target.update(table, layout=layout)
 
     def _wrapped_command(self, row: JobUsage) -> List[str]:
         width = max(20, self.size.width - 10)
@@ -1735,7 +1936,6 @@ class FalconDashboard(App):
         if section_id != "selected-logs-scroll":
             return
         self.state.logs_auto_follow = float(scroll_y) >= float(max_scroll_y) - 0.01
-        self._set_selected_subtitle()
 
     def _selected_attempt_label(self, row: Optional[JobUsage]) -> str:
         if row is None:
@@ -1758,8 +1958,14 @@ class FalconDashboard(App):
             target = self.query_one("#selected-pane", DashboardPane)
         except NoMatches:
             return
-        target.set_class(self.state.expanded_pane == "selected", "selected-active")
-        if self.state.expanded_pane != "selected":
+        inspector_visible = self._selected_inspector_visible()
+        selected_active = (
+            inspector_visible
+            and self.app_focus
+            and self.state.focused_pane == "selected"
+        )
+        target.set_class(selected_active, "selected-active")
+        if not inspector_visible:
             target.border_subtitle = ""
             return
         # Keep the selected section visibly marked even when the terminal
@@ -1780,7 +1986,7 @@ class FalconDashboard(App):
     def _focus_selected_section(self) -> None:
         """Give the active Logs viewport the real keyboard focus."""
 
-        if self.state.expanded_pane != "selected":
+        if not self._selected_inspector_visible() or self.log_manager is None:
             return
         self.state.focused_pane = "selected"
         target_id = "#selected-logs-scroll"
@@ -1793,10 +1999,28 @@ class FalconDashboard(App):
 
     def _selected_inspector_active(self) -> bool:
         return (
-            self.log_manager is not None
-            and self.state.expanded_pane == "selected"
-            and self._selected_row() is not None
+            self._selected_inspector_visible()
+            and (self.log_manager is not None or self._wide_layout)
         )
+
+    def _selected_inspector_visible(self) -> bool:
+        """Return whether Selected Job is showing its detailed inspector."""
+
+        if self._selected_row() is None:
+            return False
+        if self.state.expanded_pane == "selected":
+            return True
+        return self._wide_layout and "selected" in self._visible_panes()
+
+    def _selected_logs_focused(self) -> bool:
+        """Return whether the nested log viewport currently owns focus."""
+
+        try:
+            return self.screen.focused is self.query_one(
+                "#selected-logs-scroll", SelectedJobScroll
+            )
+        except NoMatches:
+            return False
 
     def _copy_selected_content(self, section: Optional[str] = None) -> None:
         """Copy the focused Logs pane or the command copy affordance."""
@@ -1858,7 +2082,12 @@ class FalconDashboard(App):
         self.action_quit()
 
     def action_toggle_selected_or_cleanup(self) -> None:
-        if self._selected_inspector_active():
+        # The Selected Job inspector remains visible beside Jobs in the wide
+        # layout, but visibility is not keyboard focus. Only the nested Logs
+        # viewport owns ``c`` for collapsing its height; when Jobs (or the
+        # outer Selected Job pane) has focus, ``c`` must retain its global
+        # cleanup action.
+        if self._selected_logs_focused():
             if self.state.selected_section != "logs":
                 return
             self.state.logs_collapsed = not self.state.logs_collapsed
@@ -1889,7 +2118,7 @@ class FalconDashboard(App):
         if (
             self.log_manager is not None
             and self.is_mounted
-            and self.state.expanded_pane == "selected"
+            and self._selected_inspector_visible()
         ):
             try:
                 row = self._selected_row()
@@ -1929,7 +2158,6 @@ class FalconDashboard(App):
             self.state.logs_auto_follow = (
                 float(target.scroll_y) >= float(target.max_scroll_y) - 0.01
             )
-        self._set_selected_subtitle()
 
     def _page_selected_section(self, direction: int) -> None:
         target_id = "#selected-logs-scroll"
@@ -1951,7 +2179,6 @@ class FalconDashboard(App):
             target.scroll_home(animate=False, force=True, immediate=True)
         if self.state.selected_section == "logs":
             self.state.logs_auto_follow = end
-        self._set_selected_subtitle()
 
     def _move_selected_attempt(self, amount: int) -> None:
         row = self._selected_row()
@@ -1980,7 +2207,8 @@ class FalconDashboard(App):
     def _render_selected(self) -> None:
         row = self._selected_row()
         target = self.query_one("#selected-pane", DashboardPane)
-        target.set_class(self.state.expanded_pane == "selected", "selected-active")
+        inspector_visible = self._selected_inspector_visible()
+        target.set_class(inspector_visible, "selected-active")
         compact_content = target.query_one(
             "#selected-pane-content", DashboardPaneContent
         )
@@ -1992,7 +2220,7 @@ class FalconDashboard(App):
             compact_content.display = True
             inspector.display = False
             return
-        if self.state.expanded_pane == "selected":
+        if inspector_visible:
             compact_content.display = False
             inspector.display = True
             status_icon, status_color = _status_style(row.status)
@@ -2091,10 +2319,11 @@ class FalconDashboard(App):
 
             detail_columns = (detail_table(details), detail_table(right_details))
             # Demo collectors do not own a Kubernetes log manager. Keep their
-            # expanded rendering as a single Rich page so the deterministic
-            # visual/scroll fixtures remain useful without starting fake
-            # subprocesses; real dashboards use the nested inspector below.
-            if self.log_manager is None:
+            # explicit full-screen rendering as a single Rich page so the
+            # deterministic visual/scroll fixtures remain useful without
+            # starting fake subprocesses; wide mode still uses the nested
+            # inspector below to exercise the responsive layout.
+            if self.log_manager is None and not self._wide_layout:
                 compact_content.display = True
                 inspector.display = False
                 legacy_overview = Table.grid(expand=True, padding=(0, 2))
@@ -2552,9 +2781,16 @@ class FalconDashboard(App):
         return len(self.console.render_lines(renderable, options, pad=True))
 
     def _render_expanded_resources(self, target: DashboardPane, row: JobUsage, points: List[MetricPoint]) -> None:
-        layout = self._resource_layout()
+        screen_layout = self._resource_layout()
+        # The expanded Resource Usage inspector has enough room to make a
+        # four-card overview useful at every supported size.  The old
+        # ``wide`` layout stacked all four cards vertically, which made a
+        # taller terminal spend most of its viewport on one metric at a time.
+        # Keep the wide selected-job strip, but use the compact card density
+        # whenever the screen would otherwise choose that vertical layout.
+        layout = "compact" if screen_layout == "wide" else screen_layout
         metrics = self._resource_metrics(row, points)
-        selected = self._selected_resource_strip(row, layout)
+        selected = self._selected_resource_strip(row, screen_layout)
         self._expanded_resource_charts = {}
         self._expanded_resource_uid = row.uid
         self._building_expanded_resource = True
@@ -2562,26 +2798,7 @@ class FalconDashboard(App):
         metric_start = self._renderable_height(selected, width)
         graph_height = self._resource_history_height(layout)
         graph_regions: List[Tuple[int, int, int, int]] = []
-        if layout == "wide":
-            panels = [self._wide_metric_panel(metric) for metric in metrics]
-            metric_content = Group(*panels)
-            panel_top = metric_start
-            for panel in panels:
-                panel_height = self._renderable_height(panel, width)
-                stats_width = int(panel.renderable.columns[0].width or 0)
-                history_width = self._resource_history_width(
-                    "wide", stats_width
-                )
-                graph_regions.append(
-                    (
-                        max(0, width - history_width - 3),
-                        max(panel_top + 1, panel_top + panel_height - 1 - graph_height),
-                        max(1, width - 1),
-                        panel_top + panel_height - 1,
-                    )
-                )
-                panel_top += panel_height
-        elif layout == "compact":
+        if layout == "compact":
             panels = [self._compact_metric_panel(metric) for metric in metrics]
             metric_content = Table.grid(expand=True, padding=(0, 1))
             metric_content.add_column(ratio=1)
@@ -2649,7 +2866,7 @@ class FalconDashboard(App):
         content = Group(
             selected,
             metric_content,
-            self._gpu_devices_panel(row, layout),
+            self._gpu_devices_panel(row, screen_layout),
         )
         target.border_subtitle = ""
         target.update(content)
@@ -2690,7 +2907,8 @@ class FalconDashboard(App):
             for metric in metrics
         ]
         table = Table(box=None, expand=True, padding=(0, 1), show_header=False)
-        columns = 2 if self.size.width < 90 else 4
+        pane_width = target.content_size.width or target.size.width or self.size.width
+        columns = 2 if pane_width < 90 else 4
         for _ in range(columns):
             table.add_column(ratio=1)
         if columns == 4:
@@ -2780,9 +2998,14 @@ class FalconDashboard(App):
                     "/ Search   r Refresh   q Quit"
                 )
         elif self.state.focused_pane == "selected":
-            value = (
-                "↑/↓ Scroll   ←/→ Pods   PgUp/PgDn Page   Home/End   Esc Restore   Tab Next pane   r Refresh   q Quit"
+            selected_action = (
+                "Esc Restore"
                 if self.state.expanded_pane == "selected"
+                else "Enter Expand"
+            )
+            value = (
+                f"↑/↓ Scroll   ←/→ Pods   PgUp/PgDn Page   Home/End   {selected_action}   Tab Next pane   r Refresh   q Quit"
+                if self._selected_inspector_visible()
                 else f"↑/↓ Change Job   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
             )
         elif self.state.focused_pane == "resources":
@@ -2812,9 +3035,19 @@ class FalconDashboard(App):
     def _apply_layout(self) -> None:
         if not self.is_mounted:
             return
-        pane_ids = ["jobs-pane", "selected-pane", "resources-pane", "events-pane", "summary", "controls"]
+        pane_ids = [
+            "jobs-pane",
+            "selected-pane",
+            "resources-pane",
+            "events-pane",
+            "summary",
+            "controls",
+        ]
+        body = self.query_one("#dashboard-body")
         resize = self.query_one("#resize-message", Static)
         if self.size.width < MINIMUM_WIDTH or self.size.height < MINIMUM_HEIGHT:
+            self._wide_layout = False
+            body.display = False
             for pane_id in pane_ids:
                 self.query_one(f"#{pane_id}").display = False
             resize.display = True
@@ -2852,21 +3085,38 @@ class FalconDashboard(App):
         ):
             self.state.expanded_pane = None
         if self.state.expanded_pane:
+            self._wide_layout = False
+            body.display = True
             active = self.state.expanded_pane + "-pane"
             for pane_id in pane_ids:
-                self.query_one(f"#{pane_id}").display = pane_id == active
+                if pane_id in {"summary", "controls"}:
+                    self.query_one(f"#{pane_id}").display = False
+                else:
+                    self.query_one(f"#{pane_id}").display = pane_id == active
             expanded = self.query_one(f"#{active}")
             expanded.styles.height = "1fr"
             return
+        self._wide_layout = (
+            self.size.width >= WIDE_LAYOUT_MIN_WIDTH
+            and self.size.height >= WIDE_LAYOUT_MIN_HEIGHT
+        )
+        body.display = True
         for pane_id in pane_ids:
             pane = pane_id.removesuffix("-pane")
             widget = self.query_one(f"#{pane_id}")
             widget.display = pane_id in {"summary", "controls"} or pane in visible_panes
-        self.query_one("#jobs-pane").styles.height = "1fr"
-        self.query_one("#summary").styles.height = 2
-        self.query_one("#selected-pane").styles.height = 3
-        self.query_one("#resources-pane").styles.height = 6
-        self.query_one("#events-pane").styles.height = 7
+        if self._wide_layout:
+            # DashboardBodyLayout owns the exact regions in split mode. Give
+            # each visible pane a flexible height so its content does not
+            # fight the placement calculated for that region.
+            for pane in visible_panes:
+                self.query_one(f"#{pane}-pane").styles.height = "1fr"
+        else:
+            self.query_one("#jobs-pane").styles.height = "1fr"
+            self.query_one("#summary").styles.height = 2
+            self.query_one("#selected-pane").styles.height = 3
+            self.query_one("#resources-pane").styles.height = RESOURCE_PANE_HEIGHT
+            self.query_one("#events-pane").styles.height = 7
 
     def _visible_panes(self) -> List[str]:
         hidden = self.state.hidden_panes | self._responsive_hidden_panes
@@ -2990,6 +3240,13 @@ class FalconDashboard(App):
             else:
                 self._scroll_selected_section(-1)
             return
+        if (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._scroll_selected_section(-1)
+            return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(-1)
         elif self.state.focused_pane == "events":
@@ -3005,6 +3262,13 @@ class FalconDashboard(App):
                 self._scroll_expanded_pane("selected", 1)
             else:
                 self._scroll_selected_section(1)
+            return
+        if (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._scroll_selected_section(1)
             return
         if self.state.focused_pane in {"jobs", "selected"}:
             self._move_cursor(1)
@@ -3022,13 +3286,27 @@ class FalconDashboard(App):
             self.action_up()
 
     def action_left(self) -> None:
-        if self.log_manager is not None and self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
+        if (
+            self.log_manager is not None
+            and self.state.focused_pane == "selected"
+            and (
+                self.state.expanded_pane == "selected"
+                or (self._selected_inspector_active() and self._selected_logs_focused())
+            )
+        ):
             self._move_selected_attempt(-1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(1)
 
     def action_right(self) -> None:
-        if self.log_manager is not None and self.state.focused_pane == "selected" and self.state.expanded_pane == "selected":
+        if (
+            self.log_manager is not None
+            and self.state.focused_pane == "selected"
+            and (
+                self.state.expanded_pane == "selected"
+                or (self._selected_inspector_active() and self._selected_logs_focused())
+            )
+        ):
             self._move_selected_attempt(1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(-1)
@@ -3047,6 +3325,36 @@ class FalconDashboard(App):
         # Scrolling anywhere above it freezes the viewport when events arrive.
         self.state.events_auto_follow = self.state.events_scroll_offset >= maximum
         self._render_events()
+
+    def _schedule_resource_history_refresh(self) -> None:
+        """Repaint expanded history once after a burst of wheel events.
+
+        Updating the four chart renderables is cheap, but invalidating the
+        Rich/Textual content tree on every wheel tick makes a fast mouse wheel
+        repaint the entire expanded inspector repeatedly.  Keep the latest
+        values in the mutable charts immediately, then let Textual coalesce
+        the actual repaint at the next refresh boundary.
+        """
+        if self._resource_history_refresh_pending:
+            return
+        self._resource_history_refresh_pending = True
+
+        def refresh() -> None:
+            self._resource_history_refresh_pending = False
+            if (
+                not self.is_mounted
+                or self.state.expanded_pane != "resources"
+            ):
+                return
+            try:
+                self.query_one(
+                    "#resources-pane .dashboard-pane-content",
+                    DashboardPaneContent,
+                ).refresh(layout=False)
+            except NoMatches:
+                return
+
+        self.call_after_refresh(refresh)
 
     def _scroll_history(self, amount: int) -> None:
         row = self._selected_row()
@@ -3071,14 +3379,8 @@ class FalconDashboard(App):
                             if metric.get("terminal")
                             else None
                         ),
-                    )
-            try:
-                self.query_one(
-                    "#resources-pane .dashboard-pane-content",
-                    DashboardPaneContent,
-                ).refresh(layout=False)
-            except NoMatches:
-                pass
+                )
+            self._schedule_resource_history_refresh()
             return
         self._render_resources()
 
@@ -3088,6 +3390,12 @@ class FalconDashboard(App):
                 self._page_expanded_pane("selected", -1)
             else:
                 self._page_selected_section(-1)
+        elif (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._page_selected_section(-1)
         elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
             self._page_expanded_pane("resources", -1)
         elif self.state.focused_pane == "resources":
@@ -3103,6 +3411,12 @@ class FalconDashboard(App):
                 self._page_expanded_pane("selected", 1)
             else:
                 self._page_selected_section(1)
+        elif (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._page_selected_section(1)
         elif self.state.focused_pane == "resources" and self.state.expanded_pane == "resources":
             self._page_expanded_pane("resources", 1)
         elif self.state.focused_pane == "resources":
@@ -3118,6 +3432,12 @@ class FalconDashboard(App):
                 self._jump_expanded_pane("selected", False)
             else:
                 self._jump_selected_section(False)
+        elif (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._jump_selected_section(False)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = False
             self.state.events_scroll_offset = 0
@@ -3136,6 +3456,12 @@ class FalconDashboard(App):
                 self._jump_expanded_pane("selected", True)
             else:
                 self._jump_selected_section(True)
+        elif (
+            self.state.focused_pane == "selected"
+            and self._selected_inspector_active()
+            and self._selected_logs_focused()
+        ):
+            self._jump_selected_section(True)
         elif self.state.focused_pane == "events":
             self.state.events_auto_follow = True
             self._render_events()

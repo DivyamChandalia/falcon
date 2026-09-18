@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,40 @@ from falcon.resources_ui import FalconResourcesApp
 
 
 class ResourceHistoryStoreTests(unittest.TestCase):
+    def test_old_history_schema_loads_with_empty_new_series(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "history.sqlite3"
+            with sqlite3.connect(path) as connection:
+                connection.executescript("""
+                    CREATE TABLE snapshots (
+                        source_id TEXT PRIMARY KEY,
+                        timestamp REAL NOT NULL
+                    );
+                    CREATE TABLE allocations (
+                        source_id TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        node TEXT NOT NULL,
+                        gpu_model TEXT NOT NULL,
+                        namespace TEXT NOT NULL,
+                        gpu_count REAL NOT NULL,
+                        vram_gib REAL NOT NULL,
+                        PRIMARY KEY (source_id, node, namespace)
+                    );
+                """)
+                connection.execute(
+                    "INSERT INTO snapshots VALUES (?, ?)",
+                    ("old", 2_000_000_000),
+                )
+                connection.execute(
+                    "INSERT INTO allocations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("old", 2_000_000_000, "node-a", "h100", "team-a", 2, 80),
+                )
+            points = ResourceHistoryStore(path).load(now=2_000_000_001)
+
+        self.assertEqual(points[0].values, {"team-a": 2.0})
+        self.assertEqual(points[0].cpu_values, {})
+        self.assertEqual(points[0].memory_values, {})
+
     def test_history_survives_store_instances_and_keeps_zero_snapshots(self) -> None:
         nodes = demo_cluster_snapshot("mixed").nodes
         with tempfile.TemporaryDirectory() as temporary:
@@ -28,6 +63,8 @@ class ResourceHistoryStoreTests(unittest.TestCase):
         self.assertEqual(points[0].values["team-a"], 2)
         self.assertEqual(points[0].total, 5)
         self.assertGreater(points[0].vram_total, 0)
+        self.assertGreater(points[0].cpu_total, 0)
+        self.assertGreater(points[0].memory_total, 0)
         self.assertEqual(points[1].total, 0)
 
     def test_node_and_model_filters_apply_to_persisted_history(self) -> None:

@@ -39,6 +39,7 @@ DIMENSIONS: Tuple[Tuple[int, int], ...] = (
     (100, 30),
     (120, 30),
     (140, 32),
+    (160, 30),
     (160, 40),
     (200, 50),
 )
@@ -158,6 +159,8 @@ def seed_resources_history(app: FalconResourcesApp) -> None:
         }
     )
     app.history = []
+    cpu_values = dict(app.gpu_telemetry.cpu_cores_by_namespace)
+    memory_values = dict(app.gpu_telemetry.memory_gib_by_namespace)
     for index in range(16):
         values = {
                 namespace: min(
@@ -172,6 +175,18 @@ def seed_resources_history(app: FalconResourcesApp) -> None:
                 DEMO_NOW - (15 - index) * 5 * 60,
                 values,
                 {namespace: value * 80 for namespace, value in values.items()},
+                {
+                    namespace: cpu_values.get(namespace, 0.0)
+                    * (0.75 + (index % 4) * 0.1)
+                    for namespace in namespaces
+                    if cpu_values.get(namespace, 0.0) > 0
+                },
+                {
+                    namespace: memory_values.get(namespace, 0.0)
+                    * (0.75 + (index % 4) * 0.1)
+                    for namespace in namespaces
+                    if memory_values.get(namespace, 0.0) > 0
+                },
             )
         )
     app._render_all()
@@ -213,6 +228,7 @@ async def capture(*, update_assets: bool = True) -> None:
     resource_states = (
         ("resources-80x22", "mixed", (80, 22), ()),
         ("resources-140x32", "mixed", (140, 32), ()),
+        ("resources-160x30", "mixed", (160, 30), ()),
         ("resources-200x50", "mixed", (200, 50), ()),
         (
             "resources-gpu-allocations-80x22",
@@ -227,6 +243,12 @@ async def capture(*, update_assets: bool = True) -> None:
             (seed_resources_history, "right"),
         ),
         (
+            "resources-gpu-allocations-160x30",
+            "mixed",
+            (160, 30),
+            (seed_resources_history, "right"),
+        ),
+        (
             "resources-gpu-allocations-200x50",
             "mixed",
             (200, 50),
@@ -237,6 +259,12 @@ async def capture(*, update_assets: bool = True) -> None:
             "mixed",
             (140, 32),
             (seed_resources_history, "right", "v"),
+        ),
+        (
+            "resources-gpu-allocations-memory-140x32",
+            "mixed",
+            (140, 32),
+            (seed_resources_history, "right", "m"),
         ),
         ("resources-node-expanded-80x22", "mixed", (80, 22), ("enter",)),
         ("resources-node-expanded-140x40", "mixed", (140, 40), ("enter",)),
@@ -261,18 +289,18 @@ async def capture(*, update_assets: bool = True) -> None:
         )
         results[key] = value
 
-    # Keep the README visuals on the same deterministic 140×32 canvas so their
-    # typography, gutters, and section borders can be compared directly.
+    # Keep the README visuals on the deterministic wide Resources canvas so the
+    # documentation shows the combined layout and fixed allocation legend.
     dashboard_asset, dashboard_digest = await dashboard_capture(
         "dashboard-asset", state="mixed", size=(140, 32)
     )
     resources_asset, resources_digest = await resources_capture(
-        "resources-asset", state="mixed", size=(140, 32)
+        "resources-asset", state="mixed", size=(160, 30)
     )
     allocations_asset, allocations_digest = await resources_capture(
         "resources-allocations-asset",
         state="mixed",
-        size=(140, 32),
+        size=(160, 30),
         actions=(seed_resources_history, "right"),
     )
     results[dashboard_asset] = dashboard_digest
