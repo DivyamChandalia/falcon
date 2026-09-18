@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2 — 2026-09-18
+
+- Added tqdm-compatible log capture: carriage-return progress updates replace
+  the active bar, newline-normalized updates collapse to the latest bar, and
+  ANSI terminal controls are removed from the rendered text.
+- Preserved natural wrapping for bars that genuinely exceed the available
+  widget width while keeping ordinary log text behavior unchanged.
+
 ## 0.4.1 — 2026-09-18
 
 - Made Dashboard log scrolling smoother with a virtualized, incrementally

@@ -13,9 +13,23 @@ from falcon.dashboard_logs import DashboardLogManager
 from falcon.kubernetes import KubernetesClient, ProcessResult
 
 
+class _ChunkStream:
+    def __init__(self, chunks) -> None:
+        self.chunks = iter(chunks)
+
+    def read(self, _size=-1):
+        return next(self.chunks, b"")
+
+
 class _Process:
-    def __init__(self, output: str = "", returncode: int = 0) -> None:
-        self.stdout = io.StringIO(output)
+    def __init__(self, output="", returncode: int = 0) -> None:
+        self.stdout = (
+            _ChunkStream(output)
+            if isinstance(output, (list, tuple))
+            else io.BytesIO(output)
+            if isinstance(output, bytes)
+            else io.StringIO(output)
+        )
         self.returncode = returncode
         self.terminated = False
 
@@ -33,8 +47,13 @@ class _Process:
 
 
 class _Client:
-    def __init__(self, output: str = "attach line\n") -> None:
+    def __init__(
+        self,
+        output="attach line\n",
+        terminal_output: str = "terminal line\n",
+    ) -> None:
         self.output = output
+        self.terminal_output = terminal_output
         self.attach_calls = []
         self.log_calls = []
 
@@ -44,7 +63,11 @@ class _Client:
 
     def pod_logs(self, pod_name, **kwargs):
         self.log_calls.append((pod_name, kwargs))
-        return ProcessResult(("kubectl", "logs", pod_name), 0, "terminal line\n")
+        return ProcessResult(
+            ("kubectl", "logs", pod_name),
+            0,
+            self.terminal_output,
+        )
 
 
 def _row(*attempts: PodAttempt):
@@ -106,6 +129,74 @@ class DashboardLogManagerTests(unittest.TestCase):
         )
         now[0] = 111.0
         self.assertEqual(manager.snapshot(row, row.attempt_details[0]).lines, ())
+        manager.close()
+
+    def test_live_tqdm_carriage_returns_replace_one_wrapped_log_row(self):
+        client = _Client(
+            [
+                b"\r\x1b[32m  0%|          | 0/10",
+                b"\x1b[0m\r 50%|#####     | 5/10",
+                b"\r100%|##########| 10/10\nfinished\n",
+            ]
+        )
+        manager = DashboardLogManager("team", client=client)
+        row = _row(PodAttempt("active", "active-uid", "Running"))
+        manager.reconcile([row])
+        deadline = time.monotonic() + 2
+        while (
+            manager.snapshot(row, row.attempt_details[0]).status != "exited"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        snapshot = manager.snapshot(row, row.attempt_details[0])
+        self.assertEqual(
+            snapshot.lines,
+            ("100%|##########| 10/10", "finished"),
+        )
+        self.assertNotIn("\x1b", "".join(snapshot.lines))
+        manager.close()
+
+    def test_terminal_tqdm_history_keeps_only_final_progress_state(self):
+        client = _Client(
+            terminal_output="0%|          | 0/10\r50%|#####     | 5/10\r"
+            "100%|##########| 10/10\nfinished\n"
+        )
+        manager = DashboardLogManager("team", client=client)
+        row = _row(PodAttempt("completed", "completed-uid", "Succeeded"))
+        manager.ensure_terminal_logs(row, row.attempt_details[0])
+        deadline = time.monotonic() + 2
+        while not client.log_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        snapshot = manager.snapshot(row, row.attempt_details[0])
+        self.assertEqual(
+            snapshot.lines,
+            ("100%|##########| 10/10", "finished"),
+        )
+        manager.close()
+
+    def test_newline_normalized_tqdm_updates_still_replace_previous_bar(self):
+        client = _Client(
+            "  0%|          | 0/10 [00:00<?, ?it/s]\n"
+            " 50%|#####     | 5/10 [00:01<00:01, 5.00it/s]\n"
+            "100%|##########| 10/10 [00:02<00:00, 5.00it/s]\n"
+            "finished\n"
+        )
+        manager = DashboardLogManager("team", client=client)
+        row = _row(PodAttempt("active", "active-uid", "Running"))
+        manager.reconcile([row])
+        deadline = time.monotonic() + 2
+        while (
+            manager.snapshot(row, row.attempt_details[0]).status != "exited"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        self.assertEqual(
+            manager.snapshot(row, row.attempt_details[0]).lines,
+            (
+                "100%|##########| 10/10 [00:02<00:00, 5.00it/s]",
+                "finished",
+            ),
+        )
         manager.close()
 
     def test_reconcile_stops_stream_when_attempt_becomes_terminal(self):
@@ -172,6 +263,8 @@ class KubernetesAttachStreamTests(unittest.TestCase):
             ],
         )
         self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertFalse(popen.call_args.kwargs["text"])
+        self.assertEqual(popen.call_args.kwargs["bufsize"], 0)
 
 
 if __name__ == "__main__":

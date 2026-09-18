@@ -8,6 +8,8 @@ noisy or unavailable Pod can never block rendering.
 
 from __future__ import annotations
 
+import codecs
+import re
 import subprocess
 import threading
 import time
@@ -21,6 +23,81 @@ from .kubernetes import KubernetesClient
 MAX_LOG_LINES = 200
 LOG_RETENTION_SECONDS = 24 * 60 * 60
 ATTACH_RETRY_SECONDS = 5.0
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-_])"
+)
+_TQDM_PERCENT_RE = re.compile(r"(?<!\d)(?:100|[1-9]?\d)%\|")
+_TQDM_ITER_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?it\s*\[")
+
+
+def _clean_terminal_text(value: str) -> str:
+    """Remove terminal controls while preserving the text they decorated."""
+
+    value = _ANSI_ESCAPE_RE.sub("", value)
+    output: List[str] = []
+    for character in value:
+        if character == "\b":
+            if output:
+                output.pop()
+        elif character >= " " or character == "\t":
+            output.append(character)
+    return "".join(output)
+
+
+def _tqdm_progress_key(value: str) -> str:
+    """Return a stable identity for a tqdm-shaped line, or an empty string."""
+
+    match = _TQDM_PERCENT_RE.search(value)
+    if match is not None and "|" in value[match.end() :]:
+        return f"percent:{value[:match.start()].strip()}"
+    match = _TQDM_ITER_RE.search(value)
+    if match is not None and ("it/s" in value or "s/it" in value):
+        return f"iter:{value[:match.start()].strip()}"
+    return ""
+
+
+class _TerminalLineParser:
+    """Turn a byte stream into committed lines and replaceable CR previews."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._current = ""
+        self._after_carriage_return = False
+
+    def feed(self, chunk: bytes | str) -> List[Tuple[str, str]]:
+        text = (
+            self._decoder.decode(chunk)
+            if isinstance(chunk, bytes)
+            else str(chunk)
+        )
+        events: List[Tuple[str, str]] = []
+        for character in text:
+            if character == "\r":
+                if self._current:
+                    events.append(("preview", _clean_terminal_text(self._current)))
+                self._current = ""
+                self._after_carriage_return = True
+            elif character == "\n":
+                if self._after_carriage_return and not self._current:
+                    events.append(("commit-existing", ""))
+                else:
+                    events.append(("commit", _clean_terminal_text(self._current)))
+                self._current = ""
+                self._after_carriage_return = False
+            else:
+                self._current += character
+                self._after_carriage_return = False
+        if self._current:
+            events.append(("preview", _clean_terminal_text(self._current)))
+        return events
+
+    def finish(self) -> List[Tuple[str, str]]:
+        events = self.feed(self._decoder.decode(b"", final=True))
+        if self._current:
+            events.append(("commit-existing", ""))
+            self._current = ""
+        return events
 
 
 @dataclass(frozen=True)
@@ -41,6 +118,7 @@ class LogSnapshot:
 class _Line:
     captured_at: float
     value: str
+    progress_key: str = ""
 
 
 @dataclass
@@ -62,6 +140,7 @@ class _PodLogState:
     terminal_loaded: bool = False
     retry_at: float = 0.0
     revision: int = 0
+    transient_line: bool = False
 
 
 class DashboardLogManager:
@@ -307,17 +386,30 @@ class DashboardLogManager:
         process: subprocess.Popen,
     ) -> None:
         stream = getattr(process, "stdout", None)
+        parser = _TerminalLineParser()
         try:
             if stream is not None:
-                for raw in stream:
-                    value = str(raw).rstrip("\r\n")
+                while True:
+                    raw = stream.read(4096)
+                    if not raw:
+                        break
+                    events = parser.feed(raw)
                     with self._lock:
                         state = self._states.get(key)
                         if state is None:
                             continue
-                        state.lines.append(_Line(self._clock(), value))
-                        state.revision += 1
+                        changed = self._apply_terminal_events(state, events)
                         self._prune_locked()
+                    if changed:
+                        self._notify()
+                with self._lock:
+                    state = self._states.get(key)
+                    changed = (
+                        self._apply_terminal_events(state, parser.finish())
+                        if state is not None
+                        else False
+                    )
+                if changed:
                     self._notify()
             returncode = process.wait()
         except Exception as exc:
@@ -339,6 +431,62 @@ class DashboardLogManager:
                 state.error = ""
             state.revision += 1
         self._notify()
+
+    def _apply_terminal_events(
+        self,
+        state: _PodLogState,
+        events: Iterable[Tuple[str, str]],
+    ) -> bool:
+        """Apply terminal line events, replacing the active tqdm row on CR."""
+
+        changed = False
+        for action, value in events:
+            if action == "preview":
+                # tqdm pads shorter redraws with spaces to erase the previous
+                # bar. They should not create wrapped blank rows in the TUI.
+                value = value.rstrip(" ")
+                if not value:
+                    continue
+                progress_key = _tqdm_progress_key(value)
+                line = _Line(self._clock(), value, progress_key)
+                if state.transient_line and state.lines:
+                    if state.lines[-1].value != value:
+                        state.lines[-1] = line
+                        changed = True
+                else:
+                    if (
+                        progress_key
+                        and state.lines
+                        and state.lines[-1].progress_key == progress_key
+                    ):
+                        state.lines[-1] = line
+                    else:
+                        state.lines.append(line)
+                    changed = True
+                state.transient_line = True
+            elif action == "commit":
+                progress_key = _tqdm_progress_key(value)
+                line = _Line(self._clock(), value, progress_key)
+                if state.transient_line and state.lines:
+                    if state.lines[-1].value != value:
+                        state.lines[-1] = line
+                        changed = True
+                else:
+                    if (
+                        progress_key
+                        and state.lines
+                        and state.lines[-1].progress_key == progress_key
+                    ):
+                        state.lines[-1] = line
+                    else:
+                        state.lines.append(line)
+                    changed = True
+                state.transient_line = False
+            elif action == "commit-existing":
+                state.transient_line = False
+        if changed:
+            state.revision += 1
+        return changed
 
     def ensure_terminal_logs(self, row: object, attempt: object) -> None:
         """Load one terminal attempt once, asynchronously, on first display."""
@@ -391,7 +539,45 @@ class DashboardLogManager:
                     or result.stdout.strip()
                     or f"falcon logs exited with status {result.returncode}"
                 )
-            values = result.stdout.splitlines()
+            parser = _TerminalLineParser()
+            events = parser.feed(result.stdout)
+            events.extend(parser.finish())
+            values: Deque[Tuple[str, str]] = deque(maxlen=self.max_lines)
+            transient = False
+            for action, value in events:
+                if action == "preview":
+                    value = value.rstrip(" ")
+                    if not value:
+                        continue
+                    progress_key = _tqdm_progress_key(value)
+                    item = (value, progress_key)
+                    if transient and values:
+                        values[-1] = item
+                    elif (
+                        progress_key
+                        and values
+                        and values[-1][1] == progress_key
+                    ):
+                        values[-1] = item
+                    else:
+                        values.append(item)
+                    transient = True
+                elif action == "commit":
+                    progress_key = _tqdm_progress_key(value)
+                    item = (value, progress_key)
+                    if transient and values:
+                        values[-1] = item
+                    elif (
+                        progress_key
+                        and values
+                        and values[-1][1] == progress_key
+                    ):
+                        values[-1] = item
+                    else:
+                        values.append(item)
+                    transient = False
+                elif action == "commit-existing":
+                    transient = False
             error = ""
         except Exception as exc:
             values = []
@@ -403,8 +589,12 @@ class DashboardLogManager:
             state.loading_terminal = False
             state.terminal_loaded = True
             state.lines.clear()
+            state.transient_line = False
             now = self._clock()
-            state.lines.extend(_Line(now, value) for value in values[-self.max_lines :])
+            state.lines.extend(
+                _Line(now, value, progress_key)
+                for value, progress_key in values
+            )
             state.status = "loaded" if not error else "error"
             state.error = error
             state.revision += 1

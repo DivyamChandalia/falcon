@@ -507,6 +507,17 @@ class SelectedJobScroll(RichLog):
                 return count
         return 0
 
+    @staticmethod
+    def _common_prefix(old: Tuple[str, ...], new: Tuple[str, ...]) -> int:
+        """Return the unchanged prefix shared by two snapshots."""
+
+        count = 0
+        for old_line, new_line in zip(old, new):
+            if old_line != new_line:
+                break
+            count += 1
+        return count
+
     def replace_content(
         self,
         source_key: str,
@@ -516,29 +527,28 @@ class SelectedJobScroll(RichLog):
     ) -> None:
         """Apply a bounded snapshot, appending only newly captured lines."""
 
-        previous = self._source_lines if source_key == self._source_key else ()
-        if previous == lines:
+        same_source = source_key == self._source_key
+        previous = self._source_lines if same_source else ()
+        if same_source and previous == lines:
             if follow:
                 self.scroll_end(animate=False, force=True, immediate=False)
             return
 
-        overlap = self._overlap(previous, lines)
-        if (
-            not previous
-            or (lines and overlap == 0)
-            or (len(lines) < len(previous) and overlap == len(lines))
-        ):
+        if not previous:
             super().clear()
             self._source_line_heights = []
-            overlap = 0
-        elif not lines:
-            super().clear()
-            self._source_line_heights = []
-            overlap = 0
+            retained = 0
         else:
-            self._discard_source_prefix(len(previous) - overlap)
+            overlap = self._overlap(previous, lines)
+            prefix = self._common_prefix(previous, lines)
+            if prefix >= overlap:
+                self._discard_source_suffix(len(previous) - prefix)
+                retained = prefix
+            else:
+                self._discard_source_prefix(len(previous) - overlap)
+                retained = overlap
 
-        for line in lines[overlap:]:
+        for line in lines[retained:]:
             self._write_source_line(line)
         self._source_key = source_key
         self._source_lines = lines
@@ -571,6 +581,22 @@ class SelectedJobScroll(RichLog):
         self.virtual_size = Size(self._widest_line_width, len(self.lines))
         self.scroll_y = max(0, self.scroll_y - strip_count)
         self.scroll_target_y = max(0, self.scroll_target_y - strip_count)
+        self.refresh()
+
+    def _discard_source_suffix(self, count: int) -> None:
+        """Drop rendered strips for logical lines replaced at the tail."""
+
+        if count <= 0:
+            return
+        strip_count = sum(self._source_line_heights[-count:])
+        del self._source_line_heights[-count:]
+        if not strip_count:
+            return
+        del self.lines[-strip_count:]
+        self._line_cache.clear()
+        self.virtual_size = Size(self._widest_line_width, len(self.lines))
+        self.scroll_y = min(self.scroll_y, self.max_scroll_y)
+        self.scroll_target_y = min(self.scroll_target_y, self.max_scroll_y)
         self.refresh()
 
     def on_resize(self, event: events.Resize) -> None:

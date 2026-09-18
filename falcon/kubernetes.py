@@ -542,8 +542,10 @@ class KubernetesClient:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                # Keep carriage returns intact so dashboard progress bars can
+                # replace their current row instead of becoming many lines.
+                text=False,
+                bufsize=0,
             )
         except FileNotFoundError as exc:
             raise KubernetesError(

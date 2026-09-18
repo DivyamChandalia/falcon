@@ -723,6 +723,15 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(write.call_count, 1)
             self.assertEqual(len(logs.lines), 200)
+            with patch.object(logs, "write", wraps=logs.write) as write:
+                logs.replace_content(
+                    "test-pod",
+                    tuple(f"line-{index}" for index in range(1, 200))
+                    + ("progress-51%",),
+                    follow=False,
+                )
+                self.assertEqual(write.call_count, 1)
+            self.assertEqual(len(logs.lines), 200)
             logs.replace_content(
                 "wrapped-pod",
                 ("long-value " * 500,),
