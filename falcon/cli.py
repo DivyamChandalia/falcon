@@ -52,6 +52,7 @@ from .config import (
     DEFAULT_CONFIG,
     config_path,
     detect_shell,
+    ensure_kubectl_in_home,
     gpu_preset_max_count,
     load_config,
     logname,
@@ -1959,6 +1960,63 @@ def _print_setup_welcome() -> None:
     )
 
 
+def _setup_kubectl_for_coder(*, non_interactive: bool) -> None:
+    """Keep the Kubernetes client available from shared Coder home storage."""
+
+    try:
+        source, destination = ensure_kubectl_in_home(perform_copy=False)
+    except OSError as exc:
+        print(
+            f"Warning: could not copy kubectl into $HOME/.local/bin: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    if source is None:
+        print("kubectl was not found on PATH; no Coder-session copy was made.")
+        return
+    if destination is None:
+        print(f"kubectl is already available from home: {source}")
+        print(
+            "This keeps kubectl in shared home storage so Coder sessions can "
+            "run Falcon and schedule Kubernetes Jobs. The session still "
+            "needs a usable kubeconfig/context and Kubernetes permissions."
+        )
+        return
+
+    if not non_interactive:
+        answer = input(
+            f"kubectl is installed at {source}, outside shared home storage.\n"
+            f"Copy it to {destination}? This will make kubectl available in "
+            "Coder sessions so they can run Falcon and schedule Kubernetes "
+            "Jobs. It does not copy credentials or grant permissions. [Y/n]: "
+        ).strip().lower()
+        if answer in {"n", "no"}:
+            print(
+                "Skipped the kubectl copy. Coder sessions will need another "
+                "kubectl installation before they can schedule Jobs."
+            )
+            return
+
+    try:
+        source, destination = ensure_kubectl_in_home()
+    except OSError as exc:
+        print(
+            f"Warning: could not copy kubectl into $HOME/.local/bin: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if source is None or destination is None:
+        print("kubectl copy was not needed.")
+        return
+    print(f"Copied kubectl from {source} to {destination}")
+    print(
+        "This keeps kubectl in shared home storage so Coder sessions can run "
+        "Falcon and schedule Kubernetes Jobs. The session still needs a "
+        "usable kubeconfig/context and Kubernetes permissions."
+    )
+
+
 def _update_command(args: argparse.Namespace) -> int:
     """Check for or install the latest Falcon release."""
 
@@ -2097,6 +2155,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Config: {target}")
             if rc:
                 print(f"Completion: {rc}")
+            _setup_kubectl_for_coder(non_interactive=args.non_interactive)
             skills_code = _skills_setup(args)
             _print_setup_welcome()
             return skills_code

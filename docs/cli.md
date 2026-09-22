@@ -151,6 +151,16 @@ falcon completion [bash|zsh]
 falcon config
 ```
 
+`falcon setup` detects the active `kubectl`. When the executable is installed
+outside the user's home directory, setup copies it to
+`$HOME/.local/bin/kubectl` and keeps it executable. Interactive setup asks for
+confirmation and explains that this makes the Kubernetes client available
+through shared home storage in Coder sessions, allowing a Coder terminal to
+run Falcon and schedule Jobs. `--non-interactive` setup accepts the copy
+automatically. It does not copy credentials or grant access: the session must
+still have a usable kubeconfig/context and the Kubernetes permissions required
+by the configured namespace.
+
 ## Updates
 
 ```text

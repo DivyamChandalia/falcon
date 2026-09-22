@@ -26,6 +26,14 @@ pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
 falcon setup
 ```
 
+Setup also checks the installed `kubectl`. If it is outside your home
+directory, interactive setup asks before copying it to
+`$HOME/.local/bin/kubectl`. Coder workspaces share that home directory, so a
+Coder terminal can use `kubectl` and Falcon to schedule Kubernetes Jobs instead
+of depending on the host image containing the client. The Coder session still
+needs a usable kubeconfig/context and the required Kubernetes permissions.
+`--non-interactive` setup accepts the copy automatically.
+
 Open a new shell after setup, then launch and manage a named workload:
 
 ```console
@@ -350,8 +358,10 @@ pip uninstall falcon-k8s
 - **Kubernetes access errors** — check `kubectl config current-context` and
   verify that you can create Jobs in the namespace selected during setup.
 - **No Kubernetes context** — if `kubectl config current-context` is empty or
-  invalid, run Falcon from `node1`, not from inside a Coder session, then check
-  the context again.
+  invalid, configure a kubeconfig/context for the current session and check it
+  again. `falcon setup` can copy `kubectl` into `$HOME/.local/bin` for Coder
+  sessions, but the session still needs credentials and the required RBAC
+  permissions.
 - **No matching GPU nodes** — check `presets` and `cluster.gpu_label` in
   `~/.falconrc`, then compare them with your cluster's node labels.
 - **Coder authentication expired** — run `falcon coder WORKSPACE` again;

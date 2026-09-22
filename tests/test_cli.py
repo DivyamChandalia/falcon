@@ -18,6 +18,7 @@ from falcon.cli import (
     _parser,
     _resources_command,
     _rewrite_shorthand,
+    _setup_kubectl_for_coder,
     _skills_setup,
     main,
     resolve_preset,
@@ -25,6 +26,7 @@ from falcon.cli import (
 from falcon.completion import COMMAND_ALIASES, candidates, shell_script
 from falcon.config import (
     DEFAULT_CONFIG,
+    ensure_kubectl_in_home,
     load_config,
     run_setup,
     save_resources_consumer_sort,
@@ -1320,6 +1322,84 @@ class SetupTests(unittest.TestCase):
             self.assertEqual((first, second), (target, target))
             self.assertEqual(target.read_text(encoding="utf-8"), content)
 
+    def test_kubectl_outside_home_is_copied_to_user_bin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            source = root / "system-bin" / "kubectl"
+            source.parent.mkdir()
+            source.write_bytes(b"kubectl-test-binary")
+            source.chmod(0o644)
+
+            with patch(
+                "falcon.config.shutil.which", return_value=str(source)
+            ), patch("falcon.config.Path.home", return_value=home):
+                detected, destination = ensure_kubectl_in_home()
+
+            expected = home / ".local" / "bin" / "kubectl"
+            self.assertEqual(detected, source)
+            self.assertEqual(destination, expected)
+            self.assertEqual(expected.read_bytes(), source.read_bytes())
+            self.assertTrue(expected.stat().st_mode & 0o111)
+            self.assertEqual(list(expected.parent.glob(".kubectl.*.tmp")), [])
+
+    def test_kubectl_already_in_home_is_not_copied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            source = home / ".local" / "bin" / "kubectl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"kubectl-test-binary")
+
+            with patch(
+                "falcon.config.shutil.which", return_value=str(source)
+            ), patch("falcon.config.Path.home", return_value=home):
+                detected, destination = ensure_kubectl_in_home()
+
+            self.assertEqual(detected, source)
+            self.assertIsNone(destination)
+            self.assertEqual(source.read_bytes(), b"kubectl-test-binary")
+
+    def test_setup_explains_coder_kubectl_availability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / ".falconrc"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch(
+                "falcon.cli.ensure_kubectl_in_home",
+                return_value=(
+                    Path("/usr/bin/kubectl"),
+                    Path("/home/alice/.local/bin/kubectl"),
+                ),
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(
+                    [
+                        "--config", str(target), "setup", "--non-interactive",
+                        "--no-shell", "--skip-skills",
+                    ]
+                )
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertIn("Copied kubectl from /usr/bin/kubectl", stdout.getvalue())
+        self.assertIn("Coder sessions can run Falcon", stdout.getvalue())
+
+    def test_interactive_setup_asks_before_kubectl_copy(self) -> None:
+        source = Path("/usr/bin/kubectl")
+        destination = Path("/home/alice/.local/bin/kubectl")
+        stdout = io.StringIO()
+        with patch(
+            "falcon.cli.ensure_kubectl_in_home",
+            side_effect=[(source, destination), (source, destination)],
+        ) as ensure, patch("builtins.input", return_value="y") as prompt, contextlib.redirect_stdout(
+            stdout
+        ):
+            _setup_kubectl_for_coder(non_interactive=False)
+
+        self.assertEqual(ensure.call_count, 2)
+        self.assertIn("This will make kubectl available in Coder sessions", prompt.call_args.args[0])
+        self.assertIn("Copied kubectl from /usr/bin/kubectl", stdout.getvalue())
+
     def test_interactive_setup_rerun_keeps_current_config_on_empty_answers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / ".falconrc"
@@ -1365,9 +1445,9 @@ class SetupTests(unittest.TestCase):
             target = Path(temporary) / ".falconrc"
             stdout = io.StringIO()
             stderr = io.StringIO()
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
+            with patch(
+                "falcon.cli.ensure_kubectl_in_home", return_value=(None, None)
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = main(
                     [
                         "--config", str(target), "setup", "--non-interactive",
@@ -1390,6 +1470,8 @@ class SetupTests(unittest.TestCase):
             stderr = io.StringIO()
             with patch(
                 "falcon.cli._skills_setup", return_value=5
+            ), patch(
+                "falcon.cli.ensure_kubectl_in_home", return_value=(None, None)
             ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = main([
                     "--config", str(target), "setup", "--non-interactive",

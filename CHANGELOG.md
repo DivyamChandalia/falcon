@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3 — 2026-09-22
+
+- Added an interactive `falcon setup` confirmation before copying an external
+  `kubectl` into `$HOME/.local/bin`; pressing Enter accepts the default Yes.
+- Documented that the shared-home copy makes `kubectl` and Falcon available in
+  Coder sessions for scheduling Jobs, while retaining the kubeconfig and RBAC
+  prerequisites.
+
 ## 0.4.2 — 2026-09-18
 
 - Added tqdm-compatible log capture: carriage-return progress updates replace

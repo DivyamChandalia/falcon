@@ -11,7 +11,9 @@ import copy
 import getpass
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
@@ -640,6 +642,60 @@ def install_shell_integration() -> Path:
     rc_path.parent.mkdir(parents=True, exist_ok=True)
     rc_path.write_text(updated, encoding="utf-8")
     return rc_path
+
+
+def ensure_kubectl_in_home(
+    *, perform_copy: bool = True
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Make an externally installed ``kubectl`` available from user home.
+
+    Coder sessions can share the user's home directory even when the host's
+    system binaries are not present in the workspace image.  Return the
+    detected source and the copied destination.  A missing source returns
+    ``(None, None)``; a source already below ``$HOME`` returns the source and
+    ``None`` because no copy is needed.  With ``perform_copy=False``, an
+    external source returns its planned destination without writing it.
+
+    Copying uses a temporary file followed by an atomic replace so an
+    interrupted setup cannot leave a partially written executable in the
+    shared home directory.  Filesystem errors are intentionally propagated to
+    the CLI, which reports them as a setup warning while preserving the
+    configuration setup itself.
+    """
+
+    detected = shutil.which("kubectl")
+    if not detected:
+        return None, None
+
+    source = Path(detected).absolute()
+    home = Path.home().absolute()
+    destination = home / ".local" / "bin" / "kubectl"
+    if source.is_relative_to(home):
+        return source, None
+    if not perform_copy:
+        return source, destination
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        shutil.copy2(source, temporary)
+        temporary.chmod(temporary.stat().st_mode | 0o111)
+        os.replace(temporary, destination)
+    except OSError:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        raise
+    return source, destination
 
 
 def _remove_legacy_falcon_shell(content: str) -> str:

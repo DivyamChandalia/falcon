@@ -38,3 +38,10 @@ Managed installs are idempotent. `falcon setup` refreshes modified
 Falcon-owned skill copies and removes obsolete Falcon-owned skill files.
 Unmanaged directories and symlinks remain protected conflicts and are never
 overwritten.
+
+Setup also makes the Kubernetes client available to Coder sessions: when the
+detected `kubectl` lives outside home, it is copied to
+`$HOME/.local/bin/kubectl`. Because Coder workspaces share the home directory,
+their terminals can then run Falcon and schedule Jobs. The workspace still
+needs a kubeconfig/context and Kubernetes permissions; copying the executable
+does not provide authentication or authorization.
