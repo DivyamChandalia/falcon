@@ -60,7 +60,7 @@
     "resources-gpu-allocations-vram-140x32": "2d064947e6008a1369190d4b85ab6981f954dc71130c76c979573425c71779b7",
     "resources-no-jobs": "8fda76cfb5fc8225dae2eb7fcc145cbd20017efaa3f4b11b6e0c054ed4ea660e",
     "resources-node-expanded-140x40": "131cbc2433dd8e4cba3c9df57abef7e0f1e7de52cf9ce3472400328c4f4e2b03",
-    "resources-node-expanded-80x22": "952480a20cc9d26ceffe1c7dd5c76d564846d86a96cb178595b568aefd9c12c9",
+    "resources-node-expanded-80x22": "e5d7598de9da0899268e98ab6a4f3eb786a9543ef79b2315555193624b8dd3ba",
     "resources-stale": "a4c58f869a3cf6d83b30a71ef50a50327d2c9478b858ea47fd0b5e1dc06cfc3f"
   },
   "textual": "7.x"

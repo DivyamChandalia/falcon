@@ -3433,10 +3433,10 @@ class FalconResourcesApp(App[None]):
             )
             if self.size.width < 100:
                 value = (
-                    "↑/↓ Consumers   "
-                    f"s Sort {CONSUMER_SORT_LABELS[self.state.consumer_sort]}   "
-                    f"{gpu_control}m {mode_label}   l {scale_label}   "
-                    "Tab   Esc Nodes   q Quit"
+                    "↑/↓ Consumers  "
+                    f"s {CONSUMER_SORT_LABELS[self.state.consumer_sort]}  "
+                    f"{gpu_control}m {mode_label}  l {scale_label}  "
+                    "Tab  Esc  q Quit"
                 )
             else:
                 value = (
