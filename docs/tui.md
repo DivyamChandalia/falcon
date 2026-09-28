@@ -72,20 +72,20 @@ streams; process names and allocated VRAM are reconciled every five seconds.
 - `↑` / `↓`, `j` / `k`: navigate the active side
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump
 - `Enter`: inspect the node and its consumers
-- `s`: cycle the shared workload sorting (Namespace, CPU, Memory, GPU) for
-  Selected Node and GPU-requesting Jobs
+- `s`: cycle the shared workload sorting (GPU, Memory, CPU, Namespace) for
+  Selected Node and Namespace/Workload Allocation
 - `Esc`: return to node list
-- Below `160×30`, `←` / `→` cycle Nodes and GPU Allocations (wrapping). At
+- Below `160×30`, `←` / `→` cycle Nodes and Allocations (wrapping). At
   `160×30` and above, both sides remain visible and `←` / `→` do nothing.
 - In the wide layout, `Tab` follows Allocation History, Namespace Pie,
-  GPU-requesting Jobs, Nodes, and Selected Node; `Shift+Tab` reverses that
-  order. The active side is retained across resizes.
+  Namespace/Workload Allocation, Nodes, and Selected Node; `Shift+Tab`
+  reverses that order. The active side is retained across resizes.
 - `m`: cycle the allocation charts through GPU, scheduler-requested memory, and
   scheduler-requested CPU cores
 - `v`: while the GPU mode is active, switch between requested GPU count and
   allocated VRAM. It does not leave or enter GPU mode.
 - `l`: toggle Allocation History between linear and logarithmic y-axis scale
-- Click a GPU Allocations sub-pane to select it; `Enter` expands the selection
+- Click an Allocations sub-pane to select it; `Enter` expands the selection
   and `Esc` restores it
 - `r`: refresh; `q`: quit
 
@@ -110,12 +110,12 @@ names use natural ordering, so `node10` follows `node9`.
 
 Selected-node workloads are shown as Namespace, Job, Status, CPU, RAM, and GPU.
 The `s` sort preference is stored in `resources.consumer_sort` and is restored
-on the next launch. It is shared by Selected Node workloads and GPU-requesting
-Jobs, including their expanded views, so changing it in either pane updates
-the other. CPU, memory, and GPU sorts show the largest requests first;
-Namespace sorts naturally by namespace, then Job.
+on the next launch. It defaults to GPU and is shared by Selected Node workloads
+and Namespace/Workload Allocation, including their expanded views, so changing
+it in either pane updates the other. The selected resource is primary; ties are
+resolved by GPU, memory, CPU, then natural namespace/workload name priority.
 
-GPU Allocations is scheduler-facing allocation accounting from the same local
+Allocations is scheduler-facing allocation accounting from the same local
 resource snapshot as the other Resources views; it does not query or infer GPU
 compute utilization. Opening Resources starts one detached collector for the
 configured resource endpoint. It continues after the TUI closes and stores up
@@ -123,9 +123,9 @@ to 24 hours and 20,000 snapshots in
 `$XDG_STATE_HOME/falcon/resources-history-*.sqlite3` (or
 `~/.local/state/falcon`). Later TUI launches load that window immediately. The
 Dashboard and Resources screens share Falcon's true-colour semantic palette for
-status, pressure, accents, and totals. Namespace slices use the dedicated
-seven-colour colour-blind-friendly palette, with cyan reserved for accents and
-totals.
+status, pressure, accents, and totals. Namespace slices use a dedicated
+15-colour colour-blind-friendly palette before repeating, with cyan reserved
+for accents and totals.
 Falcon pins the Rich console used by both apps to truecolour output. This is
 intentional for tmux: a `screen-256color` `$TERM` must not downgrade these
 explicit hex colours to xterm-256 or ANSI-16 values.
@@ -136,34 +136,46 @@ falls back automatically for `TERM=dumb`. Set `FALCON_COLOR_DEBUG=1` to log
 the selected mode, the framework-detected mode, and the exact RGB tuple.
 At `160×30` and above, Resources keeps its header, summary, controls, and
 footer full width. The node inventory and Selected Node details share the left
-half; GPU Allocations occupies the right half. The node details hide when the
+half; Allocations occupies the right half. The node details hide when the
 inventory needs the available height. `Enter` expands the active allocation
 panel or Selected Node to the full Resources body, and `Esc` restores the
 combined layout.
 
-The filled namespace pie and Allocation History use one shared percentage
-legend. In GPU Allocations, the left stack is a fixed 24-column Namespace
-Legend followed by the pie; the legend's outer panel matches the taller
-Allocation History panel on the right, while its rows remain content-driven.
-Allocation History independently spans from the legend's right edge to the
-full pane width. GPU-requesting Jobs starts after the pie's aspect-correct
-footprint, so its narrower column never constrains the history chart. Long
-namespace names are ellipsized. The pie uses the terminal's approximately
-2:1 cell aspect ratio and gives any excess width to the history/jobs stack.
-Even the compact minimum Resources pane retains a drawable pie footprint. The
-legend uses every available row for namespaces and adds `Other` only when
-there are more categories than the current pane can display. The same aligned
-legend is retained when History or Pie is expanded. The view selector is
-hidden while a panel is expanded; `Esc` restores it with the combined/page
-layout. Names are not repeated inside or below either graph. `System/hidden`
-is retained when needed to reconcile totals. Both graphs switch bases together
-within the active pair. GPU mode is exactly namespace requested GPU count
+When the combined layout is tall enough, Selected Node is capped at ten rows
+and a separate lower-left row shows three cluster-wide namespace-share pies
+for CPU, memory, and GPU. Allocation History and Namespace/Workload Allocation
+then stack across the full right half; the ordinary single namespace pie is
+used instead at smaller sizes. The three cluster pies are selectable by mouse
+or `Tab`: selection switches the history metric and sorts both namespace
+parents and workloads by that resource. `Enter` expands the selected pie with
+the matching Namespace/Workload Allocation hierarchy on its right.
+
+Allocations has three independent bordered surfaces without a redundant
+outer frame: Allocation History above the aspect-correct namespace pie and
+Namespace/Workload Allocation tree. The normal stack uses a balanced vertical
+split between History and the lower pie/allocation row (preserving the pie's
+minimum height in very short terminals). In the large combined layout, History
+and Namespace/Workload Allocation split the right side vertically 50/50. The tree replaces the standalone
+legend and flat GPU Jobs list. Each namespace parent uses the chart's stable
+colour and shows the sum of requested GPU count, memory, and CPU for its visible
+children; child rows show workload and node. It includes CPU-only and
+memory-only workloads, and sorting applies consistently to parents and children
+without combining unlike units. The view selector is hidden while one surface
+is expanded; `Esc` restores it with the combined/page layout. `System/hidden`
+is retained in charts when needed to reconcile totals. Both graphs switch
+bases together within the active pair. GPU mode is exactly namespace requested GPU count
 divided by total requested GPU count, VRAM mode is namespace allocated VRAM
 divided by total allocated VRAM, and the `m` pair uses scheduler-requested
 memory (GiB) or CPU cores for every active workload. The GPU and CPU/memory
 history series are additive to the existing service history format, so an
 older service remains readable; its historical CPU and memory columns begin
 collecting after the service is relaunched.
+
+Enter-expanded Selected Node retains the ordinary node facts and Resource
+Consumers inspector. Allocation pies remain cluster-wide and live in the
+combined Resources layout or their own expanded allocation view. The `m`, `v`,
+and `l` allocation controls remain active while the Selected Node inspector is
+expanded; they update the allocation view that appears when it is restored.
 
 The current step-line chart reflects that scheduler allocations change in
 discrete steps. Press `l` to use a `log1p` y-axis when large allocations would

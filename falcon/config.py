@@ -71,7 +71,7 @@ USER_DEFAULTS: Dict[str, Any] = {
     "resources": {
         "shared_memory_percent": 15,
         "last_view": "nodes",
-        "consumer_sort": "namespace",
+        "consumer_sort": "gpu",
         "history_enabled": True,
         "history_hours": 24,
         "history_interval_seconds": 5,
@@ -233,7 +233,7 @@ def _user_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             # A display preference should never make Falcon unusable after a
             # downgrade, hand edit, or retired preview value.
             resources.pop("last_view", None)
-        if resources.get("consumer_sort", "namespace") not in {
+        if resources.get("consumer_sort", "gpu") not in {
             "namespace",
             "cpu",
             "memory",
@@ -377,7 +377,7 @@ def validate_config(config: Dict[str, Any]) -> None:
             "resources.last_view must be nodes or gpu-allocations"
         )
     resources = config.get("resources", {})
-    consumer_sort = resources.get("consumer_sort", "namespace")
+    consumer_sort = resources.get("consumer_sort", "gpu")
     if consumer_sort not in {"namespace", "cpu", "memory", "gpu"}:
         raise ValueError(
             "resources.consumer_sort must be namespace, cpu, memory, or gpu"

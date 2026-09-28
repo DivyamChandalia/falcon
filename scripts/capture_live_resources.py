@@ -66,7 +66,7 @@ async def capture() -> None:
         await pilot.press("right")
         await pilot.pause(0.5)
         allocations_svg = app.export_screenshot(
-            title="Falcon GPU allocations · live cluster snapshot",
+            title="Falcon allocations · live cluster snapshot",
             simplify=True,
         )
 
@@ -78,7 +78,7 @@ async def capture() -> None:
     )
     print(
         f"captured {len(snapshot.nodes)} live nodes to {NODES_ASSET}\n"
-        f"captured live GPU allocations to {ALLOCATIONS_ASSET}\n"
+        f"captured live allocations to {ALLOCATIONS_ASSET}\n"
         f"GPU request headroom: {availability or '-'}"
     )
 

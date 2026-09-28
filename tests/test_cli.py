@@ -1219,7 +1219,7 @@ class SetupTests(unittest.TestCase):
 
     def test_resources_view_default_validation_and_atomic_persistence(self) -> None:
         self.assertEqual(DEFAULT_CONFIG["resources"]["last_view"], "nodes")
-        self.assertEqual(DEFAULT_CONFIG["resources"]["consumer_sort"], "namespace")
+        self.assertEqual(DEFAULT_CONFIG["resources"]["consumer_sort"], "gpu")
         self.assertTrue(DEFAULT_CONFIG["resources"]["history_enabled"])
         self.assertEqual(DEFAULT_CONFIG["resources"]["history_hours"], 24)
         self.assertEqual(DEFAULT_CONFIG["presets"]["pro6000"]["max_count"], 2)

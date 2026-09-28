@@ -28,12 +28,28 @@ class GPUHistoryRendererTests(unittest.TestCase):
             "#F0E442",
             "#0072B2",
             "#D55E00",
+            "#7F3C8D",
+            "#11A579",
+            "#3969AC",
+            "#E73F74",
+            "#F2B701",
+            "#80BA5A",
+            "#E68310",
+            "#008695",
         ))
 
     def test_allocation_colors_use_the_requested_pie_palette(self) -> None:
         categories = [("alpha", 1), ("beta", 2), ("gamma", 3)]
         colors = allocation_colors(categories)
         self.assertEqual(set(colors.values()), set(PALETTE.pie[:3]))
+
+    def test_allocation_colors_keep_large_namespace_sets_distinct(self) -> None:
+        categories = [
+            (f"namespace-{index:02d}", 1)
+            for index in range(len(PALETTE.pie))
+        ]
+        colors = allocation_colors(categories)
+        self.assertEqual(len(set(colors.values())), len(PALETTE.pie))
 
     @staticmethod
     def points(count: int = 40):

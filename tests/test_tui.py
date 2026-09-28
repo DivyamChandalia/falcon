@@ -48,10 +48,11 @@ from falcon.resources_charts import (
     render_gpu_history,
     render_namespace_pie,
 )
-from falcon.resources_telemetry import GpuTelemetrySnapshot
+from falcon.resources_telemetry import GpuTelemetrySnapshot, allocation_snapshot
 from falcon.resources_ui import (
-    ALLOCATION_LEGEND_WIDTH,
+    COMBINED_NODE_DETAIL_HEIGHT,
     CONSUMER_SORTS,
+    EXPANDED_NODE_MIN_CONSUMER_HEIGHT,
     RESOURCE_VIEWS,
     FalconResourcesApp,
     ResourcesPane,
@@ -1428,6 +1429,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(app.state.consumer_sort, expected)
                 self.assertEqual(persisted[-1], expected)
+            await pilot.press("s")
             self.assertEqual(app.state.consumer_sort, "gpu")
             values = app._sorted_consumers(app._selected())
             self.assertEqual(
@@ -1440,7 +1442,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         fallback = FalconResourcesApp(
             DemoCollector("mixed"), initial_consumer_sort="unsupported"
         )
-        self.assertEqual(fallback.state.consumer_sort, "namespace")
+        self.assertEqual(fallback.state.consumer_sort, "gpu")
 
     async def test_consumer_sort_is_shared_by_gpu_jobs_and_selected_node(self) -> None:
         persisted = []
@@ -1480,29 +1482,29 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.5)
 
             await pilot.press("s")
-            self.assertEqual(app.state.consumer_sort, "cpu")
+            self.assertEqual(app.state.consumer_sort, "memory")
             assert_shared_order()
 
             await pilot.press("right")
             self.assertEqual(app.state.view, "nodes")
             await pilot.press("s")
-            self.assertEqual(app.state.consumer_sort, "memory")
-            self.assertEqual(persisted[-1], "memory")
+            self.assertEqual(app.state.consumer_sort, "cpu")
+            self.assertEqual(persisted[-1], "cpu")
             assert_shared_order()
 
             await pilot.press("enter")
             self.assertTrue(app.state.expanded)
             await pilot.press("s")
-            self.assertEqual(app.state.consumer_sort, "gpu")
+            self.assertEqual(app.state.consumer_sort, "namespace")
             assert_shared_order()
 
             await pilot.press("escape")
             await pilot.press("right")
             await pilot.press("tab", "tab", "enter")
-            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pods")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "allocation")
             before_render = app._allocation_render_key
             await pilot.press("s")
-            self.assertEqual(app.state.consumer_sort, "namespace")
+            self.assertEqual(app.state.consumer_sort, "gpu")
             self.assertNotEqual(app._allocation_render_key, before_render)
             assert_shared_order()
 
@@ -1544,8 +1546,10 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
 
             geometry = app._allocation_geometry
             self.assertIsNotNone(geometry)
-            self.assertEqual(geometry.legend.width, ALLOCATION_LEGEND_WIDTH)
-            self.assertGreaterEqual(geometry.right_width, 44)
+            self.assertFalse(app.query_one("#node-pies-pane").display)
+            self.assertGreater(geometry.pie.height, 0)
+            self.assertGreaterEqual(geometry.allocation_width, 38)
+            self.assertEqual(geometry.history.width, geometry.width)
             self.assertLessEqual(
                 geometry.pie.width - 4,
                 2 * (geometry.pie.height - 2),
@@ -1568,7 +1572,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app._wide_resources_layout)
             self.assertEqual(app.state.view, "nodes")
 
-    async def test_allocation_geometry_gives_history_the_larger_share(self) -> None:
+    async def test_allocation_geometry_splits_history_and_allocation_evenly(self) -> None:
         app = FalconResourcesApp(
             DemoCollector("mixed"),
             refresh_seconds=999,
@@ -1578,22 +1582,89 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.5)
             geometry = app._allocation_geometry
             self.assertIsNotNone(geometry)
-            self.assertEqual(geometry.legend.height, geometry.history.height)
-            self.assertGreater(geometry.history.height, geometry.jobs.height)
-            self.assertEqual(geometry.pie.height, 14)
+            self.assertLessEqual(
+                abs(geometry.history.height - geometry.allocation.height),
+                1,
+            )
+            self.assertEqual(geometry.pie.height, 0)
             self.assertEqual(geometry.remainder_height, 0)
-            self.assertEqual(geometry.history.x, ALLOCATION_LEGEND_WIDTH)
-            self.assertGreater(geometry.history.width, geometry.jobs.width)
-            self.assertEqual(geometry.jobs.y, geometry.history.height)
-            self.assertEqual(geometry.jobs.height + geometry.history.height, geometry.height)
+            self.assertEqual(geometry.history.x, 0)
+            self.assertEqual(geometry.history.width, geometry.width)
+            self.assertEqual(geometry.allocation.y, geometry.history.height)
+            self.assertEqual(
+                geometry.allocation.height + geometry.history.height,
+                geometry.height,
+            )
+            detail = app.query_one("#node-pane")
+            pies = app.query_one("#node-pies-pane")
+            self.assertEqual(detail.region.height, COMBINED_NODE_DETAIL_HEIGHT)
+            self.assertTrue(pies.display)
+            self.assertGreaterEqual(pies.region.height, 12)
+            rendered = app.export_screenshot(simplify=True)
+            for title in (
+                "CPU&#160;BY&#160;NAMESPACE",
+                "MEMORY&#160;BY&#160;NAMESPACE",
+                "GPU&#160;BY&#160;NAMESPACE",
+                "NAMESPACE&#160;/&#160;WORKLOAD&#160;ALLOCATION",
+            ):
+                self.assertIn(title, rendered)
 
             expanded_history = app._allocation_geometry_for(expanded="history")
-            self.assertEqual(
-                expanded_history.legend.height,
-                expanded_history.history.height,
-            )
+            self.assertEqual(expanded_history.history.height, expanded_history.height)
             expanded_pie = app._allocation_geometry_for(expanded="pie")
-            self.assertEqual(expanded_pie.legend.height, expanded_pie.pie.height)
+            self.assertGreater(expanded_pie.pie.height, 0)
+            self.assertGreaterEqual(expanded_pie.allocation_width, 38)
+
+    async def test_compact_allocation_geometry_keeps_history_and_namespace_balanced(
+        self,
+    ) -> None:
+        app = FalconResourcesApp(
+            DemoCollector("mixed"),
+            refresh_seconds=999,
+            initial_view="gpu-allocations",
+        )
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            geometry = app._allocation_geometry
+            self.assertIsNotNone(geometry)
+            self.assertLessEqual(
+                abs(geometry.history.height - geometry.allocation.height),
+                1,
+            )
+            self.assertEqual(
+                geometry.history.height + geometry.allocation.height,
+                geometry.height,
+            )
+            self.assertGreater(geometry.pie.height, 0)
+            self.assertGreaterEqual(geometry.allocation_width, 38)
+
+    async def test_cluster_pies_select_metric_sort_and_expand_with_namespace(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.5)
+            pies = app.query_one("#node-pies-pane")
+            self.assertTrue(pies.display)
+
+            await pilot.click("#node-pies-pane", offset=(5, 5))
+            self.assertEqual(app.state.selected_cluster_pie, "cpu")
+            self.assertEqual(app.state.allocation_mode, "cpu")
+            self.assertEqual(app.state.consumer_sort, "cpu")
+            rendered = app.export_screenshot(simplify=True)
+            self.assertIn("CPU&#160;ALLOCATION&#160;HISTORY", rendered)
+            self.assertIn("sort&#160;CPU", rendered)
+
+            await pilot.press("enter")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pie")
+            geometry = app._allocation_geometry
+            self.assertGreater(geometry.pie.width, 0)
+            self.assertGreater(geometry.allocation.width, 0)
+            self.assertEqual(
+                geometry.pie.width + geometry.allocation.width,
+                geometry.width,
+            )
+            rendered = app.export_screenshot(simplify=True)
+            self.assertIn("CPU&#160;BY&#160;NAMESPACE", rendered)
+            self.assertIn("NAMESPACE&#160;/&#160;WORKLOAD&#160;ALLOCATION", rendered)
 
             app.gpu_telemetry = GpuTelemetrySnapshot.from_mappings(
                 collected_at=DEMO_NOW,
@@ -1605,9 +1676,147 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 target_pods=8,
                 sampled_pods=8,
             )
+            app._select_allocation_metric("gpu")
             categories = app._namespace_categories()
             self.assertEqual(len(categories), 8)
             self.assertNotIn("Other", dict(categories))
+
+    def test_namespace_allocation_groups_include_all_requested_resources(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        app = FalconResourcesApp(DemoCollector("mixed"), initial_consumer_sort="gpu")
+        app.nodes = list(snapshot.nodes)
+
+        consumers = app._allocation_consumers()
+        self.assertTrue(any(item.requested.gpu_count == 0 for item in consumers))
+        self.assertTrue(
+            any(
+                item.requested.gpu_count == 0
+                and (
+                    item.requested.cpu_cores > 0
+                    or item.requested.memory_bytes > 0
+                )
+                for item in consumers
+            )
+        )
+        groups = app._namespace_allocation_groups()
+        self.assertTrue(groups)
+        for group in groups:
+            self.assertEqual(
+                group.gpu_count,
+                sum(item.requested.gpu_count for item in group.consumers),
+            )
+            self.assertEqual(
+                group.memory_bytes,
+                sum(item.requested.memory_bytes for item in group.consumers),
+            )
+            self.assertAlmostEqual(
+                group.cpu_cores,
+                sum(item.requested.cpu_cores for item in group.consumers),
+            )
+
+    def test_namespace_allocation_sort_applies_to_parents_and_children(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), initial_consumer_sort="gpu")
+        app.nodes = list(demo_cluster_snapshot("mixed").nodes)
+        metrics = {
+            "gpu": lambda item: item.gpu_count,
+            "memory": lambda item: item.memory_bytes,
+            "cpu": lambda item: item.cpu_cores,
+        }
+        child_metrics = {
+            "gpu": lambda item: item.requested.gpu_count,
+            "memory": lambda item: item.requested.memory_bytes,
+            "cpu": lambda item: item.requested.cpu_cores,
+        }
+        for sort in ("gpu", "memory", "cpu"):
+            app.state.consumer_sort = sort
+            groups = app._namespace_allocation_groups()
+            self.assertEqual(
+                [metrics[sort](group) for group in groups],
+                sorted((metrics[sort](group) for group in groups), reverse=True),
+            )
+            for group in groups:
+                values = [child_metrics[sort](item) for item in group.consumers]
+                self.assertEqual(values, sorted(values, reverse=True))
+
+    def test_allocation_sort_uses_resource_priority_for_ties(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        base = snapshot.nodes[0].visible_consumers[0]
+
+        def workload(namespace, name, gpu, memory, cpu):
+            return replace(
+                base,
+                namespace=namespace,
+                workload_name=name,
+                pod_name=name,
+                requested=replace(
+                    base.requested,
+                    gpu_count=gpu,
+                    memory_bytes=memory * 1024**3,
+                    cpu_cores=cpu,
+                ),
+            )
+
+        app = FalconResourcesApp(DemoCollector("mixed"), initial_consumer_sort="gpu")
+        app.nodes = [
+            replace(
+                snapshot.nodes[0],
+                consumers=(
+                    workload("team-a", "memory-small", 2, 64, 12),
+                    workload("team-b", "memory-large", 2, 128, 1),
+                    workload("team-c", "gpu-small", 1, 256, 30),
+                ),
+            )
+        ]
+        app.state.consumer_sort = "gpu"
+        self.assertEqual(
+            [group.namespace for group in app._namespace_allocation_groups()],
+            ["team-b", "team-a", "team-c"],
+        )
+
+        app.state.consumer_sort = "gpu"
+        app.nodes = [
+            replace(
+                app.nodes[0],
+                consumers=(
+                    workload("team-a", "cpu-small", 2, 128, 4),
+                    workload("team-b", "cpu-large", 2, 128, 8),
+                ),
+            )
+        ]
+        app._nodes_revision += 1
+        self.assertEqual(
+            [item.workload_name for item in app._allocation_consumers()],
+            ["cpu-large", "cpu-small"],
+        )
+
+        app.state.consumer_sort = "memory"
+        app._nodes_revision += 1
+        app.nodes = [
+            replace(
+                app.nodes[0],
+                consumers=(
+                    workload("team-a", "gpu-small", 1, 128, 4),
+                    workload("team-b", "gpu-large", 2, 128, 1),
+                ),
+            )
+        ]
+        app._nodes_revision += 1
+        self.assertEqual(
+            [item.workload_name for item in app._allocation_consumers()],
+            ["gpu-large", "gpu-small"],
+        )
+
+    def test_namespace_colors_are_shared_by_tree_and_charts(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"))
+        app.nodes = list(demo_cluster_snapshot("mixed").nodes)
+        app.gpu_telemetry = allocation_snapshot(app.nodes, collected_at=DEMO_NOW)
+        categories = app._namespace_categories()
+        shared = app._namespace_colors()
+        chart = app._allocation_colors(categories)
+        for name, _ in categories:
+            self.assertEqual(chart[name], shared[name])
+        for group in app._namespace_allocation_groups():
+            self.assertIn(group.namespace, shared)
 
     async def test_gpu_requests_remain_visible_at_supported_allocation_widths(self) -> None:
         for size in ((80, 20), (80, 22), (140, 32), (160, 30), (160, 40), (200, 50)):
@@ -1622,14 +1831,11 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(geometry)
                 self.assertEqual(
                     app._allocation_visible_rows(),
-                    max(1, geometry.jobs.height - 4),
+                    max(1, geometry.allocation.height - 4),
                     msg=f"size={size}",
                 )
-                table_width = max(1, geometry.jobs.width - 4)
-                table = app._gpu_pod_table(
-                    app._gpu_consumers(),
-                    width=table_width,
-                )
+                table_width = max(1, geometry.allocation.width - 4)
+                table = app._allocation_table(width=table_width)
                 self.assertFalse(table.show_edge, msg=f"size={size}")
                 rendered = "".join(
                     segment.text
@@ -1638,10 +1844,12 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                         app.console.options.update(width=table_width, height=12),
                     )
                 )
-                expected = "H100×2" if table_width < 100 else "H100 ×2"
-                self.assertIn(expected, rendered, msg=f"size={size}")
+                self.assertIn("GPU", rendered, msg=f"size={size}")
+                self.assertIn("H100x2", rendered, msg=f"size={size}")
+                self.assertIn("■", rendered, msg=f"size={size}")
+                self.assertIn("└─", rendered, msg=f"size={size}")
 
-    async def test_gpu_request_column_has_priority_over_workload_names(self) -> None:
+    async def test_allocation_tree_keeps_resource_columns_with_long_names(self) -> None:
         app = FalconResourcesApp(
             DemoCollector("mixed"),
             refresh_seconds=999,
@@ -1649,17 +1857,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         )
         async with app.run_test(size=(80, 20)) as pilot:
             await pilot.pause(0.2)
-            source = app._gpu_consumers()[0]
-            consumer = replace(
-                source,
-                workload_name="job-with-a-very-long-name-that-can-yield",
-                requested=replace(
-                    source.requested,
-                    gpu_model="NVIDIA-H100-80GB-HBM3",
-                    gpu_count=2,
-                ),
-            )
-            table = app._gpu_pod_table((consumer,), width=48)
+            table = app._allocation_table(width=48)
             rendered = "".join(
                 segment.text
                 for segment in app.console.render(
@@ -1667,8 +1865,9 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                     app.console.options.update(width=48, height=8),
                 )
             )
-            self.assertIn("NVIDIA-H100-80GB-HBM3×2", rendered)
-            self.assertNotIn("job-with-a-very-long-name-that-can-yield", rendered)
+            self.assertIn("GPU", rendered)
+            self.assertIn("MEM", rendered)
+            self.assertIn("CPU", rendered)
 
     async def test_nodes_merge_responsive_gpu_bars_and_highlight_selection(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -1912,7 +2111,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.focused.id, "gpu-allocations-pane")
             self.assertEqual(app.state.selected_panels["gpu-allocations"], "pie")
             await pilot.press("tab")
-            self.assertEqual(app.state.selected_panels["gpu-allocations"], "pods")
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "allocation")
             await pilot.press("tab")
             self.assertEqual(app.state.selected_panels["gpu-allocations"], "history")
             await pilot.press("v")
@@ -1978,7 +2177,12 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("v&#160;VRAM", rendered)
             self.assertNotIn("VRAM&#160;percentages", rendered)
             self.assertNotIn("GPU&#160;COUNT&#160;%", rendered)
-            self.assertEqual(rendered.count("NAMESPACE&#160;LEGEND"), 1)
+            self.assertNotIn("NAMESPACE&#160;LEGEND", rendered)
+            self.assertNotIn(
+                "GPU&#160;ALLOCATIONS&#160;·&#160;focused",
+                rendered,
+            )
+            self.assertIn("NAMESPACE&#160;/&#160;WORKLOAD&#160;ALLOCATION", rendered)
 
             self.assertFalse(app.state.history_log_scale)
             linear_render_key = app._allocation_render_key
@@ -2016,6 +2220,29 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.allocation_mode, "gpu")
             self.assertEqual(app.state.namespace_basis, "gpu")
 
+    async def test_allocation_shortcuts_work_from_expanded_selected_node(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("enter")
+            self.assertTrue(app.state.expanded)
+            self.assertEqual(app.state.view, "nodes")
+
+            await pilot.press("m")
+            self.assertEqual(app.state.allocation_mode, "memory")
+            self.assertEqual(app.state.memory_basis, "memory")
+            self.assertEqual(app.state.view, "nodes")
+
+            await pilot.press("m")
+            self.assertEqual(app.state.allocation_mode, "cpu")
+            self.assertEqual(app.state.view, "nodes")
+
+            await pilot.press("m", "v", "l")
+            self.assertEqual(app.state.allocation_mode, "gpu")
+            self.assertEqual(app.state.namespace_basis, "vram")
+            self.assertTrue(app.state.history_log_scale)
+            self.assertIn("m GPU", app.query_one("#resources-footer").render().plain)
+
     async def test_gpu_panel_click_selects_and_enter_expands(self) -> None:
         app = FalconResourcesApp(
             DemoCollector("mixed"),
@@ -2047,12 +2274,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "history")
             self.assertFalse(app.query_one("#resources-views").display)
             pane = app.query_one("#gpu-allocations-pane")
-            chart_width = max(
-                14,
-                pane.content_size.width
-                - app._allocation_legend_width(pane.content_size.width)
-                - 6,
-            )
+            chart_width = max(1, pane.content_size.width - 4)
             self.assertLessEqual(
                 max(
                     (len(line) for line in app._history_cache.plain.splitlines()),
@@ -2060,10 +2282,17 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 chart_width,
             )
-            self.assertIn("Total&#160;usage", app.export_screenshot(simplify=True))
+            self.assertIn("ALLOCATION&#160;HISTORY", app.export_screenshot(simplify=True))
             await pilot.press("escape")
             self.assertTrue(app.query_one("#resources-views").display)
-            await pilot.click("#gpu-allocations-pane", offset=(5, 14))
+            geometry = app._allocation_geometry
+            await pilot.click(
+                "#gpu-allocations-pane",
+                offset=(
+                    geometry.pie.x + geometry.pie.width // 2,
+                    geometry.pie.y + geometry.pie.height // 2,
+                ),
+            )
             self.assertEqual(app.state.selected_panels["gpu-allocations"], "pie")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
             await pilot.press("enter")
@@ -2074,14 +2303,14 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.click(
                 "#gpu-allocations-pane",
                 offset=(
-                    geometry.jobs.x + geometry.jobs.width // 2,
-                    geometry.jobs.y + geometry.jobs.height // 2,
+                    geometry.allocation.x + geometry.allocation.width // 2,
+                    geometry.allocation.y + geometry.allocation.height // 2,
                 ),
             )
-            self.assertEqual(app.state.selected_panels["gpu-allocations"], "pods")
+            self.assertEqual(app.state.selected_panels["gpu-allocations"], "allocation")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
             await pilot.press("enter")
-            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pods")
+            self.assertEqual(app.state.expanded_panels["gpu-allocations"], "allocation")
             await pilot.press("escape")
             self.assertEqual(app.state.expanded_panels["gpu-allocations"], "")
 
@@ -2248,8 +2477,55 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         )
         app.state.namespace_basis = "gpu"
         categories = app._namespace_categories()
-        self.assertEqual(len(categories), 7)
-        self.assertEqual(categories[-1], ("Other", 3.0))
+        self.assertEqual(len(categories), 8)
+        self.assertNotIn("Other", dict(categories))
+
+    async def test_expanded_selected_node_keeps_original_inspector(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.state.expanded)
+            rendered = app.export_screenshot(simplify=True)
+            for title in (
+                "CPU&#160;BY&#160;NAMESPACE",
+                "MEMORY&#160;BY&#160;NAMESPACE",
+                "GPU&#160;BY&#160;NAMESPACE",
+            ):
+                self.assertNotIn(title, rendered)
+            self.assertGreaterEqual(
+                app._visible_consumers(),
+                EXPANDED_NODE_MIN_CONSUMER_HEIGHT - 4,
+            )
+
+            await pilot.resize_terminal(140, 30)
+            await pilot.pause()
+            rendered = app.export_screenshot(simplify=True)
+            self.assertNotIn("CPU&#160;BY&#160;NAMESPACE", rendered)
+            consumers = app._sorted_consumers(app._selected())
+            self.assertLess(
+                app.state.consumer_scroll,
+                max(1, len(consumers)),
+            )
+
+    def test_combined_pie_totals_are_cluster_wide(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        app = FalconResourcesApp(DemoCollector("mixed"))
+        app.nodes = list(snapshot.nodes)
+        consumers = app._allocation_consumers()
+        expected = {
+            "cpu": sum(item.requested.cpu_cores for item in consumers),
+            "memory": sum(
+                item.requested.memory_bytes / (1024**3) for item in consumers
+            ),
+            "gpu": sum(item.requested.gpu_count for item in consumers),
+        }
+        for basis, total in expected.items():
+            self.assertAlmostEqual(
+                sum(value for _, value in app._cluster_namespace_values(basis)),
+                total,
+            )
 
     async def test_node_expansion_reconciles_consumers_at_narrow_size(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
@@ -2783,6 +3059,8 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             visible = app._visible_consumers()
+            # With node-local pies removed, the restored inspector gives the
+            # reclaimed rows back to Resource Consumers.
             self.assertEqual(visible, 21)
             self.assertEqual(
                 app._consumer_table(app._selected(), expanded=True).row_count,

@@ -53,6 +53,14 @@ PIE_COLORS = (
     "#F0E442",  # yellow
     "#0072B2",  # blue
     "#D55E00",  # vermillion
+    "#7F3C8D",  # deep purple
+    "#11A579",  # teal green
+    "#3969AC",  # royal blue
+    "#E73F74",  # pink
+    "#F2B701",  # gold
+    "#80BA5A",  # leaf green
+    "#E68310",  # amber
+    "#008695",  # dark teal
 )
 
 

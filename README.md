@@ -220,32 +220,50 @@ falcon resources
 
 **Nodes: free CPU, memory, and GPUs by node**
 
-![Falcon cluster resources dashboard](./assets/falcon-resources.svg)
-
 The **Nodes** view shows free resources for every node. Select a node and press
 <kbd>Enter</kbd> to inspect the jobs using it. At terminals at least `160×30`,
-Nodes and GPU Allocations are shown together in equal-width sides, with Nodes
-on the left and GPU Allocations on the right; smaller terminals retain the
+Nodes and Allocations are shown together in equal-width sides, with Nodes
+on the left and Allocations on the right; smaller terminals retain the
 separate views.
 
 Use <kbd>←</kbd>/<kbd>→</kbd> to switch views, <kbd>Tab</kbd> to move focus,
 and <kbd>Enter</kbd> to expand the selected pane. In the wide layout, Tab
-visits Allocation History, the GPU-by-namespace pie, GPU-requesting Jobs,
-Nodes, and Selected Node; <kbd>Shift</kbd>+<kbd>Tab</kbd> reverses that order.
-Press <kbd>s</kbd> to cycle the shared workload sort used by GPU-requesting Jobs
-and Selected Node. Falcon remembers your last view and keeps GPU allocation
-history in the background.
+visits the allocation surfaces that are currently visible, then Nodes and
+Selected Node;
+<kbd>Shift</kbd>+<kbd>Tab</kbd> reverses that order.
+Press <kbd>s</kbd> to cycle the shared workload sort used by Allocation
+and Selected Node (GPU, memory, CPU, namespace). Equal primary values are
+resolved by GPU, memory, CPU, then natural namespace/workload name. Falcon
+remembers your last view and keeps allocation history in the background.
 
-**GPU by Namespace: history and active GPU jobs**
+**Allocations: history and active workloads**
 
-![Falcon GPU allocation history](./assets/falcon-resources-allocations.svg)
+The single wide capture below shows both sides together: Nodes and Selected
+Node on the left, with Allocation History, namespace pies, and the Namespace /
+Workload Allocation tree on the right.
 
-In **GPU Allocations**, the pie shows GPU by Namespace. Press <kbd>v</kbd> to
+![Falcon Resources: Nodes, Selected Node, history, namespace pies, and workload allocation](./assets/falcon-resources-allocations.svg)
+
+In **Allocations**, the aspect-correct chart sits beside the hierarchical
+Namespace / Workload Allocation table. Allocation History and the lower
+pie/allocation row use a balanced vertical split (with the pie's minimum height
+preserved in very short terminals); in the large combined layout, History and
+that table split the right side vertically 50/50. Namespace rows carry the same colours as the charts and
+sum the requested GPU, memory, and CPU of their child workloads. CPU-only and
+memory-only workloads remain visible. Press <kbd>v</kbd> to
 switch between GPU count and requested VRAM. Press <kbd>m</kbd> to switch the
 charts to requested memory or CPU cores; the two mode pairs retain their
 selections independently. Press <kbd>l</kbd> to toggle Allocation History
 between linear and logarithmic scale when request spikes would otherwise hide
-smaller changes.
+smaller changes. In a sufficiently tall combined layout, Selected Node keeps
+its compact styling and a separate row beneath it shows cluster-wide CPU,
+memory, and GPU namespace-share pies; Allocation History and Namespace/Workload Allocation
+use the full right side. Select a cluster-wide pie with
+the mouse or <kbd>Tab</kbd> to switch Allocation History and namespace ordering
+to that resource. <kbd>Enter</kbd> expands the selected pie beside the matching
+namespace/workload hierarchy. The <kbd>m</kbd>, <kbd>v</kbd>, and <kbd>l</kbd>
+controls remain active while Selected Node is expanded, so the allocation mode,
+GPU basis, and history scale are ready when you return to Allocations.
 
 Resource values are based on Kubernetes requests and allocations. Falcon does
 not present them as measured GPU compute utilization.
@@ -387,7 +405,7 @@ logs, `a` attach, `t` top, `m` metrics, `k` kill, `c` clean, `d` dashboard,
 ## TODO
 
 - Port the Falcon agent interface to an MCP server for long-running goal loops.
-- Show workload age in the GPU Allocations and CPU Allocations views.
+- Show workload age in the Allocations view.
 - Add a Falcon command for launching bounded agent goal loops as Kubernetes
   Jobs, with explicit read-only data mounts, a working directory, a selectable
   Codex/Claude Code/OpenCode CLI, and a user prompt.

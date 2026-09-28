@@ -290,17 +290,17 @@ async def capture(*, update_assets: bool = True) -> None:
         results[key] = value
 
     # Keep the README visuals on the deterministic wide Resources canvas so the
-    # documentation shows the combined layout and fixed allocation legend.
+    # documentation shows the combined layout and namespace/workload tree.
     dashboard_asset, dashboard_digest = await dashboard_capture(
         "dashboard-asset", state="mixed", size=(140, 32)
     )
     resources_asset, resources_digest = await resources_capture(
-        "resources-asset", state="mixed", size=(160, 30)
+        "resources-asset", state="mixed", size=(200, 50)
     )
     allocations_asset, allocations_digest = await resources_capture(
         "resources-allocations-asset",
         state="mixed",
-        size=(160, 30),
+        size=(200, 50),
         actions=(seed_resources_history, "right"),
     )
     results[dashboard_asset] = dashboard_digest

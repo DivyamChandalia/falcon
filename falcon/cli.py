@@ -1757,7 +1757,7 @@ def _resources_command(
             ),
             persist_view=lambda view: save_resources_view(view, config_file),
             initial_consumer_sort=str(
-                config.get("resources", {}).get("consumer_sort", "namespace")
+                config.get("resources", {}).get("consumer_sort", "gpu")
             ),
             persist_consumer_sort=lambda sort: save_resources_consumer_sort(
                 sort, config_file
