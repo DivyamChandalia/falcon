@@ -17,10 +17,12 @@ python scripts/capture_live_resources.py
 The matrix covers 60×18, 79×21, 80×22, 80×24, 80×30, 90×22,
 100×24, 100×30, 120×30, 140×32, 160×40, and 200×50, plus navigation,
 expanded panes, filters/dialogs, stale state, long content, and node drill-in.
-The deterministic capture updates the review goldens on a shared 140×32
-canvas. The live Resources capture additionally requires the configured
-metrics endpoint and replaces both Resources README assets with the actual
-cluster snapshot and persisted allocation history.
+The deterministic capture updates the review goldens on shared review canvases.
+The live capture uses the current Kubernetes Jobs and resource snapshot to
+replace the README dashboard and Resources SVGs; it selects the running
+`pcvit-rgb-dinov3b-400e` Job when available so the dashboard image includes a
+real Logs pane. It requires the configured cluster endpoint or equivalent
+kubectl access.
 
 Release validation:
 
