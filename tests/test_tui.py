@@ -3268,6 +3268,13 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.press(*action.split())
                 app._spinner = 0
                 app._render_header()
+                if name == "resources-200x50":
+                    # This is the heaviest normal Resources frame. Under a
+                    # loaded CI runner Textual may still have its final
+                    # screen update queued after the synchronous render.
+                    await pilot.pause()
+                    app._spinner = 0
+                    app._render_header()
                 svg = app.export_screenshot(
                     title=f"Falcon resources · {name}", simplify=True
                 )
