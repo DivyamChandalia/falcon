@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import shlex
+import shutil
 import subprocess
 import textwrap
 import threading
@@ -19,6 +20,7 @@ from rich import box
 from rich.align import Align
 from rich.console import Group
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -26,10 +28,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
-from textual.geometry import NULL_OFFSET, Region, Size
+from textual.geometry import NULL_OFFSET, Offset, Region, Size
 from textual.layout import ArrangeResult, Layout, WidgetPlacement
 from textual.layouts.vertical import VerticalLayout
 from textual.screen import ModalScreen
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.widgets import Button, Input, RichLog, Static
 
 from .dashboard import (
@@ -160,6 +164,11 @@ def _truncate(value: str, width: int) -> str:
 
 
 MAX_DISPLAY_LOG_LINE_CHARS = 4096
+SELECTION_EDGE_SCROLL_ZONE = 1
+SELECTION_EDGE_SCROLL_INTERVAL = 0.05
+# Textual's default is 0.5 seconds. A shorter chain window keeps two
+# deliberate clicks from being interpreted as a double-click too easily.
+CLICK_CHAIN_TIME_THRESHOLD = 0.35
 
 WIDE_LAYOUT_MIN_WIDTH = 160
 WIDE_LAYOUT_MIN_HEIGHT = 30
@@ -476,6 +485,7 @@ class SelectedJobScroll(RichLog):
     """A virtualized log viewport that owns its mouse wheel and focus."""
 
     can_focus = True
+    ALLOW_SELECT = True
     # Let FalconDashboard's context-aware bindings (Home/End, page movement,
     # and the Pod arrows) handle keys instead of VerticalScroll's generic
     # bindings, which would bypass the selected-section state.
@@ -497,6 +507,11 @@ class SelectedJobScroll(RichLog):
         self._source_line_heights: List[int] = []
         self._render_width = 0
         self._rewrap_pending = False
+        self._manual_selection: Optional[Selection] = None
+        self._manual_drag_start: Optional[Offset] = None
+        self._selection_pointer: Optional[Offset] = None
+        self._selection_scroll_direction = 0
+        self._selection_scroll_timer: Optional[Any] = None
 
     @staticmethod
     def _overlap(old: Tuple[str, ...], new: Tuple[str, ...]) -> int:
@@ -534,6 +549,11 @@ class SelectedJobScroll(RichLog):
                 self.scroll_end(animate=False, force=True, immediate=False)
             return
 
+        self._stop_selection_scroll()
+        self._manual_selection = None
+        self._manual_drag_start = None
+        self._selection_pointer = None
+
         if not previous:
             super().clear()
             self._source_line_heights = []
@@ -542,21 +562,30 @@ class SelectedJobScroll(RichLog):
             overlap = self._overlap(previous, lines)
             prefix = self._common_prefix(previous, lines)
             if prefix >= overlap:
-                self._discard_source_suffix(len(previous) - prefix)
                 retained = prefix
+                self._replace_source_tail(
+                    len(previous) - prefix,
+                    lines[retained:],
+                )
             else:
-                self._discard_source_prefix(len(previous) - overlap)
+                self._discard_source_prefix(
+                    len(previous) - overlap,
+                    refresh=False,
+                )
                 retained = overlap
-
-        for line in lines[retained:]:
-            self._write_source_line(line)
+                for line in lines[retained:]:
+                    self._write_source_line(line)
+        if not previous:
+            for line in lines:
+                self._write_source_line(line)
         self._source_key = source_key
         self._source_lines = lines
         self._render_width = self.scrollable_content_region.width
         if follow:
             self.scroll_end(animate=False, force=True, immediate=False)
+        self.refresh()
 
-    def _write_source_line(self, line: str) -> None:
+    def _write_source_line(self, line: str, *, record: bool = True) -> int:
         before = len(self.lines)
         self.write(
             _display_log_line(line),
@@ -564,9 +593,271 @@ class SelectedJobScroll(RichLog):
             shrink=True,
             scroll_end=False,
         )
-        self._source_line_heights.append(len(self.lines) - before)
+        height = len(self.lines) - before
+        if record:
+            self._source_line_heights.append(height)
+        return height
 
-    def _discard_source_prefix(self, count: int) -> None:
+    def _replace_source_tail(
+        self,
+        removed_count: int,
+        new_lines: Tuple[str, ...],
+    ) -> None:
+        """Replace the changed source tail without exposing an empty frame.
+
+        A carriage-returning progress bar changes the final logical line on
+        nearly every refresh.  Removing its old strips and then writing the
+        new strips lets the renderer paint a blank tail between those steps.
+        Render the new strips at the end first, then replace the old physical
+        range in one list operation.  ``RichLog.write`` does not repaint while
+        this synchronous method is running, so the next compositor pass sees
+        only the completed replacement.
+        """
+
+        if (
+            not self._size_known
+            or len(self._source_line_heights) != len(self._source_lines)
+            or any(height <= 0 for height in self._source_line_heights)
+        ):
+            self._discard_source_suffix(removed_count, refresh=False)
+            for line in new_lines:
+                self._write_source_line(line)
+            return
+
+        removed_height = sum(self._source_line_heights[-removed_count:]) if removed_count else 0
+        old_start = len(self.lines) - removed_height
+        rendered_start = len(self.lines)
+        new_heights: List[int] = []
+        for line in new_lines:
+            new_heights.append(self._write_source_line(line, record=False))
+
+        rendered = self.lines[rendered_start:]
+        del self.lines[rendered_start:]
+        self.lines[old_start:] = rendered
+        if removed_count:
+            del self._source_line_heights[-removed_count:]
+        self._source_line_heights.extend(new_heights)
+        self._line_cache.clear()
+        self.virtual_size = Size(self._widest_line_width, len(self.lines))
+        self.scroll_y = min(self.scroll_y, self.max_scroll_y)
+        self.scroll_target_y = min(self.scroll_target_y, self.max_scroll_y)
+
+    def _selection_text(self, selection: Selection) -> tuple[str, str]:
+        """Return the text selected from the rendered log viewport.
+
+        ``RichLog`` stores already-wrapped ``Strip`` objects, unlike Textual's
+        ``Log`` widget which stores one unwrapped string per row.  Native
+        selection coordinates therefore refer to the rendered rows in
+        ``self.lines``.  Strip text also contains the padding added by
+        ``expand=True``; remove that padding before handing it to Textual's
+        normal selection extractor.
+        """
+
+        if not self.lines:
+            return "", "\n"
+        text = "\n".join(strip.text.rstrip(" ") for strip in self.lines)
+        return selection.extract(text), "\n"
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        if self._manual_selection is not None:
+            selection = self._manual_selection
+        return self._selection_text(selection)
+
+    def selection_for_copy(self) -> str | None:
+        """Return the current native or fallback mouse selection."""
+
+        selection = self._manual_selection
+        if selection is None:
+            selection = self.text_selection
+        if selection is None:
+            return None
+        return self._selection_text(selection)[0]
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        """Refresh selection highlighting without rebuilding the log."""
+
+        if selection is None and self._manual_drag_start is None:
+            self._manual_selection = None
+        self._line_cache.clear()
+        self.refresh()
+
+    def _selection_offset(self, event: events.MouseEvent) -> Offset:
+        """Translate a widget-relative mouse position to a log-cell offset."""
+
+        return self._selection_offset_at(event.x, event.y)
+
+    def _selection_offset_at(self, x: int, y: int) -> Offset:
+        """Translate widget-relative coordinates to a log-cell offset."""
+
+        scroll_x, scroll_y = self.scroll_offset
+        content_offset = self.content_offset
+        width = max(0, self.scrollable_content_region.width)
+        height = max(0, len(self.lines) - 1)
+        offset_x = max(0, min(width, x - content_offset.x + scroll_x))
+        offset_y = max(0, min(height, y - content_offset.y + scroll_y))
+        return Offset(offset_x, offset_y)
+
+    def _set_manual_selection(self, selection_end: Offset) -> None:
+        """Update the fallback selection endpoint during a drag."""
+
+        if self._manual_drag_start is None:
+            return
+        if selection_end == self._manual_drag_start:
+            self._manual_selection = None
+        else:
+            self._manual_selection = Selection.from_offsets(
+                self._manual_drag_start,
+                selection_end,
+            )
+        self._line_cache.clear()
+        self.refresh()
+
+    def _stop_selection_scroll(self) -> None:
+        self._selection_scroll_direction = 0
+        timer = self._selection_scroll_timer
+        if timer is not None:
+            timer.stop()
+            self._selection_scroll_timer = None
+
+    def _set_selection_scroll_direction(self, direction: int, pointer_y: int) -> None:
+        """Start or stop edge scrolling for the active selection drag."""
+
+        if self._manual_selection is None:
+            self._stop_selection_scroll()
+            return
+
+        content_top = self.content_offset.y
+        content_bottom = (
+            content_top + self.scrollable_content_region.height - 1
+        )
+        if pointer_y <= content_top + SELECTION_EDGE_SCROLL_ZONE - 1:
+            direction = -1
+        elif pointer_y >= content_bottom - SELECTION_EDGE_SCROLL_ZONE + 1:
+            direction = 1
+        else:
+            direction = 0
+
+        if direction == 0:
+            self._stop_selection_scroll()
+            return
+        if direction < 0 and self.scroll_y <= 0:
+            self._stop_selection_scroll()
+            return
+        if direction > 0 and self.scroll_y >= self.max_scroll_y:
+            self._stop_selection_scroll()
+            return
+
+        self._selection_scroll_direction = direction
+        if self._selection_scroll_timer is None:
+            self._selection_scroll_timer = self.set_interval(
+                SELECTION_EDGE_SCROLL_INTERVAL,
+                self._auto_scroll_selection,
+                name="selected-logs-edge-scroll",
+            )
+
+    def _auto_scroll_selection(self) -> None:
+        """Scroll and extend the selection while its pointer is at an edge."""
+
+        pointer = self._selection_pointer
+        direction = self._selection_scroll_direction
+        if self._manual_drag_start is None or pointer is None or not direction:
+            self._stop_selection_scroll()
+            return
+
+        previous_scroll_y = self.scroll_y
+        self.scroll_relative(
+            y=direction,
+            animate=False,
+            force=True,
+            immediate=False,
+        )
+        if self.scroll_y == previous_scroll_y:
+            self._stop_selection_scroll()
+            return
+
+        self._set_manual_selection(
+            self._selection_offset_at(pointer.x, pointer.y)
+        )
+        self._set_selection_scroll_direction(direction, pointer.y)
+
+    def _apply_selection_style(
+        self,
+        strip: Strip,
+        selection: Selection,
+        content_y: int,
+        scroll_x: int,
+    ) -> Strip:
+        """Apply Textual's selection style to one visible rendered row."""
+
+        span = selection.get_span(content_y)
+        if span is None:
+            return strip
+        start, end = span
+        start = max(0, start - scroll_x)
+        if end == -1:
+            end = strip.cell_length
+        else:
+            end = min(strip.cell_length, end - scroll_x)
+        if end <= start:
+            return strip
+
+        selection_style = self.screen.get_component_rich_style(
+            "screen--selection"
+        )
+        selected = strip.crop(start, end)
+        selected = Strip(
+            Segment.apply_style(selected._segments, post_style=selection_style),
+            selected.cell_length,
+        )
+        return Strip.join(
+            (
+                strip.crop(0, start),
+                selected,
+                strip.crop(end),
+            )
+        )
+
+    def _mouse_is_over_viewport(self) -> bool:
+        """Return whether the current pointer can start a selection here."""
+
+        position = getattr(self.app, "mouse_position", None)
+        if position is None:
+            return False
+        return (
+            self.region.x <= position.x < self.region.right
+            and self.region.y <= position.y < self.region.bottom
+        )
+
+    def render_line(self, y: int) -> Strip:
+        """Render a row with native selection metadata and highlighting."""
+
+        scroll_x, scroll_y = self.scroll_offset
+        content_y = scroll_y + y
+        strip = self._render_line(
+            content_y,
+            scroll_x,
+            self.scrollable_content_region.width,
+        ).apply_style(self.rich_style)
+        selection = self._manual_selection
+        if selection is None:
+            selection = self.text_selection
+        if selection is not None and 0 <= content_y < len(self.lines):
+            strip = self._apply_selection_style(
+                strip,
+                selection,
+                content_y,
+                scroll_x,
+            )
+        # RichLog doesn't add the offset metadata that Screen uses to start
+        # native selection.  Add it after styling so mouse drags map back to
+        # the virtual (scrolled) row and column.  Restrict this to pointer
+        # interaction (or an active selection) so idle RichLog rendering stays
+        # byte-for-byte compatible with the existing dashboard snapshots.
+        if self._mouse_is_over_viewport() or selection is not None:
+            return strip.apply_offsets(scroll_x, content_y)
+        return strip
+
+    def _discard_source_prefix(self, count: int, *, refresh: bool = True) -> None:
         """Drop rendered strips belonging to logical lines leaving retention."""
 
         if count <= 0:
@@ -581,9 +872,10 @@ class SelectedJobScroll(RichLog):
         self.virtual_size = Size(self._widest_line_width, len(self.lines))
         self.scroll_y = max(0, self.scroll_y - strip_count)
         self.scroll_target_y = max(0, self.scroll_target_y - strip_count)
-        self.refresh()
+        if refresh:
+            self.refresh()
 
-    def _discard_source_suffix(self, count: int) -> None:
+    def _discard_source_suffix(self, count: int, *, refresh: bool = True) -> None:
         """Drop rendered strips for logical lines replaced at the tail."""
 
         if count <= 0:
@@ -597,7 +889,8 @@ class SelectedJobScroll(RichLog):
         self.virtual_size = Size(self._widest_line_width, len(self.lines))
         self.scroll_y = min(self.scroll_y, self.max_scroll_y)
         self.scroll_target_y = min(self.scroll_target_y, self.max_scroll_y)
-        self.refresh()
+        if refresh:
+            self.refresh()
 
     def on_resize(self, event: events.Resize) -> None:
         super().on_resize(event)
@@ -623,6 +916,10 @@ class SelectedJobScroll(RichLog):
             getattr(self.app, "state", None), "logs_auto_follow", True
         )
         retained = self._source_lines
+        self._stop_selection_scroll()
+        self._manual_selection = None
+        self._manual_drag_start = None
+        self._selection_pointer = None
         super().clear()
         self._source_line_heights = []
         self._render_width = width
@@ -658,6 +955,14 @@ class SelectedJobScroll(RichLog):
     def on_key(self, event: events.Key) -> None:
         """Route navigation through the dashboard's selected-section logic."""
 
+        if event.key == "escape":
+            self._stop_selection_scroll()
+            self._manual_selection = None
+            self._manual_drag_start = None
+            self._selection_pointer = None
+            self._line_cache.clear()
+            self.refresh()
+            return
         actions = {
             "up": "action_up", "k": "action_up",
             "down": "action_down", "j": "action_down",
@@ -667,6 +972,8 @@ class SelectedJobScroll(RichLog):
             "c": "action_toggle_selected_or_cleanup",
             "ctrl+c": "action_copy_or_quit",
             "command+c": "action_copy_or_quit",
+            "cmd+c": "action_copy_or_quit",
+            "super+c": "action_copy_or_quit",
         }
         action_name = actions.get(event.key)
         if action_name is None:
@@ -678,8 +985,40 @@ class SelectedJobScroll(RichLog):
             callback()
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._stop_selection_scroll()
+        self._manual_selection = None
+        self._manual_drag_start = self._selection_offset(event)
+        self._selection_pointer = Offset(event.x, event.y)
+        self.capture_mouse()
         self._activate_section()
         self.app.set_focus(self, scroll_visible=False)
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._manual_drag_start is None:
+            return
+        self._selection_pointer = Offset(event.x, event.y)
+        self._set_manual_selection(self._selection_offset(event))
+        self._set_selection_scroll_direction(0, event.y)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._manual_drag_start is None:
+            return
+        self._selection_pointer = Offset(event.x, event.y)
+        self._set_manual_selection(self._selection_offset(event))
+        self._stop_selection_scroll()
+        self._manual_drag_start = None
+        self._selection_pointer = None
+        self.release_mouse()
+        self._line_cache.clear()
+        self.refresh()
+
+    def on_mouse_release(self, event: events.MouseRelease) -> None:
+        """Discard an unfinished drag if Textual cancels mouse capture."""
+
+        self._stop_selection_scroll()
+        self._manual_drag_start = None
+        self._selection_pointer = None
+        self.release_mouse()
 
     def on_click(self, event: events.Click) -> None:
         # DashboardPane also listens for clicks to focus the outer pane. Stop
@@ -1239,12 +1578,14 @@ SelectedJobScroll.selected {{ border: solid {CYAN}; }}
 class FalconDashboard(App):
     TITLE = "Falcon Dashboard"
     ENABLE_COMMAND_PALETTE = False
+    CLICK_CHAIN_TIME_THRESHOLD = CLICK_CHAIN_TIME_THRESHOLD
     CSS = CSS
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("command+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("cmd+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
+        Binding("super+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("tab", "next_pane", "Next pane", priority=True),
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
         Binding("1", "focus_jobs", "Jobs", show=False), Binding("2", "focus_resources", "Resources", show=False),
@@ -1269,6 +1610,39 @@ class FalconDashboard(App):
         Binding("plus", "resource_zoom_in", "Zoom in", show=False),
         Binding("minus", "resource_zoom_out", "Zoom out", show=False),
     ]
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy through Textual and any clipboard utility available locally.
+
+        Textual's OSC52 path works in most terminals, but macOS Terminal does
+        not accept OSC52 clipboard writes. When Falcon is running on a host
+        with a native clipboard utility, use it as a fallback as well.
+        """
+
+        super().copy_to_clipboard(text)
+        clipboard_commands = (
+            ("pbcopy",),
+            ("wl-copy",),
+            ("xclip", "-selection", "clipboard"),
+            ("xsel", "--clipboard", "--input"),
+        )
+        for command in clipboard_commands:
+            executable = shutil.which(command[0])
+            if executable is None:
+                continue
+            try:
+                subprocess.run(
+                    [executable, *command[1:]],
+                    input=text,
+                    text=True,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            break
 
     def __init__(
         self, collector, refresh_seconds: float = 1.0,
@@ -2236,7 +2610,27 @@ class FalconDashboard(App):
             return
         self.call_after_refresh(self._focus_selected_section)
 
+    def _copy_text_selection(self) -> bool:
+        """Copy a native text selection from the selected-job log viewport."""
+
+        try:
+            logs = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+        except NoMatches:
+            return False
+        value = logs.selection_for_copy()
+        if value is None:
+            return False
+        try:
+            self.copy_to_clipboard(value)
+        except Exception as exc:
+            self.notify(f"Could not copy selection: {exc}", severity="warning")
+        else:
+            self.notify("Copied selection")
+        return True
+
     def action_copy_or_quit(self) -> None:
+        if self._copy_text_selection():
+            return
         if self._selected_inspector_active():
             self._copy_selected_content()
             return

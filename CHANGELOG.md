@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.5 — 2026-09-29
+
+- Added mouse text selection, edge auto-scroll, and clipboard copy for
+  Dashboard logs.
+- Replaced tqdm progress rows atomically to remove the delete-and-repaint
+  flicker during carriage-return updates.
+- Made `falcon update` show up to three concise “What’s new” entries after a
+  successful upgrade.
+
+## 0.4.4 — 2026-09-28
+
+- Added the combined Resources view with shared sorting and CPU, memory, and
+  GPU allocation visualizations.
+- Added expanded system-wide namespace charts and refreshed the Resources
+  documentation and captures.
+
 ## 0.4.3 — 2026-09-22
 
 - Added an interactive `falcon setup` confirmation before copying an external

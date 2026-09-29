@@ -197,6 +197,10 @@ falcon update --check
 pip uninstall falcon-k8s
 ```
 
+After a successful update, Falcon prints a short “What’s new” summary from
+the latest changelog entries. If the notes cannot be fetched, the update still
+completes normally.
+
 The updater checks for releases silently on non-interactive commands. Set
 `FALCON_NO_UPDATE_CHECK=1` to disable the interactive update prompt.
 

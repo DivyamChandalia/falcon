@@ -43,7 +43,13 @@ returns to the responsive layout. A small, left-aligned Command row sits below
 RAM request, aligned with the metadata values; its copy icon is in the same
 value column as entries such as RAM and age. The label is informational and
 does not select a second pane. Logs are full-height by default and `c` switches
-them to a two-line viewport. `Ctrl/Cmd+C` copies the selected Logs viewport.
+them to a two-line viewport. Drag across log text with the mouse, then press
+`Ctrl/Cmd+C` to copy only the selected text; with no text selected, the shortcut
+keeps its existing whole-log copy behavior.
+On macOS Terminal, use `Ctrl+C` or a terminal with OSC52 clipboard support;
+macOS Terminal reserves `Cmd+C` and does not accept OSC52. Falcon also uses
+`pbcopy`, `wl-copy`, `xclip`, or `xsel` automatically when one is available on
+the host running the Dashboard.
 The log viewport opens at the newest line and follows new output; `Home` or
 scrolling upward pauses follow until `End` resumes it. Click the Logs viewport
 to select it; it owns the keyboard and mouse-wheel scrolling while the outer

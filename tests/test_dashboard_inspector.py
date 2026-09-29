@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import time
 import unittest
 from unittest.mock import patch
+
+from textual import events
 
 from falcon.dashboard import JobUsage, PodAttempt
 from falcon.dashboard_logs import DashboardLogManager
@@ -108,6 +111,159 @@ def _job(*attempts: PodAttempt, status: str = "Running") -> JobUsage:
 
 
 class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
+    def test_copy_to_clipboard_uses_available_host_clipboard(self) -> None:
+        app = FalconDashboard(_Collector(_job()))
+        with patch(
+            "falcon.dashboard_ui.shutil.which",
+            side_effect=lambda name: "/usr/bin/pbcopy" if name == "pbcopy" else None,
+        ), patch("falcon.dashboard_ui.subprocess.run") as run:
+            app.copy_to_clipboard("selected text")
+
+        run.assert_called_once_with(
+            ["/usr/bin/pbcopy"],
+            input="selected text",
+            text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+
+    async def test_logs_support_native_selection_copy(self) -> None:
+        row = _job(PodAttempt("current-attempt", "current-uid", "Running"))
+        app = FalconDashboard(
+            _Collector(row),
+            refresh_seconds=999,
+            log_manager=DashboardLogManager("team", client=_Client()),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.6)
+            await pilot.press("4", "enter")
+            await pilot.pause(0.2)
+            logs = app.query_one("#selected-logs-scroll")
+            logs.replace_content(
+                "selection-test",
+                ("alpha bravo charlie", "second line"),
+                follow=False,
+            )
+            await pilot.pause()
+
+            await pilot.mouse_down(logs, offset=(2, 1))
+            await pilot._post_mouse_events(
+                [events.MouseMove],
+                widget=logs,
+                offset=(10, 1),
+                button=1,
+            )
+            await pilot.mouse_up(logs, offset=(10, 1))
+
+            self.assertEqual(app.screen.get_selected_text(), "alpha br")
+            selected_background = app.screen.get_component_rich_style(
+                "screen--selection"
+            ).bgcolor
+            self.assertEqual(
+                logs.render_line(0)._segments[0].style.bgcolor,
+                selected_background,
+            )
+            with patch.object(app, "copy_to_clipboard") as copy:
+                await pilot.press("ctrl+c")
+            copy.assert_called_once_with("alpha br")
+
+            # Keep the dashboard usable on terminals that don't deliver
+            # Textual's screen-level selection state. The log viewport keeps
+            # its own drag range as a fallback in that case.
+            app.screen.clear_selection()
+            app.screen.ALLOW_SELECT = False
+            await pilot.mouse_down(logs, offset=(2, 1))
+            await pilot._post_mouse_events(
+                [events.MouseMove],
+                widget=logs,
+                offset=(10, 1),
+                button=1,
+            )
+            await pilot.mouse_up(logs, offset=(10, 1))
+            self.assertIsNone(app.screen.get_selected_text())
+            with patch.object(app, "copy_to_clipboard") as copy:
+                await pilot.press("super+c")
+            copy.assert_called_once_with("alpha br")
+
+    async def test_tqdm_updates_replace_the_existing_row_atomically(self) -> None:
+        app = FalconDashboard(
+            _Collector(_job(PodAttempt("current-attempt", "current-uid", "Running"))),
+            refresh_seconds=999,
+            log_manager=DashboardLogManager("team", client=_Client()),
+        )
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("4", "enter")
+            await pilot.pause()
+            logs = app.query_one("#selected-logs-scroll")
+            logs.replace_content(
+                "tqdm-pod",
+                ("epoch 1", "  0%|          | 0/10 [00:00<?, ?it/s]"),
+                follow=False,
+            )
+            await pilot.pause()
+
+            with patch.object(logs, "_discard_source_suffix") as discard:
+                logs.replace_content(
+                    "tqdm-pod",
+                    ("epoch 1", " 50%|#####     | 5/10 [00:01<00:01, 5.00it/s]"),
+                    follow=False,
+                )
+
+            discard.assert_not_called()
+            self.assertEqual(len(logs.lines), 2)
+            self.assertIn("50%|", logs.lines[-1].text)
+
+    async def test_log_selection_scrolls_at_viewport_edges(self) -> None:
+        app = FalconDashboard(
+            _Collector(_job(PodAttempt("current-attempt", "current-uid", "Running"))),
+            refresh_seconds=999,
+            log_manager=DashboardLogManager("team", client=_Client()),
+        )
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.6)
+            logs = app.query_one("#selected-logs-scroll")
+            logs.replace_content(
+                "many-lines",
+                tuple(f"line-{index:03d}" for index in range(200)),
+                follow=False,
+            )
+            await pilot.pause()
+            logs.scroll_to(y=0, animate=False, force=True, immediate=True)
+            await pilot.pause()
+            top = logs.content_offset.y
+            bottom = top + logs.scrollable_content_region.height - 1
+
+            await pilot.mouse_down(logs, offset=(2, top))
+            await pilot._post_mouse_events(
+                [events.MouseMove],
+                widget=logs,
+                offset=(2, bottom),
+                button=1,
+            )
+            start_scroll = logs.scroll_y
+            await pilot.pause(0.2)
+            self.assertGreater(logs.scroll_y, start_scroll)
+            self.assertIsNotNone(logs._manual_selection)
+            await pilot.mouse_up(logs, offset=(2, bottom))
+
+            app.screen.clear_selection()
+            logs.scroll_end(animate=False, force=True, immediate=True)
+            await pilot.pause()
+            start_scroll = logs.scroll_y
+            await pilot.mouse_down(logs, offset=(2, bottom))
+            await pilot._post_mouse_events(
+                [events.MouseMove],
+                widget=logs,
+                offset=(2, top),
+                button=1,
+            )
+            await pilot.pause(0.2)
+            self.assertLess(logs.scroll_y, start_scroll)
+            await pilot.mouse_up(logs, offset=(2, top))
+
     async def test_running_output_is_attached_and_sections_are_independent(self) -> None:
         row = _job(
             PodAttempt("old-attempt", "old-uid", "Succeeded"),

@@ -1,3 +1,3 @@
 """Falcon: Kubernetes batch Jobs that feel like local commands."""
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"

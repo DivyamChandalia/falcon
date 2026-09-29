@@ -12,6 +12,7 @@ from falcon import __version__
 from falcon.cli import EXIT_UPDATE, _maybe_auto_update, main
 from falcon.updates import (
     install_update,
+    latest_changelog,
     latest_version,
     maybe_prompt_for_update,
     newer_version,
@@ -50,6 +51,30 @@ class UpdateTests(unittest.TestCase):
             ),
         )
         self.assertEqual(result, "0.4.0")
+
+    def test_latest_changelog_reads_the_newest_release_entries(self) -> None:
+        result = latest_changelog(
+            url="https://example.invalid/CHANGELOG.md",
+            opener=lambda request, timeout: _Response(
+                "# Changelog\n\n"
+                "## 0.4.4 — 2026-09-29\n\n"
+                "- Added the dashboard update summary.\n"
+                "  It remains concise.\n"
+                "- Fixed a progress bar flicker.\n\n"
+                "## 0.4.3 — 2026-09-22\n"
+                "- Older release.\n"
+            ),
+        )
+        self.assertEqual(
+            result,
+            (
+                "0.4.4",
+                (
+                    "Added the dashboard update summary. It remains concise.",
+                    "Fixed a progress bar flicker.",
+                ),
+            ),
+        )
 
     def test_update_check_timestamp_is_atomic_and_daily(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +168,17 @@ class UpdateTests(unittest.TestCase):
         ):
             code = main(["update"])
         self.assertEqual(code, EXIT_UPDATE)
+
+    def test_manual_update_prints_a_short_changelog(self) -> None:
+        output = io.StringIO()
+        with patch("falcon.cli.install_update", return_value=0), patch(
+            "falcon.cli.latest_changelog",
+            return_value=("0.4.4", ("Added a concise update summary.",)),
+        ), redirect_stdout(output):
+            code = main(["update"])
+        self.assertEqual(code, 0)
+        self.assertIn("What's new in Falcon 0.4.4:", output.getvalue())
+        self.assertIn("Added a concise update summary.", output.getvalue())
 
     def test_update_can_run_with_an_invalid_existing_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

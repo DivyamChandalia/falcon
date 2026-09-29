@@ -35,10 +35,8 @@ from .cluster import (
     is_system_namespace,
     natural_name_key,
 )
-from .dashboard_ui import (
-    WIDE_LAYOUT_MIN_HEIGHT,
-    WIDE_LAYOUT_MIN_WIDTH,
-)
+from .dashboard_ui import CLICK_CHAIN_TIME_THRESHOLD as FALCON_CLICK_CHAIN_TIME_THRESHOLD
+from .dashboard_ui import WIDE_LAYOUT_MIN_HEIGHT, WIDE_LAYOUT_MIN_WIDTH
 from .planning import gpu_model_order_key
 from .resources_charts import (
     HISTORY_LIMIT,
@@ -606,6 +604,7 @@ class FalconResourcesApp(App[None]):
 
     TITLE = "Falcon Resources"
     ENABLE_COMMAND_PALETTE = False
+    CLICK_CHAIN_TIME_THRESHOLD = FALCON_CLICK_CHAIN_TIME_THRESHOLD
     CSS = CSS
     BINDINGS = [
         Binding("q", "quit", "Quit"),

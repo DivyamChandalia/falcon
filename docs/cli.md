@@ -171,8 +171,11 @@ falcon update --check
 `falcon update` upgrades the current interpreter's Falcon installation from
 the official `DivyamChandalia/falcon` GitHub repository. A virtualenv or Conda
 environment is updated in place; a system interpreter uses the user site and
-does not request administrator access. `--check` only compares the installed
-semantic version with the version declared on the repository's `main` branch.
+does not request administrator access. After a successful update, Falcon
+prints up to three short entries from the latest `CHANGELOG.md` section. If
+the changelog cannot be fetched, the update still succeeds. `--check` only
+compares the installed semantic version with the version declared on the
+repository's `main` branch.
 
 Interactive commands perform the same remote check at most once every 24
 hours and ask before installing. Set `FALCON_NO_UPDATE_CHECK=1` to suppress

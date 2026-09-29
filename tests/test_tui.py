@@ -156,6 +156,10 @@ def _rgb_values(value: str) -> tuple[int, int, int]:
 
 
 class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def test_click_chain_window_is_shorter_for_falcon_apps(self) -> None:
+        self.assertEqual(FalconDashboard.CLICK_CHAIN_TIME_THRESHOLD, 0.35)
+        self.assertEqual(FalconResourcesApp.CLICK_CHAIN_TIME_THRESHOLD, 0.35)
+
     def test_apps_force_direct_truecolor_even_when_tmux_advertises_256(self) -> None:
         """Explicit Falcon hex colours must reach the terminal unchanged."""
 
@@ -3272,9 +3276,10 @@ class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
                     # This is the heaviest normal Resources frame. Under a
                     # loaded CI runner Textual may still have its final
                     # screen update queued after the synchronous render.
-                    await pilot.pause()
+                    await pilot.pause(0.5)
                     app._spinner = 0
                     app._render_header()
+                    await pilot.pause(0.5)
                 svg = app.export_screenshot(
                     title=f"Falcon resources · {name}", simplify=True
                 )

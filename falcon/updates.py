@@ -24,6 +24,9 @@ UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/DivyamChandalia/falcon/main/falcon/__init__.py"
 )
 UPDATE_MANIFEST_URL = UPDATE_VERSION_URL
+UPDATE_CHANGELOG_URL = (
+    "https://raw.githubusercontent.com/DivyamChandalia/falcon/main/CHANGELOG.md"
+)
 AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 _VERSION_DECLARATION = re.compile(
     r"(?m)^\s*(?:__version__|version)\s*=\s*[\"']([^\"']+)[\"']\s*$"
@@ -114,6 +117,46 @@ def latest_version(
     except (OSError, URLError, UnicodeError) as exc:
         raise UpdateError(f"could not check for updates: {exc}") from exc
     return _manifest_version(body)
+
+
+def latest_changelog(
+    *,
+    url: str = UPDATE_CHANGELOG_URL,
+    timeout: float = 3.0,
+    opener: Optional[Callable[..., object]] = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Fetch the newest release heading and its short changelog entries."""
+
+    request = Request(url, headers={"User-Agent": "falcon-k8s-updater"})
+    fetch = opener or urlopen
+    try:
+        response = fetch(request, timeout=timeout)
+        with response as opened:
+            body = opened.read().decode("utf-8")
+    except (OSError, URLError, UnicodeError) as exc:
+        raise UpdateError(f"could not fetch the changelog: {exc}") from exc
+
+    sections = re.split(r"(?m)^##\s+", body)
+    if len(sections) < 2:
+        raise UpdateError("the Falcon changelog has no release entries")
+    heading, *section_lines = sections[1].splitlines()
+    version = heading.strip().split(maxsplit=1)[0]
+    if not version:
+        raise UpdateError("the Falcon changelog has an invalid release heading")
+
+    entries: list[str] = []
+    current = ""
+    for line in section_lines:
+        stripped = line.strip()
+        if line.lstrip().startswith("- "):
+            if current:
+                entries.append(current)
+            current = stripped[2:].strip()
+        elif current and stripped:
+            current = f"{current} {stripped}"
+    if current:
+        entries.append(current)
+    return version, tuple(entries)
 
 
 def newer_version(current: str, latest: str) -> bool:
@@ -225,11 +268,13 @@ def maybe_prompt_for_update(
 
 __all__ = [
     "AUTO_UPDATE_INTERVAL_SECONDS",
+    "UPDATE_CHANGELOG_URL",
     "UPDATE_MANIFEST_URL",
     "UPDATE_SOURCE",
     "UPDATE_VERSION_URL",
     "UpdateError",
     "install_update",
+    "latest_changelog",
     "latest_version",
     "maybe_prompt_for_update",
     "newer_version",

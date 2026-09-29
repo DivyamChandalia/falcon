@@ -89,6 +89,7 @@ from .theme import COLOR_MODES
 from .updates import (
     UpdateError,
     install_update,
+    latest_changelog,
     latest_version,
     maybe_prompt_for_update,
     newer_version,
@@ -100,6 +101,8 @@ EXIT_NOT_FOUND = 4
 EXIT_CONFLICT = 5
 EXIT_CODER = 6
 EXIT_UPDATE = 7
+
+_UPDATE_NOTE_MAX_CHARS = 160
 
 _LAUNCH_SENTINEL = "__falcon_launch__"
 
@@ -2047,6 +2050,17 @@ def _update_command(args: argparse.Namespace) -> int:
         )
         return EXIT_UPDATE
     print("Falcon updated. Start a new shell or rerun the command.")
+    try:
+        changelog_version, entries = latest_changelog()
+    except UpdateError:
+        entries = ()
+        changelog_version = ""
+    if entries:
+        print(f"\nWhat's new in Falcon {changelog_version}:")
+        for entry in entries[:3]:
+            if len(entry) > _UPDATE_NOTE_MAX_CHARS:
+                entry = entry[: _UPDATE_NOTE_MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
+            print(f"  • {entry}")
     return 0
 
 
