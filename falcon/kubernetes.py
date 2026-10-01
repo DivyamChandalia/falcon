@@ -118,6 +118,11 @@ unset FALCON_SAVED_VIRTUAL_ENV
 """
 
 
+def debug_shell_rc(shell: str) -> str:
+    """Shared interactive startup preserving the workload's active environment."""
+    return _ZSH_DEBUG_RC if shell == "zsh" else _BASH_DEBUG_RC
+
+
 class KubernetesError(RuntimeError):
     """A Kubernetes operation failed with a useful process classification."""
 
@@ -596,12 +601,12 @@ class KubernetesClient:
         if shell_name == "zsh":
             wrapper_dir = "/tmp/falcon-zdotdir"
             wrapper_path = posixpath.join(wrapper_dir, ".zshrc")
-            wrapper = _ZSH_DEBUG_RC
+            wrapper = debug_shell_rc("zsh")
             shell_args = [shell, "-i"]
         elif shell_name == "bash":
             wrapper_dir = "/tmp/falcon-bash"
             wrapper_path = posixpath.join(wrapper_dir, ".bashrc")
-            wrapper = _BASH_DEBUG_RC
+            wrapper = debug_shell_rc("bash")
             shell_args = [shell, "--noprofile", "--rcfile", wrapper_path, "-i"]
         else:
             raise ValueError(

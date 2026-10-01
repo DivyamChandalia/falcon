@@ -9,17 +9,33 @@ Falcon chooses eligible GPU nodes, sizes CPU and memory from live capacity,
 carries your working directory and Python environment into the container, and
 provides interactive dashboards for jobs and cluster resources.
 
+New in 0.4.6: interactive Dashboard terminals (`Ctrl+T`), Resources workload
+filters (`f`), and updates that support uv tool installations.
+See the [changelog](CHANGELOG.md) for details.
+
 ## Quick start
 
 You need Python 3.10+, `kubectl`, a working Kubernetes context, and permission
 to inspect cluster resources and create Jobs.
 
-Install Falcon and run the guided setup:
+Install Falcon with pip and run the guided setup:
 
 ```console
 pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
 falcon setup
 ```
+
+Or, if you use [uv](https://docs.astral.sh/uv/), install Falcon as an isolated
+tool so it does not depend on your project's Python environment:
+
+```console
+uv tool install git+https://github.com/DivyamChandalia/falcon.git@main
+falcon setup
+```
+
+If uv's tool executables are not on `PATH`, run `uv tool update-shell`, then
+open a new terminal. Update with `falcon update` or
+`uv tool upgrade falcon-k8s`.
 
 Start a named GPU workload, then monitor or stop it:
 
@@ -98,6 +114,17 @@ new output, supports scrolling through retained lines, and keeps carriage-return
 progress updates such as `tqdm` on the current line. Use `falcon logs JOB` when
 you want a terminal-only log stream.
 
+With Selected Job focused, `Ctrl+T` opens an interactive shell in its running
+Pod, inside the Logs area. Press it again for another terminal; `←`/`→` switches
+between logs and terminals. `Ctrl+D` (or `Ctrl+W`) closes the current terminal.
+`Ctrl+C` copies selected text; without a selection it interrupts the shell
+command, not the Job. Use `Alt+←`/`Alt+→` to move the shell cursor.
+The terminal owns typing and Tab completion while focused, shows a cursor, and
+retains up to 200 lines for mouse-wheel scrolling. It uses the same shell startup
+as debug Jobs, loading your rc file when accessible inside the Pod, with a short
+directory-name prompt. Click outside the terminal to restore Dashboard keyboard
+controls. The Copy button copies the active terminal's retained output.
+
 ![Falcon Jobs dashboard: full large view with the selected pcvit Job and live Logs](./assets/falcon-dashboard.svg)
 
 For focused inspection, use:
@@ -121,7 +148,9 @@ falcon resources
 
 Resources has two sides on terminals at least `160×30`: **Nodes** on the left
 and **Allocations** on the right. Smaller terminals keep the two views as
-separate pages.
+separate pages. In the large layout, click or Tab between individual panes;
+only one is focused at a time. The Nodes/Allocations header selector appears
+only on compact pages, not in combined or individually expanded views.
 
 Allocations combines Allocation History, namespace pies, and a hierarchical
 Namespace / Workload Allocation table. The table contains requested GPU,
@@ -136,6 +165,7 @@ height.
 | `←` / `→` | switch Nodes and Allocations below `160×30` |
 | `Tab` / `Shift+Tab` | move between visible panes |
 | `s` | cycle shared sorting: GPU, memory, CPU, namespace |
+| `f` | filter workloads by minimum GPUs, CPU, memory, or namespace |
 | `m` | cycle allocation charts: GPU, memory, CPU |
 | `v` | switch GPU count and VRAM while GPU mode is active |
 | `l` | switch Allocation History between linear and log scale |
@@ -196,6 +226,13 @@ falcon update
 falcon update --check
 pip uninstall falcon-k8s
 ```
+
+For `uv tool` installations, `falcon update` uses `uv tool upgrade` and
+preserves your installed source, version constraints, and extra dependencies.
+Other installations use pip in Falcon's Python environment. uv must be on
+`PATH` to update a uv-managed installation; Falcon never falls back to pip
+inside a uv tool environment. To remove a uv installation, use
+`uv tool uninstall falcon-k8s` instead of pip.
 
 After a successful update, Falcon prints a short “What’s new” summary from
 the latest changelog entries. If the notes cannot be fetched, the update still

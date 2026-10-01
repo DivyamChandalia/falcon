@@ -17,12 +17,12 @@ keeps nodes, running Jobs, and free GPU/CPU/memory headroom on one line.
 
 - `Tab` / `Shift+Tab`: cycle panes
 - `1` Jobs, `2` Resources, `3` Events, `4` Selected Job
-- `↑` / `↓`, `j` / `k`: navigate the focused pane
+- `↑` / `↓`, `j`: navigate the focused pane
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump
 - `Enter` or `z`: expand; `Esc`: restore
 - `/`: search; `f`: filters; `s`: sort
 - `Space`: mark; `a`: mark all; `A`: clear marks
-- `k` / `F9`: kill the marked Jobs, or the selected Job when none are marked
+- `k` / `F9`: open kill/restart actions for marked Jobs, or the selected Job when none are marked; `k` works from any Dashboard pane, including Logs
 - `c`: clean succeeded Jobs within the marked set; with no marks, clean all succeeded Jobs. It switches Logs between full height and a two-line view only when the nested Logs viewport has keyboard focus.
 - `v`: choose visible panes
 - `r`: refresh; `q`: quit
@@ -59,6 +59,40 @@ succeeded or failed attempts Falcon loads the equivalent of
 `falcon logs --no-follow --tail 200`. `←`/`→` switches between Pod attempts,
 with the newest active Pod selected initially. Captured output is bounded to
 200 lines per Pod and expires from memory after 24 hours.
+
+With Selected Job focused, `Ctrl+T` opens a separate interactive `kubectl exec`
+session in the selected running Pod/container, replacing the log viewport with
+a terminal. If the selected attempt has finished, Falcon uses its newest running
+attempt. The shell prefers your locally configured zsh or bash, falling back to
+bash, zsh, then sh if unavailable in the container. It uses the same
+startup wrapper as debug Jobs: it sources your detected rc file if accessible
+inside the Pod, otherwise the container's home rc file. It preserves the Pod's
+active Conda/virtual environment. The compact prompt shows only the current
+directory's basename, for example `sigliprfdetr%`. Falcon does
+not copy host rc files into the Pod. A fallback message identifies the shell
+used when your preferred shell is unavailable. Kubernetes exec permissions still
+apply.
+
+Press `Ctrl+T` again for another window. `←`/`→` navigates Pod logs followed by
+terminal windows; `Alt+←`/`Alt+→` sends cursor movement to the shell. Other typing,
+paste, Tab, and `Ctrl+C` go to the shell, so Dashboard shortcuts do not interfere.
+`Ctrl+D` (or `Ctrl+W`) closes
+the active terminal and returns to logs. Closing a terminal or the Dashboard
+ends its exec connection, not the Kubernetes Job. Sessions remain connected when
+you switch windows or Jobs, but are not persisted after Dashboard exit. At most
+32 terminal windows may be open. Embedded terminals require a POSIX host and
+an available shell in the container. A visible block cursor marks the input
+position. Mouse-wheel scrolling retains up to 200 lines of terminal output;
+typing returns to the live cursor. Scrolling upward pauses follow until you
+scroll back down or type. This terminal scrollback is separate from Pod logs.
+The copy button copies the active terminal's retained output as plain text;
+when viewing Pod logs, it copies those logs instead.
+Select terminal text with the mouse and press `Ctrl/Cmd+C` to copy that selection
+without interrupting the shell. With no selection, `Ctrl+C` interrupts the
+running command as usual.
+Click Selected Job's metadata or outer frame to return to Dashboard shortcuts;
+the footer switches to Dashboard commands while the terminal stays connected.
+Click inside the terminal again to resume shell input and terminal controls.
 
 The expanded Resource Usage inspector also scrolls as one page. When the mouse
 is over a GPU, VRAM, CPU, or RAM utilization card, the wheel moves through that
@@ -155,6 +189,20 @@ used instead at smaller sizes. The three cluster pies are selectable by mouse
 or `Tab`: selection switches the history metric and sorts both namespace
 parents and workloads by that resource. `Enter` expands the selected pie with
 the matching Namespace/Workload Allocation hierarchy on its right.
+
+Press `f` to filter the Namespace/Workload Allocation tree by
+minimum requested GPUs, CPU cores, memory, and a case-insensitive namespace
+substring. Filters combine with AND and apply to individual workloads before
+namespace totals are calculated. Blank fields impose no restriction; bare
+memory numbers mean GiB (`8` equals `8Gi`). Enter applies, Esc cancels, and
+Clear (or `Ctrl+R` in the dialog) removes all filters. Filters survive resizing/expansion for the current
+Resources session; history, pies, and node inventory remain cluster-wide.
+
+The large combined Resources layout uses one global focus across Nodes,
+Selected Node, History, Allocation, and each namespace pie. Tab/Shift+Tab or
+clicks move that focus; remembered chart selections are not highlighted when
+another pane is active. Nodes/Allocations header labels are hidden in combined
+and individually expanded layouts; compact pages retain the selector.
 
 Allocations has three independent bordered surfaces without a redundant
 outer frame: Allocation History above the aspect-correct namespace pie and

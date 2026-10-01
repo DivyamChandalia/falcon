@@ -19,13 +19,14 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, Horizontal
 from textual.css.query import NoMatches
 from textual.errors import NoWidget
 from textual.geometry import NULL_OFFSET, Region, Size
 from textual.layout import ArrangeResult, Layout, WidgetPlacement
 from textual.layouts.vertical import VerticalLayout
-from textual.widgets import Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Static
 
 from .cluster import (
     ClusterSnapshot,
@@ -38,6 +39,7 @@ from .cluster import (
 from .dashboard_ui import CLICK_CHAIN_TIME_THRESHOLD as FALCON_CLICK_CHAIN_TIME_THRESHOLD
 from .dashboard_ui import WIDE_LAYOUT_MIN_HEIGHT, WIDE_LAYOUT_MIN_WIDTH
 from .planning import gpu_model_order_key
+from .quantities import parse_cpu, parse_memory_bytes
 from .resources_charts import (
     HISTORY_LIMIT,
     HISTORY_SECONDS,
@@ -91,6 +93,121 @@ COMBINED_RESOURCE_PIES_MIN_HEIGHT = 40
 COMBINED_NODE_PIES_MIN_WIDTH = 72
 COMBINED_NODE_DETAIL_HEIGHT = 10
 COMBINED_NODE_PIES_MIN_HEIGHT = 12
+
+
+@dataclass(frozen=True)
+class AllocationFilters:
+    """Workload request thresholds; charts retain their cluster-wide scope."""
+
+    gpu: int = 0
+    cpu: float = 0
+    memory: int = 0
+    namespace: str = ""
+
+    def matches(self, consumer: WorkloadConsumer) -> bool:
+        requested = consumer.requested
+        return (
+            requested.gpu_count >= self.gpu
+            and requested.cpu_cores >= self.cpu
+            and requested.memory_bytes >= self.memory
+            and self.namespace.casefold() in consumer.namespace.casefold()
+        )
+
+    @classmethod
+    def parse(cls, gpu: str, cpu: str, memory: str, namespace: str) -> AllocationFilters:
+        try:
+            gpu_count = int(gpu.strip() or "0")
+        except ValueError as exc:
+            raise ValueError("Minimum GPUs must be a non-negative integer") from exc
+        if gpu_count < 0:
+            raise ValueError("Minimum GPUs must be a non-negative integer")
+        memory = memory.strip()
+        if memory and all(char.isdigit() or char == "." for char in memory):
+            memory += "Gi"
+        return cls(gpu_count, float(parse_cpu(cpu.strip() or "0")), math.ceil(parse_memory_bytes(memory or "0")), namespace.strip())
+
+
+class AllocationFilterDialog(ModalScreen[Optional[AllocationFilters]]):
+    CSS = f"""
+    AllocationFilterDialog {{ align: center middle; background: {BACKGROUND}; }}
+    #allocation-filter-box {{ width: 64; max-width: 100%; height: auto; max-height: 100%; border: solid {CYAN}; padding: 0 2; background: {BACKGROUND}; }}
+    #allocation-filter-box Static {{ height: 1; }}
+    #allocation-filter-box Input {{ height: 1; border: none; padding: 0; background: {BACKGROUND}; color: {WHITE}; }}
+    #allocation-filter-box Button {{ background: {BACKGROUND}; color: {WHITE}; border: solid {BORDER}; }}
+    #allocation-filter-box Button:focus {{ border: solid {CYAN}; }}
+    #allocation-filter-error {{ color: {RED}; }}
+    #allocation-filter-buttons {{ height: 3; }}
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("enter", "submit", "Apply", priority=True),
+        Binding("tab", "next_field", "Next field", priority=True),
+        Binding("shift+tab", "previous_field", "Previous field", priority=True),
+        Binding("ctrl+r", "clear", "Clear filters", priority=True),
+    ]
+
+    def __init__(self, current: AllocationFilters):
+        super().__init__()
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Container(id="allocation-filter-box"):
+            yield Static(Text("FILTER WORKLOAD REQUESTS", style=f"bold {CYAN}"))
+            yield Static("Minimum GPUs")
+            yield Input(str(self.current.gpu) if self.current.gpu else "", id="allocation-filter-gpu")
+            yield Static("Minimum CPU cores (e.g. 2 or 500m)")
+            yield Input(str(self.current.cpu) if self.current.cpu else "", id="allocation-filter-cpu")
+            yield Static("Minimum memory (e.g. 8Gi; bare numbers are GiB)")
+            yield Input(f"{self.current.memory / 1024**3:g}Gi" if self.current.memory else "", id="allocation-filter-memory")
+            yield Static("Namespace contains (case-insensitive)")
+            yield Input(self.current.namespace, id="allocation-filter-namespace")
+            yield Static("Blank fields: no limit. AND filters; Ctrl+R clears.")
+            yield Static("", id="allocation-filter-error", markup=False)
+            with Horizontal(id="allocation-filter-buttons"):
+                yield Button("Apply", id="allocation-filter-apply")
+                yield Button("Clear", id="allocation-filter-clear")
+                yield Button("Cancel", id="allocation-filter-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#allocation-filter-gpu", Input).focus()
+
+    def action_apply(self) -> None:
+        try:
+            values = [self.query_one(f"#allocation-filter-{name}", Input).value for name in ("gpu", "cpu", "memory", "namespace")]
+            result = AllocationFilters.parse(*values)
+        except ValueError as exc:
+            self.query_one("#allocation-filter-error", Static).update(str(exc))
+            return
+        self.dismiss(result)
+
+    def action_submit(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Button) and focused.id == "allocation-filter-clear":
+            self.action_clear()
+        elif isinstance(focused, Button) and focused.id == "allocation-filter-cancel":
+            self.action_cancel()
+        else:
+            self.action_apply()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_clear(self) -> None:
+        self.dismiss(AllocationFilters())
+
+    def action_next_field(self) -> None:
+        self.focus_next()
+
+    def action_previous_field(self) -> None:
+        self.focus_previous()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "allocation-filter-apply":
+            self.action_apply()
+        elif event.button.id == "allocation-filter-clear":
+            self.action_clear()
+        else:
+            self.action_cancel()
 
 
 @dataclass(frozen=True)
@@ -378,6 +495,7 @@ class ResourcesViewState:
     consumer_sort: str = "gpu"
     active_pane: str = "nodes"
     allocation_scroll: int = 0
+    allocation_filters: AllocationFilters = field(default_factory=AllocationFilters)
     namespace_basis: str = "gpu"
     # ``m`` cycles the primary allocation metric. ``namespace_basis`` is only
     # the GPU sub-mode selected by ``v``; keep ``memory_basis`` for callers
@@ -429,6 +547,15 @@ class ResourcesChrome(Static):
 class ResourcesPane(Static):
     can_focus = True
     ALLOW_SELECT = False
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.id == "node-pies-pane":
+            # The strip is a fixed-height Rich renderable. Startup can render
+            # it before Textual commits the final pane dimensions, clipping
+            # its bottom borders until the next data refresh.
+            render = getattr(self.app, "_render_combined_node_pies", None)
+            if callable(render):
+                self.call_after_refresh(render)
 
     def _activate(self) -> None:
         pane = self.id.replace("-pane", "") if self.id else "nodes"
@@ -624,6 +751,7 @@ class FalconResourcesApp(App[None]):
         Binding("enter", "expand", "Expand"),
         Binding("escape", "collapse", "Back", show=False),
         Binding("s", "cycle_consumer_sort", "Sort consumers", show=False),
+        Binding("f", "allocation_filters", "Filter workloads", show=False),
         Binding("v", "toggle_namespace_basis", "GPU/VRAM", show=False),
         Binding("m", "toggle_allocation_basis", "GPU/Memory/CPU", show=False),
         Binding("l", "toggle_history_scale", "History log scale", show=False),
@@ -898,6 +1026,7 @@ class FalconResourcesApp(App[None]):
             return
 
     def pane_focused(self, pane: str) -> None:
+        previous = (self.state.view, self.state.active_pane)
         if self._wide_resources_layout:
             if pane == "gpu-allocations":
                 self.state.view = "gpu-allocations"
@@ -911,6 +1040,8 @@ class FalconResourcesApp(App[None]):
             self.state.focused_panes[self.state.view] = pane
             self._set_titles()
             self._render_footer()
+            if previous != (self.state.view, self.state.active_pane):
+                self.call_after_refresh(self._render_all)
             return
         valid = {
             "nodes": {"nodes", "node"},
@@ -921,6 +1052,8 @@ class FalconResourcesApp(App[None]):
         self.state.active_pane = pane
         self.state.focused_panes[self.state.view] = pane
         self._set_titles()
+        if previous != (self.state.view, self.state.active_pane):
+            self.call_after_refresh(self._render_all)
 
     def watch_app_focus(self, focused: bool) -> None:
         """Remove pane emphasis while the terminal window is inactive."""
@@ -935,9 +1068,7 @@ class FalconResourcesApp(App[None]):
                 # scrollable content. Always return the application viewport
                 # to its origin before restoring pane emphasis.
                 self.screen.scroll_to(y=0, animate=False)
-            self._set_titles()
-            if self.state.view == "nodes":
-                self._render_nodes()
+            self._render_all()
         except NoMatches:
             return
 
@@ -1863,10 +1994,10 @@ class FalconResourcesApp(App[None]):
         # Once a pane is expanded, Esc is the unambiguous way back to the
         # responsive Resources layout. The Nodes/Allocations selector is
         # unnecessary chrome while the body is dedicated to one pane.
-        self.query_one("#resources-views").display = not (
-            self.state.expanded or expanded_allocation
-        )
         wide = self._is_wide_resources() and not self.state.expanded and not expanded_allocation
+        self.query_one("#resources-views").display = not (
+            wide or self.state.expanded or expanded_allocation
+        )
         self._wide_resources_layout = wide
         body.display = True
 
@@ -1921,6 +2052,7 @@ class FalconResourcesApp(App[None]):
                 "gpu-allocations": allocation,
                 "node": detail,
                 "nodes": nodes_pane,
+                "node-pies": node_pies,
             }.get(self.state.active_pane, nodes_pane)
             if not focus_id.display:
                 focus_id = nodes_pane if nodes_pane.display else allocation
@@ -2040,6 +2172,7 @@ class FalconResourcesApp(App[None]):
         visible = (
             self.size.width >= MINIMUM_WIDTH
             and self.size.height >= RESOURCE_MINIMUM_HEIGHT
+            and not self._is_wide_resources()
             and not self.state.expanded
             and not self.state.expanded_panels.get("gpu-allocations", "")
         )
@@ -2077,6 +2210,17 @@ class FalconResourcesApp(App[None]):
             self.query_one(f"#{identifier}", ResourcesPane).border_title = (
                 f" {base}{' · focused' if self.app_focus and pane == self.state.active_pane else ''} "
             )
+
+    @property
+    def _active_resource_surface(self) -> str:
+        """One global focus target; remembered selections are not focus."""
+        if not self.app_focus:
+            return ""
+        if self.state.active_pane == "gpu-allocations":
+            return self.state.selected_panels.get("gpu-allocations", "history")
+        if self.state.active_pane == "node-pies":
+            return f"{self.state.selected_cluster_pie}-pie"
+        return self.state.active_pane
 
     def _render_overview(self) -> None:
         snapshot = ClusterSnapshot(
@@ -2243,6 +2387,8 @@ class FalconResourcesApp(App[None]):
     def _namespace_allocation_groups(self) -> tuple[NamespaceAllocationGroup, ...]:
         grouped: defaultdict[str, list[WorkloadConsumer]] = defaultdict(list)
         for consumer in self._allocation_consumers():
+            if not self.state.allocation_filters.matches(consumer):
+                continue
             grouped[consumer.namespace].append(consumer)
 
         groups = [
@@ -2483,7 +2629,7 @@ class FalconResourcesApp(App[None]):
             )
             table.add_row(*row)
         if not rows:
-            table.add_row(Text("No active resource allocations", style=MUTED))
+            table.add_row(Text("No workloads match filters" if self.state.allocation_filters != AllocationFilters() else "No active resource allocations", style=MUTED))
         return table
 
     @staticmethod
@@ -2576,6 +2722,8 @@ class FalconResourcesApp(App[None]):
             self.color_mode,
             geometry.signature,
             _valid_consumer_sort(self.state.consumer_sort),
+            self.state.allocation_filters,
+            self._active_resource_surface,
             self.state.history_log_scale,
             self.history_hours,
             self._history_revision,
@@ -2623,11 +2771,11 @@ class FalconResourcesApp(App[None]):
                         style=f"bold {PALETTE.accent}",
                     ),
                     subtitle=Text(
-                        f" sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]} · s cycle ",
+                        f" sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]} · s cycle " + ("· filtered · f edit " if self.state.allocation_filters != AllocationFilters() else ""),
                         style=GRAY,
                     ),
                     box=box.SQUARE,
-                    border_style=BORDER,
+                    border_style=CYAN if self._active_resource_surface == "allocation" else BORDER,
                     width=geometry.width,
                     height=geometry.height,
                     padding=(0, 1),
@@ -2665,7 +2813,7 @@ class FalconResourcesApp(App[None]):
                 subtitle=Text(f" {self._history_window_label} ", style=GRAY),
                 box=box.SQUARE,
                 border_style=(
-                    CYAN if not expanded and selected == "history" else BORDER
+                    CYAN if self._active_resource_surface == "history" else BORDER
                 ),
                 width=region.width,
                 height=region.height,
@@ -2702,7 +2850,7 @@ class FalconResourcesApp(App[None]):
                     style=RED if telemetry.stale else GRAY,
                 ),
                 box=box.SQUARE,
-                border_style=(CYAN if not expanded and selected == "pie" else BORDER),
+                border_style=(CYAN if self._active_resource_surface == "pie" else BORDER),
                 width=region.width,
                 height=region.height,
                 padding=(0, 1),
@@ -2721,9 +2869,9 @@ class FalconResourcesApp(App[None]):
                 " NAMESPACE / WORKLOAD ALLOCATION ",
                 style=f"bold {PALETTE.accent}",
             ),
-            subtitle=Text(f" sort {sort_label} · s cycle ", style=GRAY),
+            subtitle=Text(f" sort {sort_label} · s cycle " + ("· filtered · f edit " if self.state.allocation_filters != AllocationFilters() else ""), style=GRAY),
             box=box.SQUARE,
-            border_style=CYAN if selected == "allocation" else BORDER,
+            border_style=CYAN if self._active_resource_surface == "allocation" else BORDER,
             width=geometry.allocation.width,
             height=geometry.allocation.height,
             padding=(0, 1),
@@ -3061,7 +3209,7 @@ class FalconResourcesApp(App[None]):
                     title=Text(f" {title} ", style=f"bold {CYAN}"),
                     border_style=(
                         CYAN
-                        if basis == self.state.selected_cluster_pie
+                        if self._active_resource_surface == f"{basis}-pie"
                         else BORDER
                     ),
                     box=box.SQUARE,
@@ -3457,6 +3605,13 @@ class FalconResourcesApp(App[None]):
                 f"s Sort {CONSUMER_SORT_LABELS[self.state.consumer_sort]}   "
                 "r Refresh   q Quit"
             )
+        if (
+            self._active_resource_surface == "allocation"
+            and self.size.width >= MINIMUM_WIDTH
+            and self.size.height >= RESOURCE_MINIMUM_HEIGHT
+        ):
+            # Put this first so it remains visible even in compact terminals.
+            value = "f Filter   " + value
         self.query_one("#resources-footer", Static).update(Text(value, style=GRAY))
 
     def _render_all(self) -> None:
@@ -3744,6 +3899,20 @@ class FalconResourcesApp(App[None]):
 
     def action_refresh_data(self) -> None:
         self._request_update(force=True)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        return not isinstance(self.screen, ModalScreen)
+
+    def action_allocation_filters(self) -> None:
+        self.push_screen(AllocationFilterDialog(self.state.allocation_filters), self._allocation_filters_applied)
+
+    def _allocation_filters_applied(self, filters: Optional[AllocationFilters]) -> None:
+        if filters is None:
+            return
+        self.state.allocation_filters = filters
+        self.state.allocation_scroll = 0
+        self._allocation_render_key = None
+        self._render_all()
 
     def action_cycle_consumer_sort(self) -> None:
         if self.state.view not in RESOURCE_VIEWS:
