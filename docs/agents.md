@@ -1,5 +1,9 @@
 # Coding-agent integration
 
+For live, reconnectable agent terminals with restricted child Jobs, see
+[Falcon sandbox](sandbox.md). It does not expose your kubeconfig or require
+Coder, SSH, or a public server.
+
 Falcon packages one concise skill at `falcon/skills/falcon/SKILL.md`.
 
 Install managed copies:

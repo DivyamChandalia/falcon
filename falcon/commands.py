@@ -127,6 +127,16 @@ def capture_logs(
 
 def attach(namespace: str, name: Optional[str]) -> int:
     target = target_job(name)
+    from .sandbox_service import attach_session, load_session
+
+    try:
+        session = load_session(target)
+    except (FileNotFoundError, ValueError):
+        session = None
+    if session is not None:
+        if session["policy"]["namespace"] != namespace:
+            raise ValueError("sandbox namespace does not match; supply its --namespace")
+        return attach_session(target)
     result = KubernetesClient(namespace).attach(target)
     if result.returncode == 0:
         remember_job(target)

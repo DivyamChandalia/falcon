@@ -204,6 +204,50 @@ completes normally.
 The updater checks for releases silently on non-interactive commands. Set
 `FALCON_NO_UPDATE_CHECK=1` to disable the interactive update prompt.
 
+## Sandboxed coding agents
+
+Run a locally installed Codex, Claude Code, or OpenCode in a Kubernetes Job
+with a reconnectable tmux terminal:
+
+```console
+falcon sandbox --name agent-loop -c 4 -m 8Gi --read-only /path/to/data -- codex
+falcon attach agent-loop
+falcon sandbox status agent-loop
+falcon sandbox stop agent-loop
+```
+
+Replace `codex` with `claude` or `opencode`, or use `--agent-bin PATH` when the
+executable is not on PATH. `--detach` leaves the agent running without opening
+the terminal. Detach from tmux with **Ctrl+B, D** to keep it running;
+**Ctrl+C** stops the agent and cleans up the sandbox Job (not its child Jobs).
+
+Without `--name`, the Job is named `falcon-{harness}-{working-directory-name}`,
+for example `falcon-codex-jet-k8s`.
+
+The sandbox uses your configured image, mounts local tools read-only, and
+persists the selected agent's settings/login/history. Codex uses a filtered
+settings copy synchronized by the broker, directly shared read-write session
+directories, and container-local sockets/databases.
+The working directory is
+writable; extra data mounts are read-only. Agent-specific persistent state is
+an additional writable location; synchronized/shared settings can affect your
+local agent sessions.
+
+The active Python environment is mounted read-write and shared with child
+Jobs; package changes modify that host environment directly. Run Falcon's
+trusted broker from a separate Python installation. Sandbox
+sessions and CPU-only children default to 1 CPU and 1 GiB RAM.
+
+Agents can launch child Jobs through a background broker on the launch
+machine. Children inherit the directory restrictions, not your Kubernetes
+credentials or writable agent settings. Keep that machine running for new
+submissions; closing the attached terminal is safe. Full agent permissions
+are enabled inside the container by default, not on the launch machine.
+
+See [Sandbox setup, isolation, and recovery](docs/sandbox.md) for requirements
+and limitations. This feature provides a goal-loop environment, not its own
+goal-loop runner.
+
 ## Troubleshooting
 
 - **`falcon: command not found`** — open a new shell or add

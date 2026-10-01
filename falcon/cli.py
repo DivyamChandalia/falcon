@@ -245,6 +245,17 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command_name")
 
+    sandbox = sub.add_parser("sandbox", help="Run a live coding agent with restricted child Jobs")
+    _submission_arguments(sandbox)
+    sandbox.add_argument("--read-only", action="append", default=[], metavar="DIRECTORY")
+    sandbox.add_argument("--agent-bin", metavar="PATH")
+    sandbox.add_argument("--permissions", choices=("full", "agent"), default="full")
+    sandbox.add_argument("--detach", action="store_true")
+    sandbox.epilog = "Examples: falcon sandbox -- codex; falcon sandbox status|resume|stop NAME"
+    for action in sandbox._actions:
+        if action.dest == "command":
+            action.help = "Agent argv after --, or status|resume|stop NAME"
+
     jobs = sub.add_parser("jobs", help="List a bounded set of Jobs")
     jobs.add_argument("--limit", type=int, default=50)
     jobs.add_argument("--status")
@@ -501,7 +512,7 @@ def _rewrite_shorthand(
     public_commands = {
         "jobs", "get", "events", "logs", "attach", "top", "metrics",
         "kill", "clean", "dashboard", "resources", "coder", "setup",
-        "completion", "config", "update", "shell-init",
+        "completion", "config", "update", "shell-init", "sandbox",
     }
     # Falcon 0.1 installed this command in shell startup files. Keep a hidden,
     # output-compatible migration alias so upgrading the executable cannot
@@ -2116,6 +2127,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.print_help()
             return 0
         _maybe_auto_update(args.command_name, args)
+        if args.command_name == "sandbox":
+            from .sandbox_service import launch_session, manage_session
+
+            if args.command[:1] and args.command[0] in {"status", "resume", "stop"}:
+                if len(args.command) != 2:
+                    raise CliError("usage: falcon sandbox status|resume|stop NAME")
+                return manage_session(*args.command, output=args.output)
+            return launch_session(args, config)
         if args.command_name == "jobs":
             return _jobs_command(args, config)
         if args.command_name == "get":

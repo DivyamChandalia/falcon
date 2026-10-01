@@ -208,6 +208,69 @@ class ParserTests(CliHarness):
         self.assertIn("2080tix*", zsh_completion)
         self.assertIn('compstate[list]="${compstate[list]} rows"', zsh_completion)
 
+    def test_sandbox_completion_commands_sessions_and_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            session = state / "falcon/sandboxes/falcon-codex-demo"
+            session.mkdir(parents=True)
+            (session / "session.json").write_text("{}")
+            for name in ("stopped-session", "missing-session"):
+                old = state / "falcon/sandboxes" / name
+                old.mkdir()
+                (old / "session.json").write_text("{}")
+            (state / "falcon/sandboxes/stopped-session/stopped").touch()
+            kubectl = root / "kubectl"
+            kubectl.write_text("#!/bin/sh\nprintf '%s\\n' job.batch/falcon-codex-demo job.batch/stopped-session job.batch/unregistered-child\n")
+            kubectl.chmod(0o755)
+            (root / "data set").mkdir()
+            (root / "data-file").touch()
+            for shell in ("bash", "zsh"):
+                executable = shutil.which(shell)
+                if executable is None:
+                    continue
+
+                def complete(words: str, index: int) -> list[str]:
+                    if shell == "bash":
+                        command = (
+                            "source /dev/stdin; "
+                            f"COMP_WORDS=({words}); COMP_CWORD={index - 1}; "
+                            "_falcon_native; printf '%s\\n' \"${COMPREPLY[@]}\""
+                        )
+                    else:
+                        command = (
+                            "compdef() { :; }; typeset -A compstate; "
+                            "compadd() { while [[ $1 == -* ]]; do "
+                            "case $1 in -V|-S) shift 2;; --) shift; break;; *) shift;; esac; "
+                            "done; printf '%s\\n' \"$@\"; }; "
+                            "_files() { printf 'FILES:%s\\n' \"$*\"; }; "
+                            "_normal() { printf 'AGENT\\n'; }; source /dev/stdin; "
+                            f"words=({words}); CURRENT={index}; _falcon_native"
+                        )
+                    result = subprocess.run(
+                        [executable, "-c", command], input=shell_script(shell, config=DEFAULT_CONFIG),
+                        text=True, capture_output=True, cwd=root,
+                        env={**os.environ, "XDG_STATE_HOME": str(state), "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}"},
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    return result.stdout.splitlines()
+
+                with self.subTest(shell=shell):
+                    options = complete("falcon sandbox ''", 3)
+                    for value in ("status", "resume", "stop", "--read-only", "--detach"):
+                        self.assertIn(value, options)
+                    for action in ("status", "resume", "stop"):
+                        self.assertEqual(complete(f"falcon sandbox {action} ''", 4), [session.name])
+                    paths = complete("falcon sandbox --read-only './data'", 4)
+                    if shell == "bash":
+                        self.assertEqual(paths, ["./data set/"])
+                        self.assertEqual(complete(f"falcon sandbox --read-only '{root}/data'", 4), [str(root / "data set") + "/"])
+                        self.assertEqual(complete("falcon sandbox -- codex --read-only './data'", 6), [""])
+                    else:
+                        self.assertEqual(paths, ["FILES:-/"])
+                        self.assertEqual(complete("falcon sandbox -- codex --read-only './data'", 6), ["AGENT"])
+                    self.assertEqual(complete("falcon sandbox --permissions ''", 4), ["full", "agent"])
+
     def test_job_completion_queries_without_a_local_cache(self) -> None:
         for shell in ("bash", "zsh"):
             script = shell_script(shell, config=DEFAULT_CONFIG)

@@ -10,6 +10,7 @@ from .commands import job_names
 from .config import gpu_preset_max_count
 
 BASE_COMMANDS = [
+    "sandbox",
     "jobs",
     "get",
     "logs",
@@ -52,6 +53,7 @@ LAUNCH_OPTIONS = [
 ]
 
 OPTIONS: Dict[str, List[str]] = {
+    "sandbox": [*LAUNCH_OPTIONS, "--read-only", "--agent-bin", "--permissions", "--detach", "status", "resume", "stop"],
     "jobs": [
         "--output", "--limit", "--status", "--gpu", "--node", "--namespace",
     ],
@@ -193,6 +195,30 @@ _falcon_native() {{
   case "$subject" in
 {alias_cases}
   esac
+  if [[ "$subject" == sandbox ]]; then
+    local previous="${{words[CURRENT-1]}}" index
+    for (( index=3; index<CURRENT; index++ )); do
+      if [[ "${{words[index]}}" == -- ]]; then
+        _normal
+        return
+      fi
+    done
+    case "$previous" in
+      --read-only|--environment) _files -/; return ;;
+      --agent-bin) _files; return ;;
+      --permissions) compadd -- full agent; return ;;
+    esac
+    if (( CURRENT == 4 )) && [[ "${{words[3]}}" == status || "${{words[3]}}" == resume || "${{words[3]}}" == stop ]]; then
+      local name directory
+      while IFS= read -r name; do
+        name="${{name#job.batch/}}"
+        directory="${{XDG_STATE_HOME:-$HOME/.local/state}}/falcon/sandboxes/$name"
+        [[ -f "$directory/session.json" && ! -f "$directory/stopped" ]] && values+=("$name")
+      done < <(command kubectl get jobs.batch -n {namespace} --selector falcon.dev/sandbox -o name --request-timeout=2s 2>/dev/null)
+      compadd -- $values
+      return
+    fi
+  fi
   if (( CURRENT == 2 )); then
     case "$current" in
       {zsh_base_preset_pattern})
@@ -253,6 +279,44 @@ _falcon_native() {{
   case "$subject" in
 {alias_cases}
   esac
+  COMPREPLY=()
+  if [[ "$subject" == sandbox ]]; then
+    local previous="${{COMP_WORDS[COMP_CWORD-1]}}" word
+    for word in "${{COMP_WORDS[@]:2:COMP_CWORD-2}}"; do
+      if [[ "$word" == -- ]]; then
+        compopt -o default -o bashdefault 2>/dev/null || true
+        return
+      fi
+    done
+    case "$previous" in
+      --read-only|--environment|--agent-bin)
+        local lookup="$cur" path mode=-d
+        [[ "$previous" == --agent-bin ]] && mode=-f
+        [[ "$lookup" == '~/'* ]] && lookup="$HOME/${{lookup:2}}"
+        while IFS= read -r path; do
+          [[ -d "$path" ]] && path="${{path%/}}/"
+          [[ "$cur" == '~/'* ]] && path="~/${{path#"$HOME/"}}"
+          COMPREPLY+=("$path")
+        done < <(compgen "$mode" -- "$lookup")
+        compopt -o filenames -o nospace 2>/dev/null || true
+        return ;;
+      --permissions) values=(full agent) ;;
+    esac
+    if [[ "$previous" == --permissions ]]; then
+      COMPREPLY=( $(compgen -W "${{values[*]}}" -- "$cur") )
+      return
+    fi
+    if [[ $COMP_CWORD -eq 3 && "${{COMP_WORDS[2]}}" =~ ^(status|resume|stop)$ ]]; then
+      local name directory
+      while IFS= read -r name; do
+        name="${{name#job.batch/}}"
+        directory="${{XDG_STATE_HOME:-$HOME/.local/state}}/falcon/sandboxes/$name"
+        [[ -f "$directory/session.json" && ! -f "$directory/stopped" ]] || continue
+        [[ "$name" == "$cur"* ]] && COMPREPLY+=("$name")
+      done < <(command kubectl get jobs.batch -n {namespace} --selector falcon.dev/sandbox -o name --request-timeout=2s 2>/dev/null)
+      return
+    fi
+  fi
   if [[ $COMP_CWORD -eq 1 ]]; then
     if [[ "$cur" =~ ^({bash_preset_pattern})$ ]]; then
       values=("${{_falcon_counted_presets[@]}}")
