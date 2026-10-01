@@ -2037,7 +2037,7 @@ def _update_command(args: argparse.Namespace) -> int:
             print(f"Falcon is up to date ({__version__}).")
         return 0
 
-    print(f"Updating Falcon {__version__} from GitHub…")
+    print(f"Updating Falcon {__version__}…")
     try:
         status = install_update()
     except UpdateError as exc:
@@ -2045,7 +2045,7 @@ def _update_command(args: argparse.Namespace) -> int:
         return EXIT_UPDATE
     if status:
         print(
-            f"falcon update: pip exited with status {status}",
+            f"falcon update: installer exited with status {status}",
             file=sys.stderr,
         )
         return EXIT_UPDATE

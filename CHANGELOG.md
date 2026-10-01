@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.6 — 2026-10-01
+
+- Added interactive Dashboard terminals: Ctrl+T opens shells, arrows switch
+  windows, Ctrl+D closes, and 200-line scrollback supports selection-aware
+  copying. Click outside the terminal to restore Dashboard controls.
+- Added Resources namespace/workload filters with `f`, single-pane focus,
+  contextual filter hints, and cleaner combined/expanded views without
+  redundant Nodes/Allocations selectors.
+- Added uv-aware `falcon update` and uv installation instructions; Dashboard
+  `k` now opens Job actions from any non-terminal pane.
+
 ## 0.4.5 — 2026-09-29
 
 - Added mouse text selection, edge auto-scroll, and clipboard copy for

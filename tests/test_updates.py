@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from falcon import __version__
 from falcon.cli import EXIT_UPDATE, _maybe_auto_update, main
 from falcon.updates import (
+    UpdateError,
     install_update,
     latest_changelog,
     latest_version,
@@ -19,6 +21,7 @@ from falcon.updates import (
     pip_command,
     record_update_check,
     update_check_due,
+    uv_tool_environment,
 )
 
 
@@ -161,6 +164,45 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(calls[0][1], False)
         self.assertEqual(calls[0][0][-1], "git+https://example.invalid/falcon.git@main")
         self.assertIn("--upgrade", pip_command())
+
+    def test_uv_tool_update_preserves_owner_and_tool_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = Path(directory) / "custom-tools/falcon-k8s"
+            tool.mkdir(parents=True)
+            (tool / "uv-receipt.toml").write_text('[tool]\nrequirements = []\n')
+            with patch("falcon.updates.sys.prefix", str(tool)), patch("falcon.updates.shutil.which", return_value="/usr/local/bin/uv"), patch.dict(os.environ, {"UV_TOOL_DIR": "/wrong/tools"}), patch("falcon.updates.subprocess.run") as runner:
+                runner.return_value.returncode = 0
+                self.assertEqual(uv_tool_environment(), tool)
+                self.assertEqual(install_update(), 0)
+            args, kwargs = runner.call_args
+            self.assertEqual(args[0], ["/usr/local/bin/uv", "tool", "upgrade", "falcon-k8s"])
+            self.assertEqual(kwargs["env"]["UV_TOOL_DIR"], str(tool.parent))
+            self.assertFalse(kwargs["check"])
+            self.assertNotIn("pip", args[0])
+            self.assertNotIn("git+", " ".join(args[0]))
+
+    def test_uv_missing_never_falls_back_to_pip(self) -> None:
+        with patch("falcon.updates.uv_tool_environment", return_value=Path("/tools/falcon-k8s")), patch("falcon.updates.shutil.which", return_value=None), patch("falcon.updates.subprocess.run") as runner:
+            with self.assertRaisesRegex(UpdateError, "uv is not on PATH"):
+                install_update()
+        runner.assert_not_called()
+
+    def test_uv_failure_propagates_without_pip_retry(self) -> None:
+        with patch("falcon.updates.uv_tool_environment", return_value=Path("/tools/falcon-k8s")), patch("falcon.updates.shutil.which", return_value="uv"), patch("falcon.updates.subprocess.run") as runner:
+            runner.return_value.returncode = 12
+            self.assertEqual(install_update(), 12)
+            self.assertEqual(runner.call_count, 1)
+            runner.side_effect = OSError("cannot execute")
+            with self.assertRaisesRegex(UpdateError, "could not run uv"):
+                install_update()
+
+    def test_uv_created_venv_without_tool_receipt_uses_pip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch("falcon.updates.sys.prefix", directory), patch("falcon.updates.subprocess.run") as runner:
+            (Path(directory) / "pyvenv.cfg").write_text("uv = 0.10.0\n")
+            runner.return_value.returncode = 0
+            self.assertIsNone(uv_tool_environment())
+            self.assertEqual(install_update(), 0)
+            self.assertEqual(runner.call_args.args[0][1:4], ["-m", "pip", "install"])
 
     def test_manual_update_failure_has_distinct_exit_code(self) -> None:
         with patch("falcon.cli.install_update", return_value=17), redirect_stdout(io.StringIO()), patch(

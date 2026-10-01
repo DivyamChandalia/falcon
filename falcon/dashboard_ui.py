@@ -48,6 +48,12 @@ from .dashboard import (
     _timestamp,
 )
 from .dashboard_logs import DashboardLogManager, LogSnapshot
+from .dashboard_terminal import (
+    TERMINAL_SCROLLBACK_LINES,
+    DashboardTerminal,
+    TerminalSession,
+    exec_command,
+)
 from .planning import GPU_MODEL_DISPLAY_ORDER, canonical_gpu
 from .theme import (
     BACKGROUND,
@@ -964,7 +970,7 @@ class SelectedJobScroll(RichLog):
             self.refresh()
             return
         actions = {
-            "up": "action_up", "k": "action_up",
+            "up": "action_up", "k": "action_kill",
             "down": "action_down", "j": "action_down",
             "left": "action_left", "right": "action_right",
             "pageup": "action_page_up", "pagedown": "action_page_down",
@@ -1095,6 +1101,7 @@ class SelectedJobInspector(Container):
                 flat=True,
             )
         yield SelectedJobScroll(id="selected-logs-scroll")
+        yield DashboardTerminal(id="selected-terminal")
 
     def clear(self, message: str = "No Job selected") -> None:
         self.query_one("#selected-details-left", Static).update(
@@ -1147,6 +1154,7 @@ class SelectedJobInspector(Container):
         )
         logs_scroll.border_title = f" LOGS · {attempt_label} "
         logs_scroll.set_class(logs_collapsed, "collapsed")
+        self.app._sync_terminal_view()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         callback = getattr(self.app, "selected_button_pressed", None)
@@ -1569,6 +1577,9 @@ SelectedJobScroll:focus {{ border: solid {CYAN}; }}
 SelectedJobScroll.selected {{ border: solid {CYAN}; }}
 #selected-logs-scroll {{ width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
 #selected-logs-scroll.collapsed {{ height: 4; min-height: 4; max-height: 4; }}
+#selected-terminal {{ display: none; width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; overflow-x: hidden; overflow-y: auto; scrollbar-size-vertical: 1; background: {BACKGROUND}; color: {WHITE}; }}
+#selected-terminal:focus {{ border: solid {CYAN}; }}
+#selected-terminal-screen {{ width: 1fr; height: auto; }}
 #events-pane {{ height: 7; min-height: 3; }}
 #resize-message {{ display: none; height: 1fr; content-align: center middle; color: {YELLOW}; }}
 #falcon-footer {{ height: 1; color: {GRAY}; padding: 0 1; }}
@@ -1587,6 +1598,9 @@ class FalconDashboard(App):
         Binding("cmd+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("super+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("tab", "next_pane", "Next pane", priority=True),
+        Binding("ctrl+t", "new_terminal", "New terminal", show=False, priority=True),
+        Binding("ctrl+w", "close_terminal", "Close terminal", show=False, priority=True),
+        Binding("ctrl+d", "close_terminal", "Close terminal", show=False, priority=True),
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
         Binding("1", "focus_jobs", "Jobs", show=False), Binding("2", "focus_resources", "Resources", show=False),
         Binding("3", "focus_events", "Events", show=False), Binding("4", "focus_selected", "Selected Job", show=False),
@@ -1594,7 +1608,7 @@ class FalconDashboard(App):
         Binding("escape", "escape", "Restore", show=False), Binding("r", "update_data", "Refresh"),
         Binding("up", "up", "Up", show=False), Binding("down", "down", "Down", show=False),
         Binding("left", "left", "Left", show=False), Binding("right", "right", "Right", show=False),
-        Binding("j", "down", "Down", show=False), Binding("k", "kill_or_up", "Kill / Up", show=False),
+        Binding("j", "down", "Down", show=False), Binding("k", "kill", "Job actions", show=False, priority=True),
         Binding("pageup", "page_up", "Page up", show=False), Binding("pagedown", "page_down", "Page down", show=False),
         Binding("home", "home", "Oldest", show=False), Binding("end", "end", "Latest", show=False),
         Binding("h", "history_left", "Earlier", show=False), Binding("l", "history_right", "Later", show=False),
@@ -1655,6 +1669,7 @@ class FalconDashboard(App):
         color_mode: Optional[str] = None,
         log_manager: Optional[DashboardLogManager] = None,
         launch_config: Optional[Mapping[str, Any]] = None,
+        terminal_factory: Callable[..., TerminalSession] = TerminalSession,
     ):
         super().__init__()
         self.color_mode = configure_color(self.console, color_mode)
@@ -1671,6 +1686,11 @@ class FalconDashboard(App):
         self._coder_workspace_action = coder_workspace_action
         self._clock = clock or (lambda: datetime.now().strftime("%H:%M:%S"))
         self.log_manager = log_manager
+        self._terminal_factory = terminal_factory
+        self._terminals: Dict[str, List[TerminalSession]] = {}
+        self._terminal_windows: Dict[str, Optional[int]] = {}
+        self._terminal_render_key: object = None
+        self._terminal_poll_cursor = 0
         self.launch_config: Mapping[str, Any] = launch_config or {}
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
@@ -1742,9 +1762,13 @@ class FalconDashboard(App):
         # size watcher makes live resize deterministic across that range.
         self.set_interval(0.1, self._check_terminal_size)
         self.set_interval(1.0, self._tick_clock)
+        self.set_interval(0.05, self._poll_terminals)
         self._render_all()
 
     def on_unmount(self) -> None:
+        for sessions in self._terminals.values():
+            for session in sessions:
+                session.close()
         if self.log_manager is not None:
             self.log_manager.close()
         close = getattr(self.collector, "close", None)
@@ -1763,6 +1787,8 @@ class FalconDashboard(App):
             return
         self._last_terminal_size = (self.size.width, self.size.height)
         try:
+            if self._terminal_has_focus() and (self.size.width < WIDE_LAYOUT_MIN_WIDTH or self.size.height < WIDE_LAYOUT_MIN_HEIGHT):
+                self.state.expanded_pane = "selected"
             self._apply_layout()
             self._render_all()
         except NoMatches:
@@ -2457,7 +2483,7 @@ class FalconDashboard(App):
         # ``screen.focused`` would then leave arrows and the footer routed to
         # the wrong pane even though Logs visibly received the click.
         self.state.focused_pane = "selected"
-        if section_id == "selected-logs-scroll":
+        if section_id in {"selected-logs-scroll", "selected-terminal"}:
             self.state.selected_section = "logs"
         self._set_titles()
         self._set_selected_subtitle()
@@ -2516,15 +2542,17 @@ class FalconDashboard(App):
                 pass
         row = self._selected_row()
         section = self.state.selected_section.upper()
-        target.border_subtitle = f" {section} · {self._selected_attempt_label(row)} "
+        terminal = self._active_terminal()
+        target.border_subtitle = f" TERMINAL · {terminal.label} " if terminal else f" {section} · {self._selected_attempt_label(row)} "
 
     def _focus_selected_section(self) -> None:
         """Give the active Logs viewport the real keyboard focus."""
 
-        if not self._selected_inspector_visible() or self.log_manager is None:
+        row = self._selected_row()
+        if not self._selected_inspector_visible() or (self.log_manager is None and not (row and self._terminals.get(row.uid))):
             return
         self.state.focused_pane = "selected"
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-terminal" if self._active_terminal() else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id)
         except NoMatches:
@@ -2551,9 +2579,7 @@ class FalconDashboard(App):
         """Return whether the nested log viewport currently owns focus."""
 
         try:
-            return self.screen.focused is self.query_one(
-                "#selected-logs-scroll", SelectedJobScroll
-            )
+            return self.screen.focused is self.query_one("#selected-logs-scroll") or self.screen.focused is self.query_one("#selected-terminal")
         except NoMatches:
             return False
 
@@ -2571,6 +2597,15 @@ class FalconDashboard(App):
         if section == "command":
             value = self._reconstructed_command(row)
             label = "command"
+        elif (terminal := self._active_terminal()) is not None:
+            value = "\n".join(
+                line.rstrip()
+                for line in terminal.render(cursor=False, scrollback=True).plain.splitlines()
+            ).rstrip("\n")
+            if not value:
+                self.notify("No terminal output yet", severity="warning")
+                return
+            label = "terminal output"
         else:
             attempt = self._selected_attempt(row)
             if self.log_manager is None or attempt is None:
@@ -2628,7 +2663,27 @@ class FalconDashboard(App):
             self.notify("Copied selection")
         return True
 
+    def _copy_terminal_selection(self) -> bool:
+        if self._active_terminal() is None:
+            return False
+        try:
+            value = self.query_one("#selected-terminal", DashboardTerminal).selection_for_copy()
+        except NoMatches:
+            return False
+        if not value:
+            return False
+        try:
+            self.copy_to_clipboard(value)
+        except Exception as exc:
+            self.notify(f"Could not copy selection: {exc}", severity="warning")
+        else:
+            self.notify("Copied selection")
+        return True
+
     def action_copy_or_quit(self) -> None:
+        if self._terminal_has_focus():
+            self._copy_terminal_selection()
+            return
         if self._copy_text_selection():
             return
         if self._selected_inspector_active():
@@ -2744,6 +2799,159 @@ class FalconDashboard(App):
             target.scroll_home(animate=False, force=True, immediate=True)
         if self.state.selected_section == "logs":
             self.state.logs_auto_follow = end
+
+    def _active_terminal(self) -> Optional[TerminalSession]:
+        row = self._selected_row()
+        if row is None:
+            return None
+        index = self._terminal_windows.get(row.uid)
+        sessions = self._terminals.get(row.uid, [])
+        return sessions[index] if index is not None and 0 <= index < len(sessions) else None
+
+    def _terminal_has_focus(self) -> bool:
+        return isinstance(self.focused, DashboardTerminal) and self._active_terminal() is not None
+
+    def action_new_terminal(self) -> None:
+        if self.state.focused_pane != "selected":
+            return
+        row = self._selected_row()
+        if row is None:
+            return
+        attempt = self._selected_attempt(row)
+        if attempt is None or not attempt.running:
+            attempt = next((item for item in reversed(self._selected_attempts(row)) if item.running), None)
+        if attempt is None:
+            self.notify("Exec requires a running Pod.", severity="warning")
+            return
+        if sum(len(items) for items in self._terminals.values()) >= 32:
+            self.notify("Close a terminal first (maximum 32 open windows).", severity="warning")
+            return
+        from .config import detect_shell
+
+        namespace = getattr(self.log_manager, "namespace", None) or getattr(self.collector, "namespace", None)
+        if not namespace:
+            self.notify("Exec is unavailable without a Kubernetes namespace.", severity="warning")
+            return
+        client = getattr(self.log_manager, "_client", None)
+        executable = getattr(client, "executable", None) or shutil.which("kubectl") or "kubectl"
+        try:
+            shell, shell_rc = detect_shell()
+            session = self._terminal_factory(
+                exec_command(namespace, attempt.name, attempt.container, shell, executable, rc_path=str(shell_rc or ""), prompt_label=row.job),
+                label=f"{attempt.name} · {attempt.container or 'main'}",
+            )
+        except (ImportError, OSError, ValueError) as exc:
+            self.notify(f"Could not open terminal: {exc}", severity="error")
+            return
+        sessions = self._terminals.setdefault(row.uid, [])
+        sessions.append(session)
+        self._terminal_windows[row.uid] = len(sessions) - 1
+        self.state.logs_collapsed = False
+        if not self._selected_inspector_visible():
+            self.state.expanded_pane = "selected"
+        self._apply_layout()
+        self._render_selected()
+        self.call_after_refresh(self._focus_selected_section)
+
+    def action_close_terminal(self) -> None:
+        row = self._selected_row()
+        session = self._active_terminal()
+        if row is None or session is None:
+            return
+        index = self._terminal_windows[row.uid]
+        session.close()
+        self._terminals[row.uid].pop(index)
+        self._terminal_windows[row.uid] = None
+        self._terminal_render_key = None
+        self._render_selected()
+        self._sync_terminal_view()
+        self.set_focus(self.query_one("#selected-logs-scroll"), scroll_visible=False)
+
+    def _send_terminal_input(self, data: bytes) -> None:
+        session = self._active_terminal()
+        if session is not None and data:
+            try:
+                session.send(data)
+            except ValueError as exc:
+                self.notify(str(exc), severity="warning")
+
+    def _poll_terminals(self) -> None:
+        sessions = [session for items in self._terminals.values() for session in items]
+        if sessions:
+            # Drain at most 64 KiB/tick; rotate background windows fairly.
+            start = self._terminal_poll_cursor % len(sessions)
+            batch = (sessions[start:] + sessions[:start])[:8]
+            self._terminal_poll_cursor += len(batch)
+            for session in batch:
+                try:
+                    session.poll()
+                except OSError:
+                    session.close()
+        if self._active_terminal() is not None and self._selected_inspector_visible():
+            self._sync_terminal_view()
+
+    def _sync_terminal_view(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            terminal = self.query_one("#selected-terminal", DashboardTerminal)
+            logs = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+            copy_button = self.query_one("#selected-logs-copy", Button)
+        except NoMatches:
+            # Modal screens and teardown may temporarily hide the inspector.
+            return
+        session = self._active_terminal()
+        tooltip = "Copy terminal output" if session is not None else "Ctrl/Cmd+C"
+        if copy_button.tooltip != tooltip:
+            copy_button.tooltip = tooltip
+        if terminal.display != (session is not None):
+            terminal.display = session is not None
+        if logs.display != (session is None):
+            logs.display = session is None
+        if session is None:
+            self._terminal_render_key = None
+            return
+        viewport = terminal.scrollable_content_region
+        if viewport.width > 0 and viewport.height > 0:
+            session.resize(viewport.width, viewport.height)
+        row = self._selected_row()
+        index = self._terminal_windows[row.uid]
+        label = f" TERMINAL {index + 1}/{len(self._terminals[row.uid])} · {session.label} "
+        if terminal.border_title != label:
+            terminal.border_title = label
+        subtitle = f" exited {session.returncode} · Ctrl+D close " if session.returncode is not None else " Ctrl+T new · ←/→ windows · Ctrl+D close "
+        if terminal.border_subtitle != subtitle:
+            terminal.border_subtitle = subtitle
+        key = (id(session), session.revision, self._terminal_has_focus())
+        if key != self._terminal_render_key:
+            first_line = max(0, session.screen.history_rows_seen + session.screen.lines - max(TERMINAL_SCROLLBACK_LINES, session.screen.lines))
+            terminal.update_screen(session.render(cursor=self._terminal_has_focus(), scrollback=True), source=(id(session), first_line))
+            self._terminal_render_key = key
+
+    def _move_selected_window(self, amount: int) -> None:
+        row = self._selected_row()
+        if row is None:
+            return
+        attempts = self._selected_attempts(row)
+        sessions = self._terminals.get(row.uid, [])
+        index = self._terminal_windows.get(row.uid)
+        current = len(attempts) + index if index is not None else self.state.selected_attempt_index
+        if current < 0:
+            current = max(0, len(attempts) - 1)
+        total = len(attempts) + len(sessions)
+        if not total:
+            return
+        target = max(0, min(total - 1, current + amount))
+        if target < len(attempts):
+            self._terminal_windows[row.uid] = None
+            self.state.selected_attempt_index = target
+            self.state.logs_auto_follow = True
+            self._ensure_selected_terminal_logs(row)
+        else:
+            self._terminal_windows[row.uid] = target - len(attempts)
+        self._render_selected()
+        self._sync_terminal_view()
+        self.call_after_refresh(self._focus_selected_section)
 
     def _move_selected_attempt(self, amount: int) -> None:
         row = self._selected_row()
@@ -2888,7 +3096,7 @@ class FalconDashboard(App):
             # deterministic visual/scroll fixtures remain useful without
             # starting fake subprocesses; wide mode still uses the nested
             # inspector below to exercise the responsive layout.
-            if self.log_manager is None and not self._wide_layout:
+            if self.log_manager is None and not self._wide_layout and not self._terminals.get(row.uid):
                 compact_content.display = True
                 inspector.display = False
                 legacy_overview = Table.grid(expand=True, padding=(0, 2))
@@ -3573,6 +3781,10 @@ class FalconDashboard(App):
                 if self._selected_inspector_visible()
                 else f"↑/↓ Change Job   v Panes   {pane_action}   Tab Next pane   r Refresh   q Quit"
             )
+            if self._terminal_has_focus():
+                value = "Ctrl+T New terminal   Ctrl+D Close terminal   ←/→ Windows   Alt+←/→ Cursor   Ctrl+C Copy selection / interrupt"
+            elif self._active_terminal() is not None:
+                value = "k Kill   c Clean   Ctrl+T New terminal   " + value
         elif self.state.focused_pane == "resources":
             zoom = round(100 / self.state.resource_zoom)
             if self.state.expanded_pane == "resources":
@@ -3873,12 +4085,24 @@ class FalconDashboard(App):
             self._scroll_history(-1)
 
     def action_kill_or_up(self) -> None:
-        if self.state.focused_pane == "jobs":
-            self.action_kill()
-        else:
-            self.action_up()
+        self.action_kill()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        if action in {"new_terminal", "close_terminal"} and isinstance(self.screen, ModalScreen):
+            return False
+        if self._terminal_has_focus():
+            if action == "copy_or_quit":
+                return bool(self.query_one("#selected-terminal", DashboardTerminal).selection_for_copy())
+            return action in {"new_terminal", "close_terminal"}
+        # Global job actions must not intercept typing or stack dialogs.
+        if action == "kill" and (isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input)):
+            return False
+        return True
 
     def action_left(self) -> None:
+        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+            self._move_selected_window(-1)
+            return
         if (
             self.log_manager is not None
             and self.state.focused_pane == "selected"
@@ -3892,6 +4116,9 @@ class FalconDashboard(App):
             self._scroll_history(1)
 
     def action_right(self) -> None:
+        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+            self._move_selected_window(1)
+            return
         if (
             self.log_manager is not None
             and self.state.focused_pane == "selected"

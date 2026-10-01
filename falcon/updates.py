@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -188,18 +189,36 @@ def pip_command(source: str = UPDATE_SOURCE) -> list[str]:
     return command
 
 
+def uv_tool_environment() -> Optional[Path]:
+    """A uv-created venv alone is not a tool; require its installation receipt."""
+    prefix = Path(sys.prefix).resolve()
+    return prefix if (prefix / "uv-receipt.toml").is_file() else None
+
+
 def install_update(
     source: str = UPDATE_SOURCE,
     *,
     runner: Optional[Callable[..., object]] = None,
 ) -> int:
-    """Install the latest Falcon source and return pip's exit status."""
+    """Update through the owning installer and return its exit status."""
 
     run = runner or subprocess.run
+    tool = uv_tool_environment()
+    if tool is not None:
+        uv = shutil.which("uv")
+        if uv is None:
+            raise UpdateError("Falcon is managed by uv, but uv is not on PATH; restore uv and run 'uv tool upgrade falcon-k8s'")
+        # Target this tool root even when the invoking shell overrides it.
+        # uv preserves the receipt's source, constraints, and extra dependencies.
+        command = [uv, "tool", "upgrade", tool.name]
+        options = {"env": {**os.environ, "UV_TOOL_DIR": str(tool.parent)}}
+    else:
+        command = pip_command(source)
+        options = {}
     try:
-        result = run(pip_command(source), check=False)
+        result = run(command, check=False, **options)
     except OSError as exc:
-        raise UpdateError(f"could not run pip: {exc}") from exc
+        raise UpdateError(f"could not run {'uv' if tool else 'pip'}: {exc}") from exc
     return int(getattr(result, "returncode", 1))
 
 
