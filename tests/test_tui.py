@@ -2695,6 +2695,51 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 total,
             )
 
+    def test_combined_vram_pie_uses_requested_device_memory(self) -> None:
+        snapshot = demo_cluster_snapshot("mixed")
+        app = FalconResourcesApp(DemoCollector("mixed"))
+        app.nodes = list(snapshot.nodes)
+        sizes = {node.name: (node.gpu_memory_bytes_per_device or 0) / (1024**3)
+                 for node in snapshot.nodes}
+        expected = {}
+        for consumer in app._allocation_consumers():
+            value = consumer.requested.gpu_count * sizes[consumer.node_name]
+            if value > 0:
+                expected[consumer.namespace] = expected.get(consumer.namespace, 0) + value
+        self.assertEqual(dict(app._cluster_namespace_values("vram")), expected)
+        self.assertNotEqual(app._cluster_namespace_values("gpu"), app._cluster_namespace_values("vram"))
+        app.nodes = [replace(node, gpu_memory_bytes_per_device=None) for node in app.nodes]
+        self.assertEqual(app._cluster_namespace_values("vram"), ())
+
+    async def test_v_updates_combined_gpu_pie_without_changing_focus(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.pause(0.5)
+            before_cpu = app._cluster_namespace_values("cpu")
+            before_memory = app._cluster_namespace_values("memory")
+            with patch("falcon.resources_ui.render_namespace_pie", wraps=render_namespace_pie) as render:
+                await pilot.press("v")
+                await pilot.pause()
+                self.assertEqual(app.state.namespace_basis, "vram")
+                self.assertEqual(app.state.active_pane, "nodes")
+                self.assertIn("VRAM&#160;BY&#160;NAMESPACE", app.export_screenshot(simplify=True))
+                self.assertTrue(any(call.args[0] == app._cluster_namespace_values("vram")
+                                    and call.kwargs.get("unit") == "G" for call in render.call_args_list))
+                self.assertEqual(app._cluster_namespace_values("cpu"), before_cpu)
+                self.assertEqual(app._cluster_namespace_values("memory"), before_memory)
+                app.state.active_pane = "node-pies"
+                app.state.view = "gpu-allocations"
+                app.state.selected_cluster_pie = "gpu"
+                app._render_all()
+                await pilot.press("enter")
+                self.assertEqual(app.state.expanded_panels["gpu-allocations"], "pie")
+                await pilot.press("v")
+                self.assertEqual(app.state.namespace_basis, "gpu")
+                self.assertEqual(app._allocation_basis(), "gpu")
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertIn("GPU&#160;BY&#160;NAMESPACE", app.export_screenshot(simplify=True))
+
     async def test_node_expansion_reconciles_consumers_at_narrow_size(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(80, 22)) as pilot:

@@ -3154,11 +3154,17 @@ class FalconResourcesApp(App[None]):
         """Aggregate requested resources by namespace across all nodes."""
 
         values: defaultdict[str, float] = defaultdict(float)
+        per_device_gib = {
+            node.name: max(0.0, (node.gpu_memory_bytes_per_device or 0) / (1024**3))
+            for node in self.nodes
+        } if basis == "vram" else {}
         for consumer in self._allocation_consumers():
             if basis == "cpu":
                 value = max(0.0, float(consumer.requested.cpu_cores))
             elif basis == "memory":
                 value = max(0.0, consumer.requested.memory_bytes / (1024**3))
+            elif basis == "vram":
+                value = max(0.0, float(consumer.requested.gpu_count)) * per_device_gib.get(consumer.node_name, 0.0)
             else:
                 value = max(0.0, float(consumer.requested.gpu_count))
             if value > 0:
@@ -3188,7 +3194,11 @@ class FalconResourcesApp(App[None]):
         for panel_width, (title, basis, unit, empty_label) in zip(
             column_widths, definitions
         ):
-            categories = self._cluster_namespace_values(basis)
+            chart_basis = basis
+            if basis == "gpu" and self.state.namespace_basis == "vram":
+                chart_basis = "vram"
+                title, unit, empty_label = "VRAM BY NAMESPACE", "G", "No VRAM allocation"
+            categories = self._cluster_namespace_values(chart_basis)
             panels.append(
                 Panel(
                     Align.center(
