@@ -53,7 +53,7 @@ LAUNCH_OPTIONS = [
 ]
 
 OPTIONS: Dict[str, List[str]] = {
-    "sandbox": [*LAUNCH_OPTIONS, "--read-only", "--agent-bin", "--permissions", "--detach", "status", "resume", "stop"],
+    "sandbox": [*LAUNCH_OPTIONS, "--read-only", "--agent-bin", "--permissions", "--detach", "--auto-continue", "status", "resume", "stop"],
     "jobs": [
         "--output", "--limit", "--status", "--gpu", "--node", "--namespace",
     ],

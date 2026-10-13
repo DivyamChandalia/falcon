@@ -251,6 +251,8 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     sandbox.add_argument("--agent-bin", metavar="PATH")
     sandbox.add_argument("--permissions", choices=("full", "agent"), default="full")
     sandbox.add_argument("--detach", action="store_true")
+    sandbox.add_argument("--auto-continue", action="store_true",
+                         help="Continue Codex after usage limits reset, only while detached")
     sandbox.epilog = "Examples: falcon sandbox -- codex; falcon sandbox status|resume|stop NAME"
     for action in sandbox._actions:
         if action.dest == "command":

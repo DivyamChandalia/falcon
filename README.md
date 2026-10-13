@@ -258,6 +258,10 @@ executable is not on PATH. `--detach` leaves the agent running without opening
 the terminal. Detach from tmux with **Ctrl+B, D** to keep it running;
 **Ctrl+C** stops the agent and cleans up the sandbox Job (not its child Jobs).
 
+For Codex, add `--auto-continue` to wait for usage limits to reset and send
+`continue` while detached. `falcon sandbox status NAME` shows the wait state;
+leave the agent input empty before detaching. See the [details](docs/sandbox.md#continue-after-codex-usage-limits-reset).
+
 Without `--name`, the Job is named `falcon-{harness}-{working-directory-name}`,
 for example `falcon-codex-jet-k8s`.
 

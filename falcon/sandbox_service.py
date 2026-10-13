@@ -567,6 +567,8 @@ def launch_session(args: argparse.Namespace, config: dict) -> int:
     if command[:1] == ["--"]:
         command.pop(0)
     agent, executable = discover_agent(command, args.agent_bin)
+    if getattr(args, "auto_continue", False) and agent != "codex":
+        raise ValueError("--auto-continue currently supports Codex only")
     name = args.name or default_session_name(agent, Path.cwd())
     namespace = args.namespace or config["cluster"]["namespace"]
     policy = make_policy(name, namespace, str(Path.cwd()), args.read_only)
@@ -650,6 +652,7 @@ def launch_session(args: argparse.Namespace, config: dict) -> int:
         "session": name, "namespace": namespace, "workspace": policy.workspace,
         "record": str(Path(policy.workspace) / ".falcon/sandbox" / name / "agent.json"),
         "permissions": args.permissions, "token": token, "worker_token": worker_token,
+        "auto_continue": bool(getattr(args, "auto_continue", False)),
     }
     payload = {"gpu": args.gpu, "gpus": args.gpus, "cpu": args.cpu if args.gpu else args.cpu or "1", "memory": args.memory if args.gpu else args.memory or "1Gi", "shm_size": args.shm_size, "shm_percent": args.shm_percent, "maximize": args.maximize}
     gpu, plan = resource_plan(payload, config, namespace)
@@ -754,6 +757,11 @@ def print_session_status(status: dict[str, Any], workspace: str) -> None:
     print(f"Workspace: {workspace}")
     print(f"Job:       {phase}")
     print(f"Agent:     {agent.get('state', 'not started')}" + (f" (exit {agent['exit_code']})" if "exit_code" in agent else ""))
+    if agent.get("auto_continue"):
+        continuation = agent["auto_continue"]
+        print(f"Continue:  {continuation.get('status', 'watching')}")
+        if continuation.get("reset_at"):
+            print("Reset:     " + time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(continuation["reset_at"])))
     print(f"Broker:    {broker.get('state', 'not started')}")
     if local.get("reason"):
         print(f"Note:      {local['reason']}")

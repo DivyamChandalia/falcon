@@ -11,8 +11,12 @@ import base64
 import hmac
 import io
 import json
+import math
 import os
+import re
+import selectors
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -27,6 +31,222 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 MAX_BODY = 256 * 1024
 PORT = 8765
+
+
+def codex_rate_limits(spec: dict) -> dict:
+    """Read quota only; never start a turn, redeem credits, or change login."""
+    command = [spec["argv"][0], "app-server", "--listen", "stdio://"]
+    # Keep provider/config overrides (including the container-local SQLite
+    # path), without passing TUI-only permission or resume flags to app-server.
+    arguments = spec["argv"][1:]
+    for index, argument in enumerate(arguments):
+        if argument in {"-c", "--config"} and index + 1 < len(arguments):
+            command.extend([argument, arguments[index + 1]])
+    environment = dict(os.environ)
+    environment.pop("FALCON_SANDBOX_WORKER_TOKEN", None)
+    process = subprocess.Popen(command, cwd=spec["workspace"], env=environment,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + 15
+    buffer = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def send(value: dict) -> None:
+            process.stdin.write((json.dumps(value) + "\n").encode())
+            process.stdin.flush()
+
+        def reply(identifier: int) -> dict:
+            while time.monotonic() < deadline:
+                while b"\n" in buffer:
+                    line, _, remaining = buffer.partition(b"\n")
+                    buffer[:] = remaining
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("Invalid Codex quota response")
+                    if value.get("id") == identifier:
+                        if "error" in value or not isinstance(value.get("result"), dict):
+                            raise ValueError("Codex quota query failed")
+                        return value["result"]
+                if not selector.select(max(0, deadline - time.monotonic())):
+                    break
+                chunk = os.read(process.stdout.fileno(), 8192)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                if len(buffer) > MAX_BODY:
+                    raise ValueError("Codex quota response exceeds limit")
+            raise ValueError("Codex quota query timed out")
+
+        try:
+            send({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "falcon-sandbox", "version": "1"}}})
+            reply(1)
+            send({"method": "initialized"})
+            send({"id": 2, "method": "account/rateLimits/read"})
+            return reply(2)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+            process.stdin.close()
+            process.stdout.close()
+
+
+def quota_reset(limits: dict) -> tuple[bool, float | None]:
+    """Fail closed on unknown snapshots; wait for every exhausted window."""
+    snapshot = limits.get("rateLimits")
+    if not isinstance(snapshot, dict):
+        raise ValueError("Codex did not provide quota windows")
+    exhausted = []
+    windows = 0
+    for name in ("primary", "secondary"):
+        window = snapshot.get(name)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            raise ValueError("Unknown Codex quota window")
+        used = window.get("usedPercent")
+        reset = window.get("resetsAt")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or used < 0:
+            raise ValueError("Unknown Codex quota usage")
+        windows += 1
+        if used >= 100:
+            if isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset) or reset <= 0:
+                raise ValueError("Codex did not provide a reset time")
+            exhausted.append(float(reset))
+    if not windows:
+        raise ValueError("Codex did not provide quota windows")
+    # A server-classified credit/billing/unknown limit must not be interpreted
+    # as available quota merely because percentage windows are below 100%.
+    if not exhausted and snapshot.get("rateLimitReachedType"):
+        raise ValueError("Codex reports a non-window limit")
+    return bool(exhausted), max(exhausted) if exhausted else None
+
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def empty_codex_input(screen: str) -> bool:
+    """Allow empty input or styled placeholder, never ordinary draft text."""
+    lines = [line for line in screen.splitlines()
+             if SGR.sub("", line).strip().startswith("›")]
+    if not lines:
+        return False
+    line = lines[-1].split("›", 1)[1]
+    muted = False
+    position = 0
+    for match in SGR.finditer(line):
+        if line[position:match.start()].strip() and not muted:
+            return False
+        codes = [int(code or "0") for code in match.group(1).split(";")]
+        if 0 in codes or 22 in codes or 39 in codes:
+            muted = False
+        if 2 in codes or 90 in codes or codes == [38, 5, 8]:
+            muted = True
+        elif 38 in codes or any(30 <= code <= 37 for code in codes):
+            muted = False
+        position = match.end()
+    return not line[position:].strip() or muted
+
+
+class AutoContinue:
+    """One continuation per confirmed reset, scoped to the original tmux pane."""
+
+    def __init__(self, spec: dict):
+        self.spec = spec
+        self.path = Path(spec["record"]).with_name("auto-continue.json")
+        try:
+            self.state = json.loads(self.path.read_text())
+            if not isinstance(self.state, dict):
+                self.state = {}
+        except (OSError, ValueError):
+            self.state = {}
+        self.next_check = 0.0
+        self.pending = self.state.get("reset_at")
+        if self.pending is not None and (isinstance(self.pending, bool) or not isinstance(self.pending, (int, float)) or not math.isfinite(self.pending) or self.pending <= 0):
+            self.pending = None
+            self.state.pop("reset_at", None)
+        self.pane = None
+
+    def tmux(self, *arguments: str) -> str:
+        result = subprocess.run(["tmux", "-L", "falcon", *arguments],
+                                capture_output=True, text=True, check=True, timeout=5)
+        if len(result.stdout) > MAX_BODY:
+            raise ValueError("tmux response exceeds limit")
+        return result.stdout.strip()
+
+    def tick(self, status: dict, now: float) -> dict:
+        if status.get("state") != "running" or not status.get("session_id"):
+            return {"status": "waiting for running Codex session"}
+        if now < self.next_check:
+            return dict(self.state)
+        self.next_check = now + 5
+        try:
+            pane = self.tmux("display-message", "-p", "-t", "agent:0.0", "#{pane_id}")
+            if not pane.startswith("%") or not pane[1:].isdigit():
+                raise ValueError("Cannot identify agent pane")
+            if self.pane is not None and pane != self.pane:
+                raise ValueError("Agent pane changed; automatic input disabled")
+            self.pane = pane
+            screen = self.tmux("capture-pane", "-p", "-e", "-t", pane)
+            text = SGR.sub("", screen).replace("’", "'")
+            notice = re.search(r"(?im)^\s*[■●•]?\s*you've\s+hit\s+your\s+(?:usage\s+)?limit\b", text) is not None
+            if not notice:
+                self.pending = None
+                self.state.pop("reset_at", None)
+                self.state["status"] = "watching for usage limit"
+            elif self.pending is None:
+                exhausted, reset = quota_reset(codex_rate_limits(self.spec))
+                self.next_check = now + 60
+                if exhausted and reset != self.state.get("last_sent_reset"):
+                    self.pending = reset
+                    self.state.update(status="waiting for quota reset", reset_at=reset)
+                else:
+                    self.state["status"] = "no new confirmed exhausted quota window"
+            elif now >= self.pending + 10:
+                # Never type into an attached session or tmux copy mode.
+                attached = self.tmux("display-message", "-p", "-t", pane,
+                                     "#{session_attached}:#{pane_in_mode}:#{pane_dead}")
+                if attached != "0:0:0":
+                    self.state["status"] = "reset due; detach to allow continuation"
+                else:
+                    # A detached user can still leave an unfinished draft.
+                    # Unknown composer content is safer to leave untouched.
+                    if not empty_codex_input(screen):
+                        self.state["status"] = "reset due; clear the input draft before detaching"
+                    else:
+                        exhausted, _ = quota_reset(codex_rate_limits(self.spec))
+                        self.next_check = now + 60
+                        if exhausted:
+                            self.state["status"] = "waiting for confirmed available quota"
+                        else:
+                            # Recheck after the network query: attachment or
+                            # manual progress during it invalidates this turn.
+                            if self.tmux("display-message", "-p", "-t", pane,
+                                         "#{session_attached}:#{pane_in_mode}:#{pane_dead}") != "0:0:0" or self.tmux("capture-pane", "-p", "-e", "-t", pane) != screen:
+                                self.state["status"] = "input changed during quota check; waiting"
+                                atomic_json(self.path, self.state)
+                                return dict(self.state)
+                            # Record before sending: a crash between writing
+                            # and input delivery must not duplicate a prompt.
+                            self.state.update(status="continue sent", last_sent_reset=self.pending)
+                            self.state.pop("reset_at", None)
+                            atomic_json(self.path, self.state)
+                            self.pending = None
+                            self.tmux("send-keys", "-t", pane, "-l", "continue")
+                            self.tmux("send-keys", "-t", pane, "Enter")
+            atomic_json(self.path, self.state)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.state["status"] = "automatic continuation paused: could not safely verify quota/pane"
+            self.next_check = now + 60
+        return dict(self.state)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -436,10 +656,13 @@ def supervise(spec_path: Path) -> None:
     threading.Thread(target=relay.serve_forever, daemon=True).start()
     executable = shlex.join([sys.executable, str(Path(__file__)), "agent", str(spec_path)])
     subprocess.run(["tmux", "-L", "falcon", "-f", str(spec_path.parent / "tmux.conf"), "new-session", "-d", "-s", "agent", executable], check=True)
+    continuation = AutoContinue(spec) if spec.get("auto_continue") and spec["agent"] == "codex" else None
     try:
         while True:
             try:
                 status = session_status(record)
+                if continuation is not None:
+                    status["auto_continue"] = continuation.tick(status, time.time())
                 with relay.lock:
                     relay.status = status
             except (OSError, ValueError):

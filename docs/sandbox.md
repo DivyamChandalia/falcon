@@ -102,6 +102,39 @@ Ordinary agent exits stop the parent Job and are not retried. Arbitrary loop scr
 not automatically replayed after Pod loss. An exhausted Job must be stopped
 and relaunched with the agent's explicit resume command.
 
+### Continue after Codex usage limits reset
+
+Opt in when launching a Codex sandbox:
+
+```console
+falcon sandbox --auto-continue -- codex
+# Start your task, then detach with Ctrl+B, D when appropriate.
+falcon sandbox status falcon-codex-WORKING-DIRECTORY
+```
+
+The in-Pod supervisor recognizes Codex's usage-limit notice and reads structured
+quota windows through `codex app-server`. It waits until all exhausted windows
+reset, adds a ten-second safety margin, and confirms quota is available before
+typing `continue` into the original agent pane. Status shows the reset time and
+whether automatic continuation is waiting or paused. This works without an
+attached terminal; the launch-machine broker must still run for restricted child
+Jobs and normal cleanup.
+
+Automatic input is sent **only while detached**, outside tmux copy mode, with an
+empty Codex input field (a dim/gray placeholder is allowed). An unfinished draft,
+unknown composer styling, changed pane, unavailable quota information, billing
+limit, or unsupported app-server leaves the session untouched. Checks are bounded
+and quota queries are at most once per minute. There is at most one automatic
+submission per reset window; state is retained across Pod replacement. Manual
+progress that clears the limit notice cancels a pending continuation.
+
+This option currently supports **Codex only** and applies to newly launched
+sessions, not already-running Jobs. It never buys credits, redeems reset credits,
+changes models, or modifies provider limits. Stopping or exiting the sandbox stops
+the watcher. The detection uses Codex's visible limit notice, so future terminal
+UI changes may require a Falcon update; quota reset times are not guessed from
+human-readable dates. See the official [Codex app-server quota interface](https://learn.chatgpt.com/docs/app-server).
+
 ## Tools, permissions, and persistent settings
 
 Falcon resolves the local executable and mounts its installation read-only.
