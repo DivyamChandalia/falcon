@@ -72,8 +72,18 @@ last successful launch or inspected target when available.
 
 ```text
 falcon kill JOB [JOB...]
+falcon kill 'benchmark-*' '*-ascformer-*' --dry-run
 falcon clean
 ```
+
+`kill` accepts exact names and shell-style wildcard patterns (`*`, `?`, `[abc]`),
+resolved against Jobs in the selected namespace. Quote patterns; shells may
+expand unquoted globs locally or reject unmatched globs before Falcon runs.
+All patterns resolve before deletion; an unmatched argument aborts a wildcard
+command without deleting anything. Overlapping targets are deduplicated.
+`--dry-run` prints the resolved targets and their deletion route without mutation
+or Coder authentication; `--output json` includes `dry_run: true` and `killed: false`.
+Without arguments, the existing last-Job behavior is retained, including in dry-run.
 
 `falcon kill` recognizes Coder-owned Job names in the form
 `coder-<current-user>-<workspace>`. It submits Coder's native workspace delete

@@ -60,6 +60,14 @@ succeeded or failed attempts Falcon loads the equivalent of
 with the newest active Pod selected initially. Captured output is bounded to
 200 lines per Pod and expires from memory after 24 hours.
 
+With the Logs or terminal viewport focused, `Ctrl+F` opens an inline search bar
+for its retained output. Search is literal and case-insensitive, highlights all
+matches, and scrolls to the active match. `Enter` moves to the next match and
+`Shift+Enter` moves backward, wrapping at either end; `Esc` closes the bar and
+restores viewport focus. Typing in the search bar never sends shell commands or
+filters the Jobs table. Searching Logs pauses automatic follow; `End` resumes
+follow after closing search. Changing Jobs or output windows clears highlighting.
+
 With Selected Job focused, `Ctrl+T` opens a separate interactive `kubectl exec`
 session in the selected running Pod/container, replacing the log viewport with
 a terminal. If the selected attempt has finished, Falcon uses its newest running
@@ -108,6 +116,12 @@ Device metrics and per-process GPU utilization use persistent `nvidia-smi`
 streams; process names and allocated VRAM are reconciled every five seconds.
 
 ## Resources
+
+Selected Node consumers and Namespace/Workload Allocation include a fixed
+`AGE` column with at most three characters of text. It shows the largest elapsed unit (`59s`, `1m`,
+`1h`, `4d`, `1w`), capped at `99w`, as of the resource snapshot. Job creation
+time takes precedence over Pod creation time; unknown ages show `-`, and
+namespace aggregate rows are blank.
 
 - `↑` / `↓`, `j` / `k`: navigate the active side
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump

@@ -63,7 +63,7 @@ OPTIONS: Dict[str, List[str]] = {
     "events": ["-f", "--follow", "--output", "--limit", "--namespace"],
     "top": ["--namespace"],
     "metrics": ["--interval", "--namespace"],
-    "kill": ["--output", "--namespace"],
+    "kill": ["--output", "--namespace", "--dry-run"],
     "dashboard": ["--demo", "--job", "--color"],
     "resources": [
         "--output", "--node", "--gpu", "--limit", "--consumer-limit", "--demo",

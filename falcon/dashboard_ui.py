@@ -54,6 +54,8 @@ from .dashboard_terminal import (
     TerminalSession,
     exec_command,
 )
+from .output_search import highlight_strip
+from .output_search import matches as output_matches
 from .planning import GPU_MODEL_DISPLAY_ORDER, canonical_gpu
 from .theme import (
     BACKGROUND,
@@ -496,6 +498,8 @@ class SelectedJobScroll(RichLog):
     # and the Pod arrows) handle keys instead of VerticalScroll's generic
     # bindings, which would bypass the selected-section state.
     BINDINGS = []
+    search_query = ""
+    search_match = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(
@@ -844,6 +848,9 @@ class SelectedJobScroll(RichLog):
             scroll_x,
             self.scrollable_content_region.width,
         ).apply_style(self.rich_style)
+        if self.search_query and 0 <= content_y < len(self.lines):
+            strip = highlight_strip(strip, self.lines[content_y].text,
+                                    self.search_query, content_y, scroll_x, self.search_match)
         selection = self._manual_selection
         if selection is None:
             selection = self.text_selection
@@ -1100,6 +1107,9 @@ class SelectedJobInspector(Container):
                 compact=True,
                 flat=True,
             )
+        with Horizontal(id="output-search-bar"):
+            yield Input(placeholder="Find output · Enter next · Shift+Enter previous · Esc close", id="output-search-input")
+            yield Static("0 matches", id="output-search-count")
         yield SelectedJobScroll(id="selected-logs-scroll")
         yield DashboardTerminal(id="selected-terminal")
 
@@ -1548,6 +1558,9 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; padding: 0 1; }}
 #controls {{ height: 1; color: {GRAY}; padding: 0 1; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
+#output-search-bar {{ display: none; height: 1; }}
+#output-search-input {{ width: 1fr; height: 1; border: none; padding: 0; }}
+#output-search-count {{ width: 16; height: 1; color: {CYAN}; }}
 #dashboard-body {{ width: 1fr; height: 1fr; }}
 DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; scrollbar-visibility: hidden; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
@@ -1599,6 +1612,8 @@ class FalconDashboard(App):
         Binding("super+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("tab", "next_pane", "Next pane", priority=True),
         Binding("ctrl+t", "new_terminal", "New terminal", show=False, priority=True),
+        Binding("ctrl+f", "find_output", "Find output", show=False, priority=True),
+        Binding("shift+enter", "previous_output_match", "Previous match", show=False, priority=True),
         Binding("ctrl+w", "close_terminal", "Close terminal", show=False, priority=True),
         Binding("ctrl+d", "close_terminal", "Close terminal", show=False, priority=True),
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
@@ -1696,6 +1711,9 @@ class FalconDashboard(App):
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
         self.event_search = ""
+        self._output_search_target = None
+        self._output_matches = []
+        self._output_match_index = -1
         self.histories: Dict[str, Deque[MetricPoint]] = {}
         self.summary_history: Deque[MetricPoint] = deque(maxlen=120)
         self._refreshing = False
@@ -2812,6 +2830,7 @@ class FalconDashboard(App):
         return isinstance(self.focused, DashboardTerminal) and self._active_terminal() is not None
 
     def action_new_terminal(self) -> None:
+        self._close_output_search(restore_focus=False)
         if self.state.focused_pane != "selected":
             return
         row = self._selected_row()
@@ -2854,6 +2873,7 @@ class FalconDashboard(App):
         self.call_after_refresh(self._focus_selected_section)
 
     def action_close_terminal(self) -> None:
+        self._close_output_search(restore_focus=False)
         row = self._selected_row()
         session = self._active_terminal()
         if row is None or session is None:
@@ -2922,13 +2942,14 @@ class FalconDashboard(App):
         subtitle = f" exited {session.returncode} · Ctrl+D close " if session.returncode is not None else " Ctrl+T new · ←/→ windows · Ctrl+D close "
         if terminal.border_subtitle != subtitle:
             terminal.border_subtitle = subtitle
-        key = (id(session), session.revision, self._terminal_has_focus())
+        key = (id(session), session.revision, self._terminal_has_focus(), terminal.search_query, terminal.search_match)
         if key != self._terminal_render_key:
             first_line = max(0, session.screen.history_rows_seen + session.screen.lines - max(TERMINAL_SCROLLBACK_LINES, session.screen.lines))
             terminal.update_screen(session.render(cursor=self._terminal_has_focus(), scrollback=True), source=(id(session), first_line))
             self._terminal_render_key = key
 
     def _move_selected_window(self, amount: int) -> None:
+        self._close_output_search(restore_focus=False)
         row = self._selected_row()
         if row is None:
             return
@@ -3965,6 +3986,9 @@ class FalconDashboard(App):
             self.call_after_refresh(self._focus_selected_section)
 
     def action_escape(self) -> None:
+        if self._output_search_target is not None:
+            self._close_output_search()
+            return
         # Application bindings remain active while a ModalScreen is mounted in
         # the Textual version supported by Falcon.  Handle Escape here as well
         # as on each dialog so it can never leak through to the dashboard.
@@ -3997,6 +4021,7 @@ class FalconDashboard(App):
             self._selection_changed()
 
     def _selection_changed(self) -> None:
+        self._close_output_search(restore_focus=False)
         self.state.events_scroll_offset = 0
         self.state.events_auto_follow = True
         self.state.resource_scroll_offset = 0
@@ -4088,6 +4113,15 @@ class FalconDashboard(App):
         self.action_kill()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        if action == "copy_or_quit" and getattr(self.focused, "id", None) == "output-search-input":
+            return False
+        if action == "find_output":
+            return not isinstance(self.screen, ModalScreen) and (
+                self._selected_logs_focused()
+                or getattr(self.focused, "id", None) == "output-search-input"
+            )
+        if action == "previous_output_match":
+            return getattr(self.focused, "id", None) == "output-search-input"
         if action in {"new_terminal", "close_terminal"} and isinstance(self.screen, ModalScreen):
             return False
         if self._terminal_has_focus():
@@ -4369,7 +4403,81 @@ class FalconDashboard(App):
         control.display = True
         control.focus()
 
+    def action_find_output(self) -> None:
+        self.screen.clear_selection()
+        target_id = "selected-terminal" if self._active_terminal() is not None else "selected-logs-scroll"
+        self._output_search_target = target_id
+        self.query_one("#output-search-bar").display = True
+        control = self.query_one("#output-search-input", Input)
+        control.focus()
+        self._search_output(0, reset=True)
+
+    def _close_output_search(self, *, restore_focus: bool = True) -> None:
+        target_id = self._output_search_target
+        if target_id is None:
+            return
+        self._output_search_target = None
+        self._output_matches = []
+        self._output_match_index = -1
+        try:
+            self.query_one("#output-search-bar").display = False
+        except NoMatches:
+            return
+        for selector in ("#selected-logs-scroll", "#selected-terminal"):
+            target = self.query_one(selector)
+            target.search_query = ""
+            target.search_match = None
+            target.refresh()
+        if restore_focus:
+            self.set_focus(self.query_one(f"#{target_id}"), scroll_visible=False)
+        self._sync_terminal_view()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "output-search-input" and self._output_search_target:
+            self._search_output(0, reset=True)
+            event.stop()
+
+    def action_previous_output_match(self) -> None:
+        self._search_output(-1)
+
+    def _search_output(self, amount: int, *, reset: bool = False) -> None:
+        if self._output_search_target is None:
+            return
+        target = self.query_one(f"#{self._output_search_target}")
+        query = self.query_one("#output-search-input", Input).value
+        if isinstance(target, SelectedJobScroll):
+            lines = [line.text for line in target.lines]
+        else:
+            session = self._active_terminal()
+            lines = session.render(cursor=False, scrollback=True).plain.split("\n") if session else []
+        matches = output_matches(lines, query)
+        old_match = self._output_matches[self._output_match_index] if self._output_matches and self._output_match_index >= 0 else None
+        if reset:
+            index = 0
+        elif old_match in matches:
+            index = matches.index(old_match) + amount
+        else:
+            index = 0 if amount >= 0 else -1
+        self._output_matches = matches
+        self._output_match_index = index % len(matches) if matches else -1
+        target.search_query = query
+        target.search_match = matches[self._output_match_index] if matches else None
+        self.query_one("#output-search-count", Static).update(
+            f"{self._output_match_index + 1}/{len(matches)}" if matches else ("No matches" if query else "Type to search")
+        )
+        if isinstance(target, SelectedJobScroll):
+            self.state.logs_auto_follow = False if query else self.state.logs_auto_follow
+            target.refresh()
+        else:
+            self._sync_terminal_view()
+        if target.search_match:
+            target.call_after_refresh(target.scroll_to, y=target.search_match[0], animate=False, force=True)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "output-search-input":
+            self._search_output(1)
+            event.stop()
+            return
         if event.input.id != "search-input":
             return
         if "events" in event.input.placeholder.lower():

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.7 — 2026-10-13
+
+- Added Ctrl+F search in Dashboard logs and terminals, with highlighted
+  matches, next/previous navigation, and isolated search input.
+- Added quoted wildcard patterns and `--dry-run` to `falcon kill`, with
+  namespace-scoped matching, deduplication, and preserved Coder handling.
+- Added compact Job ages to Resources tables and fixed GPU namespace pies
+  switching between GPU count and VRAM with `v`.
+
 ## 0.4.6 — 2026-10-01
 
 - Added interactive Dashboard terminals: Ctrl+T opens shells, arrows switch

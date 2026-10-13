@@ -9,8 +9,8 @@ Falcon chooses eligible GPU nodes, sizes CPU and memory from live capacity,
 carries your working directory and Python environment into the container, and
 provides interactive dashboards for jobs and cluster resources.
 
-New in 0.4.6: interactive Dashboard terminals (`Ctrl+T`), Resources workload
-filters (`f`), and updates that support uv tool installations.
+New in 0.4.7: Dashboard output search (`Ctrl+F`), wildcard Job deletion with
+`--dry-run`, and compact Resources Job ages.
 See the [changelog](CHANGELOG.md) for details.
 
 ## Quick start
@@ -114,6 +114,10 @@ new output, supports scrolling through retained lines, and keeps carriage-return
 progress updates such as `tqdm` on the current line. Use `falcon logs JOB` when
 you want a terminal-only log stream.
 
+Press `Ctrl+F` while Logs or a terminal is focused to search retained output.
+Matches are highlighted; `Enter`/`Shift+Enter` moves next/previous and `Esc`
+closes search. Searches are literal and case-insensitive.
+
 With Selected Job focused, `Ctrl+T` opens an interactive shell in its running
 Pod, inside the Logs area. Press it again for another terminal; `←`/`→` switches
 between logs and terminals. `Ctrl+D` (or `Ctrl+W`) closes the current terminal.
@@ -137,6 +141,18 @@ For focused inspection, use:
 | `falcon events JOB` | Kubernetes events |
 | `falcon metrics JOB` | CPU, RAM, GPU, and VRAM metrics |
 | `falcon kill JOB` | remove a Job |
+
+Remove multiple matching Jobs in your configured namespace using quoted patterns:
+
+```console
+falcon kill 'benchmark-*' '*-ascformer-*' --dry-run
+falcon kill 'benchmark-*' '*-ascformer-*'
+```
+
+`--dry-run` previews targets without deleting anything. Patterns support `*`,
+`?`, and character classes; overlapping matches are deleted once. If any pattern
+matches nothing, the entire command stops without deleting anything. Quote
+patterns to prevent your shell expanding them into local filenames.
 
 ## Inspect cluster resources
 

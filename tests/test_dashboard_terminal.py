@@ -175,6 +175,41 @@ class TerminalTests(unittest.TestCase):
 
 
 class TerminalDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_output_search_does_not_send_shell_input(self):
+        row = _job(PodAttempt("pod-live", "pod-uid", "Running", container="trainer"))
+        collector = _Collector(row)
+        collector.namespace = "team"
+        sessions = []
+
+        def factory(command, **kwargs):
+            session = TerminalSession(["/bin/bash", "--noprofile", "--norc", "-i"], **kwargs)
+            sessions.append(session)
+            return session
+
+        app = FalconDashboard(collector, refresh_seconds=999, terminal_factory=factory)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.3)
+            app.action_focus_selected()
+            await pilot.press("ctrl+t")
+            await pilot.pause(0.3)
+            session = sessions[0]
+            session.stream.feed("\r\nneedle one\r\nNEEDLE two\r\n")
+            session.revision += 1
+            app._sync_terminal_view()
+            with patch.object(session, "send") as send:
+                await pilot.press("ctrl+f")
+                self.assertEqual(app.focused.id, "output-search-input")
+                app.focused.value = "needle"
+                await pilot.pause()
+                self.assertEqual(len(app._output_matches), 2)
+                await pilot.press("enter", "shift+enter")
+                send.assert_not_called()
+                await pilot.press("escape")
+                self.assertIsInstance(app.focused, DashboardTerminal)
+                self.assertEqual(app.focused.search_query, "")
+                await pilot.press("x")
+                send.assert_called_once_with(b"x")
+
     async def test_multiple_terminals_input_navigation_and_cleanup(self):
         row = _job(PodAttempt("pod-live", "pod-uid", "Running", container="trainer"))
         collector = _Collector(row)

@@ -1184,6 +1184,82 @@ class InspectionCliTests(CliHarness):
         self.assertEqual(removed_code, EXIT_USAGE)
         self.assertIn("falcon kill JOB", removed_stderr)
 
+    def test_kill_patterns_resolve_all_matches_once_and_deduplicate(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli.kill") as killer:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}}
+                for name in ("benchmark-b", "benchmark-a", "train-ascformer-v2", "unrelated")
+            ]}
+            code, stdout, stderr = self.invoke("kill", "benchmark-*", "*-ascformer-*", "benchmark-a", "--namespace", "team")
+            self.assertEqual((code, stderr), (0, ""))
+            client.assert_called_once_with("team")
+            client.return_value.list_jobs.assert_called_once_with()
+            killer.assert_called_once_with("team", ["benchmark-a", "benchmark-b", "train-ascformer-v2"])
+            self.assertIn("Killed 3 Job", stdout)
+
+    def test_kill_unmatched_pattern_prevents_all_deletions(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            client.return_value.list_jobs.return_value = {"items": [{"metadata": {"name": "benchmark-a"}}]}
+            code, _, stderr = self.invoke("kill", "benchmark-*", "missing-*")
+            self.assertEqual(code, 4)
+            self.assertIn("nothing deleted", stderr)
+            delete.assert_not_called()
+
+    def test_kill_dry_run_resolves_patterns_without_deleting_or_coder_auth(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete, patch("falcon.cli._authenticated_coder_connection") as auth:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}} for name in ("benchmark-a", "coder-user-workspace")
+            ]}
+            code, stdout, stderr = self.invoke("kill", "*", "--dry-run", "--output", "json")
+            self.assertEqual((code, stderr), (0, ""))
+            data = json.loads(stdout)["data"]
+            self.assertEqual(data["jobs"], ["benchmark-a", "coder-user-workspace"])
+            self.assertFalse(data["killed"])
+            self.assertTrue(data["dry_run"])
+            delete.assert_not_called()
+            auth.assert_not_called()
+
+    def test_kill_literal_dry_run_does_not_require_listing_and_reports_owner(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            code, stdout, stderr = self.invoke("kill", "job-a", "coder-user-workspace", "--dry-run")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertIn("Kubernetes Job deletion", stdout)
+            self.assertIn("Coder workspace deletion", stdout)
+            client.assert_not_called()
+            delete.assert_not_called()
+
+    def test_kill_question_mark_and_character_class_patterns(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets", return_value=([], ["job-a", "job-b"])) as delete:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}} for name in ("job-a", "job-b", "job-aa")
+            ]}
+            code, _, stderr = self.invoke("kill", "job-?", "job-[ab]")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(delete.call_args.args[0], ["job-a", "job-b"])
+
+    def test_kill_pattern_coder_matches_use_existing_owner_routing(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets", return_value=([("workspace", "coder-user-workspace")], [])) as delete:
+            client.return_value.list_jobs.return_value = {"items": [{"metadata": {"name": "coder-user-workspace"}}]}
+            code, _, stderr = self.invoke("kill", "coder-*")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(delete.call_args.args[0], ["coder-user-workspace"])
+
+    def test_kill_pattern_listing_failure_never_deletes(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            client.return_value.list_jobs.side_effect = KubernetesError("Forbidden")
+            code, _, stderr = self.invoke("kill", "benchmark-*")
+            self.assertEqual(code, EXIT_KUBERNETES)
+            self.assertIn("Forbidden", stderr)
+            delete.assert_not_called()
+
+    def test_kill_dry_run_retains_last_job_fallback(self) -> None:
+        with patch("falcon.cli.target_job", return_value="last-job") as last, patch("falcon.cli._delete_job_targets") as delete:
+            code, stdout, stderr = self.invoke("kill", "--dry-run", "--output", "json")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["data"]["jobs"], ["last-job"])
+            last.assert_called_once_with(None)
+            delete.assert_not_called()
+
     def test_unavailable_kubernetes_has_distinct_exit(self) -> None:
         class Broken:
             def __init__(self, namespace):

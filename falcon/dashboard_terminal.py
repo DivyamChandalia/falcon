@@ -19,6 +19,7 @@ from textual.containers import ScrollableContainer
 from textual.widgets import Static
 
 from .kubernetes import debug_shell_rc
+from .output_search import highlight_text
 
 TERMINAL_SCROLLBACK_LINES = 200
 
@@ -336,6 +337,8 @@ def key_bytes(key: str, character: str | None = None) -> bytes:
 class DashboardTerminal(ScrollableContainer, inherit_bindings=False):
     can_focus = True
     BINDINGS = []
+    search_query = ""
+    search_match = None
 
     def compose(self):
         yield Static(id="selected-terminal-screen", markup=False)
@@ -350,7 +353,9 @@ class DashboardTerminal(ScrollableContainer, inherit_bindings=False):
         position = self.scroll_y
         removed = max(0, source[1] - previous[1]) if previous and previous[0] == source[0] else 0
         self._source = source
-        self.query_one("#selected-terminal-screen", Static).update(content)
+        self.query_one("#selected-terminal-screen", Static).update(
+            highlight_text(content, self.search_query, self.search_match)
+        )
         if follow:
             self.call_after_refresh(self._follow_output, position)
         elif removed:
@@ -360,7 +365,7 @@ class DashboardTerminal(ScrollableContainer, inherit_bindings=False):
 
     def _follow_output(self, previous_position: float) -> None:
         # A wheel/drag may have moved the viewport since output was queued.
-        if abs(self.scroll_y - previous_position) < 0.01:
+        if not self.search_query and abs(self.scroll_y - previous_position) < 0.01:
             self.scroll_end(animate=False)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:

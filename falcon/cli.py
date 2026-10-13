@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import getpass
 import os
 import re
@@ -329,7 +330,8 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     killer = sub.add_parser(
         "kill", help="Kill Jobs or remove Coder-owned workspaces"
     )
-    killer.add_argument("jobs", nargs="*")
+    killer.add_argument("jobs", nargs="*", help="Job names or quoted wildcard patterns (*, ?, [abc])")
+    killer.add_argument("--dry-run", action="store_true", help="Preview resolved targets without deleting anything")
     _namespace(killer)
     _output(killer)
 
@@ -1424,10 +1426,32 @@ def _kill_command(
 ) -> int:
     """Delete Coder Jobs through Coder and ordinary Jobs through Kubernetes."""
 
-    targets = list(args.jobs) or [target_job(None)]
+    namespace = _namespace_value(args, config)
+    supplied = list(args.jobs) or [target_job(None)]
+    targets: List[str] = []
+    if any(any(char in name for char in "*?[") for name in supplied):
+        available = sorted({str(job.get("metadata", {}).get("name") or "")
+                            for job in KubernetesClient(namespace).list_jobs().get("items", [])} - {""})
+        for pattern in supplied:
+            matched = [name for name in available if fnmatch.fnmatchcase(name, pattern)]
+            if not matched:
+                raise CliError(f"no Jobs match {pattern!r} in namespace {namespace}; nothing deleted", EXIT_NOT_FOUND)
+            targets.extend(matched)
+    else:
+        targets = supplied
+    targets = list(dict.fromkeys(targets))
+    if getattr(args, "dry_run", False):
+        if args.output == "json":
+            print(dumps("KillResult", {"jobs": targets, "killed": False, "dry_run": True}))
+        else:
+            print(f"Dry run: {len(targets)} target(s) in namespace {namespace}; nothing deleted")
+            for target in targets:
+                owner = "Coder workspace deletion" if target.startswith("coder-") else "Kubernetes Job deletion"
+                print(f"  {target} ({owner})")
+        return 0
     deleted_workspaces, ordinary_jobs = _delete_job_targets(
         targets,
-        _namespace_value(args, config),
+        namespace,
         config,
     )
 
