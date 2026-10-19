@@ -246,6 +246,13 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command_name")
 
+    mcp = sub.add_parser("mcp", help="Structured job tools for coding agents")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    serve = mcp_sub.add_parser("serve", help="Serve MCP tools over stdio")
+    serve.add_argument("--state-dir", help="Private local MCP state directory")
+    mcp_config = mcp_sub.add_parser("config", help="Print client configuration without editing it")
+    mcp_config.add_argument("--agent", required=True, choices=("codex", "claude", "opencode"))
+
     jobs = sub.add_parser("jobs", help="List a bounded set of Jobs")
     jobs.add_argument("--limit", type=int, default=50)
     jobs.add_argument("--status")
@@ -503,7 +510,7 @@ def _rewrite_shorthand(
     public_commands = {
         "jobs", "get", "events", "logs", "attach", "top", "metrics",
         "kill", "clean", "dashboard", "resources", "coder", "setup",
-        "completion", "config", "update", "shell-init",
+        "completion", "config", "update", "shell-init", "mcp",
     }
     # Falcon 0.1 installed this command in shell startup files. Keep a hidden,
     # output-compatible migration alias so upgrading the executable cannot
@@ -2091,7 +2098,7 @@ def _update_command(args: argparse.Namespace) -> int:
 def _maybe_auto_update(command_name: str, args: argparse.Namespace) -> None:
     """Offer a daily update only for interactive, human-facing commands."""
 
-    if command_name in {"completion", "config", "setup", "update"}:
+    if command_name in {"completion", "config", "setup", "update", "mcp"}:
         return
     if getattr(args, "output", None) == "json":
         return
@@ -2140,6 +2147,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.print_help()
             return 0
         _maybe_auto_update(args.command_name, args)
+        if args.command_name == "mcp":
+            if args.mcp_command == "config":
+                from .mcp_config import render_config
+
+                print(render_config(args.agent, config_path=config_arg))
+                return 0
+            try:
+                from .mcp_server import serve as serve_mcp
+            except ImportError as exc:
+                raise CliError(
+                    "MCP requires the optional dependencies: install 'falcon-k8s[mcp]' "
+                    "(uv tool users: uv tool install --force 'falcon-k8s[mcp]')"
+                ) from exc
+            serve_mcp(config, state_dir=args.state_dir)
+            return 0
         if args.command_name == "jobs":
             return _jobs_command(args, config)
         if args.command_name == "get":

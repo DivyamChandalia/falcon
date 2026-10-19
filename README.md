@@ -211,6 +211,29 @@ Falcon waits for the workspace and prints links for VS Code, Antigravity,
 Cursor, JupyterLab, and the web terminal. See [Coder and agent workflows](docs/agents.md)
 for authentication and workspace requirements.
 
+## Agent-managed Jobs via MCP
+
+Falcon can expose a local stdio [Model Context Protocol](https://modelcontextprotocol.io/)
+server for coding agents. Install the optional extra, then print the client
+snippet you need:
+
+```console
+pip install 'falcon-k8s[mcp]'
+falcon mcp config --agent codex
+falcon mcp config --agent claude
+falcon mcp config --agent opencode
+```
+
+Add the printed snippet to the selected client; Falcon never edits client
+configuration files. The server is started as `falcon mcp serve`, uses the
+user's existing kubeconfig and Falcon namespace, and exposes planning,
+submission, inspection, logs, metrics, event waiting, cancellation, and
+restart tools. It does not change client permissions or grant host
+permissions. MCP submit/restart requests require idempotency keys, and event
+waits return a cursor for reuse on the next wait. See [Coder and agent
+workflows](docs/agents.md) for the tool list, legacy-job compatibility,
+long-wait behavior, and job safety rules.
+
 ## Configuration
 
 Falcon stores configuration in `~/.falconrc`. The guided setup is the easiest
@@ -282,7 +305,6 @@ The updater checks for releases silently on non-interactive commands. Set
 
 ## TODO
 
-- [ ] Port the Falcon agent interface to an MCP server for long-running goal loops.
 - [ ] Show workload age in the Allocations view.
 - [ ] Add a Falcon command for launching bounded agent goal loops as Kubernetes
   Jobs, with explicit read-only data mounts, a working directory, a selectable

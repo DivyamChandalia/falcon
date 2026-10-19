@@ -374,9 +374,22 @@ def _job_sort_key(row: JobUsage) -> Tuple[bool, bool, bool, str]:
     return (succeeded, not row.at_risk, row.status != "Running", row.job)
 
 
-def _kubectl(args: List[str], timeout: int = 15) -> Optional[str]:
+def _with_kubectl_context(args: List[str], context: Optional[str]) -> List[str]:
+    if context is None:
+        return args
+    return ["--context", context, *args]
+
+
+def _kubectl(
+    args: List[str], timeout: int = 15, *, context: Optional[str] = None
+) -> Optional[str]:
     try:
-        result = subprocess.run(["kubectl"] + args, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            ["kubectl"] + _with_kubectl_context(args, context),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
         return result.stdout if result.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -397,20 +410,33 @@ def _age(timestamp: str) -> str:
         return "-"
 
 
-def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
+def _gpu_metrics(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> GpuSample:
     query = (
         "index,name,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu,"
         "power.draw,ecc.errors.uncorrected.volatile.total,driver_version"
     )
     output = _kubectl(
-        ["exec", "-n", namespace, pod, "--", "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                f"--query-gpu={query}", "--format=csv,noheader,nounits",
+            ],
+            context,
+        ),
         timeout=8,
     )
     sample = _parse_gpu_lines(output.splitlines() if output else [])
-    processes = _gpu_processes(namespace, pod)
+    if context is None:
+        processes = _gpu_processes(namespace, pod)
+        process_utilization = _gpu_process_utilization(namespace, pod)
+    else:
+        processes = _gpu_processes(namespace, pod, context=context)
+        process_utilization = _gpu_process_utilization(namespace, pod, context=context)
     _apply_gpu_process_utilization(
         processes,
-        _gpu_process_utilization(namespace, pod),
+        process_utilization,
     )
     _attach_gpu_processes(sample, processes)
     return sample
@@ -438,24 +464,34 @@ def _parse_gpu_process_lines(lines: List[str]) -> List[GpuProcess]:
     return processes
 
 
-def _gpu_processes(namespace: str, pod: str) -> List[GpuProcess]:
+def _gpu_processes(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> List[GpuProcess]:
     query = "gpu_uuid,pid,process_name,used_gpu_memory"
     output = _kubectl(
-        [
-            "exec", "-n", namespace, pod, "--", "nvidia-smi",
-            f"--query-compute-apps={query}", "--format=csv,noheader,nounits",
-        ],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                f"--query-compute-apps={query}", "--format=csv,noheader,nounits",
+            ],
+            context,
+        ),
         timeout=8,
     )
     return _parse_gpu_process_lines(output.splitlines() if output else [])
 
 
-def _gpu_process_utilization(namespace: str, pod: str) -> Dict[int, float]:
+def _gpu_process_utilization(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> Dict[int, float]:
     output = _kubectl(
-        [
-            "exec", "-n", namespace, pod, "--", "nvidia-smi",
-            "pmon", "-c", "1", "-s", "u",
-        ],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                "pmon", "-c", "1", "-s", "u",
+            ],
+            context,
+        ),
         timeout=8,
     )
     return _parse_gpu_process_utilization(
@@ -553,9 +589,15 @@ def _parse_gpu_lines(lines: List[str]) -> GpuSample:
 class StreamingGpuSampler:
     """Keep one nvidia-smi stream per running pod instead of execing each frame."""
 
-    def __init__(self, namespace: str, interval_ms: int = 1000):
+    def __init__(
+        self,
+        namespace: str,
+        interval_ms: int = 1000,
+        context: Optional[str] = None,
+    ):
         self.namespace = namespace
         self.interval_ms = interval_ms
+        self.context = context
         self._lock = threading.Lock()
         self._processes: Dict[str, subprocess.Popen] = {}
         self._samples: Dict[str, GpuSample] = {}
@@ -594,8 +636,14 @@ class StreamingGpuSampler:
         try:
             process = subprocess.Popen(
                 [
-                    "kubectl", "exec", "-n", self.namespace, pod, "--",
-                    "nvidia-smi", "pmon", "-d", "1", "-s", "u",
+                    "kubectl",
+                    *_with_kubectl_context(
+                        [
+                            "exec", "-n", self.namespace, pod, "--",
+                            "nvidia-smi", "pmon", "-d", "1", "-s", "u",
+                        ],
+                        self.context,
+                    ),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -631,9 +679,15 @@ class StreamingGpuSampler:
         try:
             process = subprocess.Popen(
                 [
-                    "kubectl", "exec", "-n", self.namespace, pod, "--", "nvidia-smi",
-                    f"--query-gpu={query}", "--format=csv,noheader,nounits",
-                    f"--loop-ms={self.interval_ms}",
+                    "kubectl",
+                    *_with_kubectl_context(
+                        [
+                            "exec", "-n", self.namespace, pod, "--", "nvidia-smi",
+                            f"--query-gpu={query}", "--format=csv,noheader,nounits",
+                            f"--loop-ms={self.interval_ms}",
+                        ],
+                        self.context,
+                    ),
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             )
@@ -691,6 +745,14 @@ class StreamingGpuSampler:
         now = time.monotonic()
         if pods and now - self._process_samples_at >= KUBERNETES_USAGE_SECONDS:
             pod_names = list(pods)
+            if self.context is None:
+                def load_processes(pod: str) -> List[GpuProcess]:
+                    return _gpu_processes(self.namespace, pod)
+            else:
+                def load_processes(pod: str) -> List[GpuProcess]:
+                    return _gpu_processes(
+                        self.namespace, pod, context=self.context
+                    )
             with ThreadPoolExecutor(
                 max_workers=min(8, max(1, len(pod_names)))
             ) as pool:
@@ -698,7 +760,7 @@ class StreamingGpuSampler:
                     zip(
                         pod_names,
                         pool.map(
-                            lambda pod: _gpu_processes(self.namespace, pod),
+                            load_processes,
                             pod_names,
                         ),
                     )
@@ -744,8 +806,10 @@ class UsageCollector:
         risk_average_samples: int = RISK_AVERAGE_SAMPLES,
         collect_availability: bool = True,
         resource_source: Optional[Any] = None,
+        context: Optional[str] = None,
     ):
         self.namespace = namespace
+        self.context = context
         self.thresholds = thresholds
         self.ema_alpha = ema_alpha
         self.job_filter = job_filter
@@ -759,7 +823,15 @@ class UsageCollector:
         self._items_at = 0.0
         self._live: Optional[Dict[str, Tuple[float, float]]] = None
         self._live_at = 0.0
-        self._gpu_sampler = StreamingGpuSampler(namespace) if streaming_gpu else None
+        self._gpu_sampler = (
+            (
+                StreamingGpuSampler(namespace, context=context)
+                if context is not None
+                else StreamingGpuSampler(namespace)
+            )
+            if streaming_gpu
+            else None
+        )
         self._event_cache: Dict[str, Tuple[float, List[JobEvent]]] = {}
         self.metrics_url = metrics_url
         self.collect_availability = collect_availability
@@ -768,6 +840,14 @@ class UsageCollector:
         self._availability_at = 0.0
         self.last_error = ""
         self.last_successful_refresh = 0.0
+
+    def _kubectl(
+        self, args: List[str], timeout: Optional[int] = None
+    ) -> Optional[str]:
+        args = _with_kubectl_context(args, self.context)
+        if timeout is None:
+            return _kubectl(args)
+        return _kubectl(args, timeout=timeout)
 
     def invalidate(self) -> None:
         self._items_at = 0.0
@@ -807,7 +887,9 @@ class UsageCollector:
             if nodes:
                 unschedulable_names = set()
                 if any(not node.scheduling_info_available for node in nodes):
-                    raw_nodes = _kubectl(["get", "nodes", "-o", "json"], timeout=15)
+                    raw_nodes = self._kubectl(
+                        ["get", "nodes", "-o", "json"], timeout=15
+                    )
                     if isinstance(raw_nodes, str):
                         try:
                             for item in json.loads(raw_nodes).get("items", []):
@@ -829,7 +911,10 @@ class UsageCollector:
                     availability[gpu_type] = (free + node.gpu_free, total + node.gpu_total)
                 self.gpu_availability = availability
                 return
-        raw = _kubectl(["get", "nodes,pods", "--all-namespaces", "-o", "json"], timeout=15)
+        raw = self._kubectl(
+            ["get", "nodes,pods", "--all-namespaces", "-o", "json"],
+            timeout=15,
+        )
         if raw is None:
             return
         try:
@@ -886,7 +971,7 @@ class UsageCollector:
         collected: Dict[Tuple[str, str, str, str], JobEvent] = {}
         # One namespace query is considerably cheaper than one subprocess per
         # historical attempt, especially for retried Jobs.
-        raw = _kubectl(
+        raw = self._kubectl(
             ["get", "events", "-n", self.namespace, "-o", "json"],
             timeout=15,
         )
@@ -994,13 +1079,13 @@ class UsageCollector:
             # Pod label, so a combined label-filtered query loses the durable
             # Job template.  Fetch the named Job and its attempts separately.
             if self.job_filter:
-                raw_job = _kubectl(
+                raw_job = self._kubectl(
                     [
                         "get", "job.batch", self.job_filter, "-n",
                         self.namespace, "-o", "json",
                     ]
                 )
-                raw_pods = _kubectl(
+                raw_pods = self._kubectl(
                     [
                         "get", "pods", "-n", self.namespace, "-l",
                         f"job-name={self.job_filter}", "-o", "json",
@@ -1016,7 +1101,7 @@ class UsageCollector:
                     except (TypeError, json.JSONDecodeError):
                         raw = None
             else:
-                combined = _kubectl(
+                combined = self._kubectl(
                     [
                         "get", "jobs.batch,pods", "-n", self.namespace,
                         "-o", "json",
@@ -1048,7 +1133,7 @@ class UsageCollector:
             if self.job_filter:
                 top_args.extend(["-l", f"job-name={self.job_filter}"])
             top_args.append("--no-headers")
-            top = _kubectl(top_args, timeout=10)
+            top = self._kubectl(top_args, timeout=10)
             self._live_at = now
             if top is not None:
                 self._live = {
@@ -1070,9 +1155,17 @@ class UsageCollector:
             samples = self._gpu_sampler.samples(running_gpu_pods)
         else:
             pod_names = list(running_gpu_pods)
+
+            def load_metrics(pod: str) -> GpuSample:
+                if self.context is None:
+                    return _gpu_metrics(self.namespace, pod)
+                return _gpu_metrics(
+                    self.namespace, pod, context=self.context
+                )
+
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(pod_names)))) as pool:
                 samples = dict(
-                    zip(pod_names, pool.map(lambda pod: _gpu_metrics(self.namespace, pod), pod_names))
+                    zip(pod_names, pool.map(load_metrics, pod_names))
                 )
 
         def new_group(job_item: Optional[Dict]) -> Dict:

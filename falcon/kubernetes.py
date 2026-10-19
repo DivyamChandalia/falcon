@@ -8,6 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import yaml
 
@@ -178,6 +179,7 @@ class KubernetesClient:
         namespace: str = "default",
         *,
         executable: str = "kubectl",
+        context: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         clock: Callable[[], float] = time.monotonic,
@@ -189,11 +191,19 @@ class KubernetesClient:
             raise ValueError("Kubernetes timeout must be positive")
         self.namespace = namespace
         self.executable = executable
+        self.context = context
         self.timeout = float(timeout)
         self._runner = runner
         self._clock = clock
         self._sleep = sleeper
         self._closed = False
+
+    def command_argv(self, args: Sequence[str]) -> List[str]:
+        """Build argv, optionally pinned to the context captured by an MCP session."""
+        prefix = [self.executable]
+        if self.context is not None:
+            prefix += ["--context", self.context]
+        return [*prefix, *map(str, args)]
 
     def _run(
         self,
@@ -206,7 +216,7 @@ class KubernetesClient:
     ) -> ProcessResult:
         if self._closed:
             raise KubernetesError("Kubernetes client is closed")
-        argv = [self.executable, *map(str, args)]
+        argv = self.command_argv(args)
         timeout_value = (
             self.timeout
             if timeout is None
@@ -380,6 +390,30 @@ class KubernetesClient:
             timeout=max(self.timeout, 40.0) if wait else self.timeout,
         )
 
+    def delete_job_uid(
+        self, name: str, uid: str, *, namespace: Optional[str] = None,
+    ) -> ProcessResult:
+        """Delete exactly one Job identity, not a same-name replacement.
+
+        The API checks the UID atomically. A preceding GET alone would leave
+        a race between identity validation and ordinary ``kubectl delete``.
+        """
+        if not name or not uid:
+            raise ValueError("Job name and UID are required")
+        effective = namespace or self.namespace
+        path = (
+            "/apis/batch/v1/namespaces/"
+            f"{quote(effective, safe='')}/jobs/{quote(name, safe='')}"
+        )
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({
+                "apiVersion": "v1", "kind": "DeleteOptions",
+                "preconditions": {"uid": uid},
+                "propagationPolicy": "Background",
+            }),
+        )
+
     def delete_pod(
         self,
         name: str,
@@ -487,6 +521,8 @@ class KubernetesClient:
         namespace: Optional[str] = None,
         tail: int = -1,
         container: Optional[str] = None,
+        timestamps: bool = False,
+        since_time: Optional[str] = None,
     ) -> ProcessResult:
         """Return bounded, non-following logs for one Pod attempt.
 
@@ -507,6 +543,10 @@ class KubernetesClient:
         ]
         if container:
             args += ["--container", container]
+        if timestamps:
+            args.append("--timestamps=true")
+        if since_time is not None:
+            args += ["--since-time", since_time]
         return self._run(
             args,
             capture=True,
@@ -531,14 +571,13 @@ class KubernetesClient:
         if not pod_name:
             raise ValueError("Kubernetes Pod name must not be empty")
         effective = namespace or self.namespace
-        args = [
-            self.executable,
+        args = self.command_argv([
             "attach",
             pod_name,
             "--namespace", effective,
             "--stdin=false",
             "--tty=false",
-        ]
+        ])
         if container:
             args += ["--container", container]
         try:

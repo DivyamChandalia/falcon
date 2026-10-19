@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added optional MCP job tools for coding agents, with server-side event waits,
+  bounded per-attempt logs, metrics, and retry-safe submission/relaunch.
+- Agent-managed Jobs disable automatic retries so failures return control to
+  the agent. Existing CLI retry settings and agent permissions are unchanged.
+- Added `falcon mcp config` snippets for Codex, Claude Code, and OpenCode.
+
 ## 0.4.7 — 2026-10-13
 
 - Added Ctrl+F search in Dashboard logs and terminals, with highlighted

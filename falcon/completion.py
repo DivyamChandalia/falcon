@@ -26,6 +26,7 @@ BASE_COMMANDS = [
     "config",
     "completion",
     "update",
+    "mcp",
 ]
 PRIORITY_COMMANDS = ["logs", "top"]
 TOP_LEVEL_LAUNCH_OPTIONS = ["--cpu", "--memory", "--gpus"]
@@ -79,6 +80,7 @@ OPTIONS: Dict[str, List[str]] = {
     ],
     "completion": ["bash", "zsh"],
     "update": ["--check"],
+    "mcp": ["serve", "config", "--agent", "codex", "claude", "opencode", "--state-dir"],
 }
 
 

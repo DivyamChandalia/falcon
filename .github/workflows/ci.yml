@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - name: Install Falcon and test dependencies
-        run: python -m pip install -e ".[test]"
+        run: python -m pip install -e ".[test,mcp]"
       - name: Compile
         run: python -m compileall -q falcon tests
       - name: Unit, CLI, TUI, and snapshot tests
@@ -62,3 +62,6 @@ jobs:
           /tmp/falcon-wheel/bin/python -c "import importlib.util; assert importlib.util.find_spec('falcon'); assert importlib.util.find_spec('jet') is None"
           test ! -e /tmp/falcon-wheel/bin/jet
           /tmp/falcon-wheel/bin/python -c "from importlib.resources import files; assert files('falcon.skills').joinpath('falcon/SKILL.md').is_file()"
+          /tmp/falcon-wheel/bin/falcon mcp config --agent codex
+          /tmp/falcon-wheel/bin/pip install 'falcon-k8s[mcp]'
+          /tmp/falcon-wheel/bin/python -c "from falcon.mcp_server import create_server; from falcon.config import DEFAULT_CONFIG; assert create_server(DEFAULT_CONFIG)"
