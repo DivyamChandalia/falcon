@@ -69,7 +69,8 @@ class RestartOverrides(BaseModel):
 INSTRUCTIONS = (
     "Manage Kubernetes batch jobs in the configured namespace using structured tools. "
     "Use plan_job before submission when sizing is uncertain. Reuse the same unique "
-    "idempotency_key when retrying a submit/restart request; never submit a duplicate "
+    "idempotency_key when retrying a submit request; restart retries are managed "
+    "internally from the source Job UID. Never submit a duplicate "
     "because a wait or transport timed out. Agent-managed jobs never automatically "
     "retry failures. Failure events include the exact failed pod and bounded logs. "
     "Inspect them, then make an explicit disposition: prefer restart_job for a "
@@ -305,18 +306,21 @@ def create_server(
 
     @server.tool(annotations=destructive, structured_output=True)
     async def restart_job(
-        job: JobReference, idempotency_key: str, overrides: Optional[RestartOverrides] = None,
+        job: JobReference, overrides: Optional[RestartOverrides] = None,
     ) -> dict[str, Any]:
         """Restart a terminal job under the same name, with optional fixes and no retries.
 
         Requires a retained Job with a terminal Kubernetes condition. For an
-        active job, cancel it and use submit_job for a new run instead. The
-        Job is replaced with a new UID and new Pod names. Terminated old Pods
-        are retained for logs; job_logs accepts the previous Job reference.
+        active job, cancel it and use submit_job for a new run instead.
+        The old Job and its Pods are deleted, then recreated under the same
+        Job name with a new UID and new Pod names. Old logs are not archived;
+        inspect failure logs before restarting if needed.
         Monitor the returned new Job reference, never the old UID.
+        Retry the same source reference and overrides to resume an interrupted
+        restart; Falcon manages operation identity internally.
         """
         return await invoke(
-            "restart_job", job.model_dump(), idempotency_key,
+            "restart_job", job.model_dump(),
             overrides=overrides.model_dump(exclude_none=True) if overrides else None,
         )
 

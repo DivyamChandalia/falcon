@@ -2,9 +2,19 @@
 
 ## Unreleased
 
+- Fixed same-name MCP restarts hanging on orphan garbage collection. Restart
+  deletes the old Job and Pods, then recreates the same name with a new UID.
+  Old logs are not archived. Stuck legacy orphan deletion can be resumed with
+  UID/version guards without removing unrelated finalizers.
+- Fixed stale warnings from a previous Job UID being attributed to a same-name
+  replacement after restart.
+
+- Restart retry identity is now managed internally by Falcon, using the source
+  Job UID instead of requiring an agent-supplied idempotency key.
+
 - MCP restarts now keep the Job name while returning a new UID and creating
-  new Pods. Old terminated Pods remain available for logs, and interrupted
-  restarts can be safely resumed with the same idempotency key.
+  new Pods. Interrupted restarts can be safely resumed with the same source
+  reference and arguments.
 
 - Simplified agent monitoring to one synchronous, long-lived MCP wait; removed
   advice to background the call and end the turn before an event arrives.

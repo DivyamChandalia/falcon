@@ -321,6 +321,17 @@ class _OperationStore:
             )
             self._connection.commit()
 
+    def restart_key(self, ref: Mapping[str, str]) -> Optional[str]:
+        """Recover legacy explicit keys as well as Falcon-generated restarts."""
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT idempotency_key FROM falcon_mcp_operations
+                   WHERE kind = 'restart' AND namespace = ? AND source_uid = ?
+                   ORDER BY (created_uid != '') DESC, created_at ASC LIMIT 1""",
+                (ref["namespace"], ref["uid"]),
+            ).fetchone()
+        return str(row[0]) if row else None
+
     def restarted_source(self, ref: Mapping[str, str]) -> bool:
         """Authorize historical log reads only for a recorded replacement."""
         with self._lock:
@@ -1652,7 +1663,7 @@ class JobService:
     def restart_job(
         self,
         job: dict,
-        idempotency_key: str,
+        idempotency_key: Optional[str] = None,
         overrides: Optional[dict] = None,
     ) -> dict:
         """Replace one terminal Job under its original name, with a new UID.
@@ -1667,12 +1678,22 @@ class JobService:
         # after a subsequent restart has reused the same name again.
         ref = self._job_ref(job)
         normalized_overrides = self._restart_overrides(overrides)
-        key = self._idempotency_key(idempotency_key)
+        if idempotency_key is None:
+            # One source UID can be replaced only once. Repeated requests
+            # resume/replay it, including after a transport/process failure.
+            key = self._operations.restart_key(ref) or self._idempotency_key(
+                "restart-" + hashlib.sha256(
+                    json.dumps(ref, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+            )
+        else:
+            key = self._idempotency_key(idempotency_key)
         digest = self._restart_digest(ref, normalized_overrides)
         operation = self._operations.get("restart", key)
         if operation is not None and operation.request_digest != digest:
             raise IdempotencyConflict(
-                "idempotency key was already used for a different restart"
+                "a different restart is already recorded; retry with the "
+                "original Job reference and overrides"
             )
         planned_name = (
             operation.planned_name
@@ -1715,7 +1736,8 @@ class JobService:
             )
             if operation.request_digest != digest:
                 raise IdempotencyConflict(
-                    "idempotency key was already used for a different restart"
+                    "a different restart is already recorded; retry with the "
+                    "original Job reference and overrides"
                 )
             if operation.created_uid:
                 return self._completed_restart(ref, operation)
@@ -1796,10 +1818,36 @@ class JobService:
         if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
             return live
         self._validate_restart_source(ref, live)
+        # Delete attempts explicitly as well as cascading the Job: this also
+        # recovers interrupted legacy Orphan deletes without orphaning Pods.
+        for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"]):
+            metadata = pod.get("metadata") or {}
+            try:
+                self.client.delete_pod_uid(
+                    str(metadata.get("name") or ""), str(metadata.get("uid") or ""),
+                    namespace=ref["namespace"],
+                )
+            except Exception as exc:
+                if not _is_not_found(exc):
+                    raise
+        live = self._get_job_optional(ref["name"], ref["namespace"])
+        if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+            return live
+        if (live.get("metadata") or {}).get("deletionTimestamp"):
+            try:
+                self.client.finish_orphaned_job_deletion(live, namespace=ref["namespace"])
+            except Exception:
+                current = self._get_job_optional(ref["name"], ref["namespace"])
+                if current is None or str((current.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+                    return current
+                raise
+            live = self._get_job_optional(ref["name"], ref["namespace"])
+            if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+                return live
         try:
             self.client.delete_job_uid(
                 ref["name"], ref["uid"], namespace=ref["namespace"],
-                propagation_policy="Orphan",
+                propagation_policy="Background",
             )
         except Exception:
             # Another retry may have completed the same UID-preconditioned
@@ -1816,7 +1864,7 @@ class JobService:
             if time.monotonic() >= deadline:
                 raise MCPServiceError(
                     "source Job deletion is still pending; retry restart_job with "
-                    "the same idempotency key to finish the restart"
+                    "the same Job reference and arguments to finish the restart"
                 )
             time.sleep(0.1)
 

@@ -44,6 +44,10 @@ class FakeService:
         self.calls.append(("cancel", job))
         return {"job": job, "cancelled": True}
 
+    def restart_job(self, job, overrides=None):
+        self.calls.append(("restart", job, overrides))
+        return {"job": {**job, "uid": "replacement-uid"}}
+
     async def wait_for_events(self, jobs, **kwargs):
         self.calls.append(("wait", jobs, kwargs))
         self.waiting.set()
@@ -69,6 +73,7 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
             assert not tools["submit_job"].annotations.readOnlyHint
             assert tools["cancel_job"].annotations.destructiveHint
             assert tools["restart_job"].annotations.destructiveHint
+            assert "idempotency_key" not in tools["restart_job"].inputSchema["properties"]
             assert tools["submit_job"].annotations.idempotentHint
             schema = tools["submit_job"].inputSchema
             assert "idempotency_key" in schema["required"]
@@ -120,6 +125,19 @@ async def test_synchronous_wait_stays_pending_until_event_and_allows_other_tools
         assert event.structuredContent["events"][0]["type"] == "failed"
         assert service.calls[0][2]["timeout"] == 604800
         assert service.calls[0][2]["scheduling_policy"] == "report_blocked"
+
+
+@pytest.mark.asyncio
+async def test_protocol_restart_manages_identity_without_agent_supplied_key():
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("restart_job", {
+            "job": REF, "overrides": {"command": ["true"]},
+        })
+        assert not result.isError
+        assert result.structuredContent["job"] == {**REF, "uid": "replacement-uid"}
+        assert service.calls == [("restart", REF, {"command": ["true"]})]
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,46 @@ def test_pod_logs_can_resume_from_timestamp_without_changing_default_reads():
     assert "--timestamps=true" not in calls[1]
 
 
+def test_pod_deletion_is_context_and_uid_guarded():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    client = KubernetesClient("mine", context="cluster-a", runner=run)
+    client.delete_pod_uid("old-pod", "pod-uid")
+    argv, kwargs = calls[0]
+    assert argv[:3] == ["kubectl", "--context", "cluster-a"]
+    assert "/api/v1/namespaces/mine/pods/old-pod" in argv
+    assert json.loads(kwargs["input"])["preconditions"] == {"uid": "pod-uid"}
+    with pytest.raises(ValueError, match="name and UID"):
+        client.delete_pod_uid("old-pod", "")
+
+
+def test_orphan_recovery_removes_only_orphan_and_requires_deletion():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    client = KubernetesClient("mine", runner=run)
+    job = {"metadata": {"name": "train", "uid": "old-job", "resourceVersion": "10",
+                        "deletionTimestamp": "2026-10-22T00:00:00Z",
+                        "finalizers": ["other-controller", "orphan"]}}
+    client.finish_orphaned_job_deletion(job)
+    assert json.loads(calls[0][-1]) == [
+        {"op": "test", "path": "/metadata/uid", "value": "old-job"},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": "10"},
+        {"op": "test", "path": "/metadata/finalizers", "value": ["other-controller", "orphan"]},
+        {"op": "remove", "path": "/metadata/finalizers/1"},
+    ]
+    del job["metadata"]["deletionTimestamp"]
+    client.finish_orphaned_job_deletion(job)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("name,uid", [("", "uid"), ("name", "")])
 def test_uid_delete_rejects_missing_identity(name, uid):
     with pytest.raises(ValueError, match="name and UID"):

@@ -195,6 +195,15 @@ def test_event_store_evicts_old_records_without_reusing_cursors(
     store.close()
 
 
+def test_old_job_warning_cannot_match_same_name_replacement(store: EventStore):
+    monitor = Monitor(_client(), "research", store, watcher=FakeWatcher())
+    key = monitor._track(_job(uid="new-uid", name="same-name"), 1)
+    involved = {"kind": "Job", "name": "same-name", "namespace": "research"}
+    assert monitor._event_job_key({"involvedObject": {**involved, "uid": "old-uid"}}) is None
+    assert monitor._event_job_key({"involvedObject": {**involved, "uid": "new-uid"}}) == key
+    assert monitor._event_job_key({"involvedObject": involved}) == key
+
+
 def test_event_details_are_bounded_with_explicit_message_truncation(
     store: EventStore,
 ) -> None:

@@ -1408,7 +1408,9 @@ class Monitor:
         kind = _string(involved.get("kind")).lower()
         if kind == "pod" and uid in self._pod_to_job:
             return self._pod_to_job[uid]
-        if kind == "job":
+        if kind == "job" and not uid:
+            # Same-name restarts have different identities. An explicit stale
+            # UID must never fall back to the replacement's matching name.
             name = _string(involved.get("name"))
             for key, entry in self._tracked.items():
                 identity = entry["identity"]

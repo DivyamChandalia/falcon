@@ -417,6 +417,39 @@ class KubernetesClient:
             }),
         )
 
+    def delete_pod_uid(self, name: str, uid: str, *, namespace: Optional[str] = None) -> ProcessResult:
+        """Delete a specific old attempt, never a same-name replacement Pod."""
+        if not name or not uid:
+            raise ValueError("Pod name and UID are required")
+        effective = namespace or self.namespace
+        path = f"/api/v1/namespaces/{quote(effective, safe='')}/pods/{quote(name, safe='')}"
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({"apiVersion": "v1", "kind": "DeleteOptions",
+                                   "preconditions": {"uid": uid}, "propagationPolicy": "Background"}),
+        )
+
+    def finish_orphaned_job_deletion(
+        self, job: Mapping[str, Any], *, namespace: Optional[str] = None,
+    ) -> None:
+        """Recover an old orphan deletion after the caller deletes its old Pods."""
+        metadata = job.get("metadata") or {}
+        finalizers = metadata.get("finalizers") or []
+        if not metadata.get("deletionTimestamp") or "orphan" not in finalizers:
+            return
+        if not metadata.get("uid") or not metadata.get("resourceVersion"):
+            raise KubernetesError("Job UID and resourceVersion are required for orphan recovery")
+        operations = [
+            {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+            {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]},
+            {"op": "test", "path": "/metadata/finalizers", "value": finalizers},
+            {"op": "remove", "path": f"/metadata/finalizers/{finalizers.index('orphan')}"},
+        ]
+        self._run([
+            "patch", "job", metadata["name"], "--namespace", namespace or self.namespace,
+            "--type=json", "--patch", json.dumps(operations),
+        ])
+
     def delete_pod(
         self,
         name: str,

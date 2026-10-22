@@ -115,6 +115,20 @@ class FakeClient:
             stdout=self.log_text.get(pod_name, ""),
         )
 
+    def delete_pod_uid(self, name, uid, *, namespace=None):
+        self.pods[:] = [pod for pod in self.pods if not (
+            pod["metadata"]["name"] == name and pod["metadata"]["uid"] == uid
+        )]
+
+    def finish_orphaned_job_deletion(self, job, *, namespace=None):
+        current = self.jobs.get(job["metadata"]["name"])
+        if current and current["metadata"].get("deletionTimestamp"):
+            finalizers = current["metadata"].get("finalizers", [])
+            if "orphan" in finalizers:
+                finalizers.remove("orphan")
+                if not finalizers:
+                    del self.jobs[job["metadata"]["name"]]
+
     def delete_job_uid(
         self, name: str, uid: str, *, namespace: str | None = None,
         propagation_policy: str = "Background",
@@ -617,7 +631,7 @@ def test_restart_strips_controller_retry_policies_and_links_source(tmp_path: Pat
     assert result["name"] == "failed-job"
     assert result["uid"] != "source-uid"
     assert client.deleted == [("failed-job", "source-uid")]
-    assert client.delete_policies == ["Orphan"]
+    assert client.delete_policies == ["Background"]
     spec = restarted["spec"]
     template_spec = spec["template"]["spec"]
     container = template_spec["containers"][0]
@@ -699,7 +713,7 @@ def _terminal_job(service: JobService, client: FakeClient) -> dict:
     return ref
 
 
-def test_restart_preserves_old_pod_logs_without_mixing_attempts(tmp_path: Path) -> None:
+def test_restart_deletes_old_attempts_without_mixing_new_logs(tmp_path: Path) -> None:
     client = FakeClient()
     service = _service(tmp_path, client)
     source = _terminal_job(service, client)
@@ -708,14 +722,13 @@ def test_restart_preserves_old_pod_logs_without_mixing_attempts(tmp_path: Path) 
     client.log_text["train-old"] = "2026-01-01T00:00:01Z old failure\n"
 
     restarted = service.restart_job(source, "restart-logs")["job"]
-    assert old_pod["metadata"]["ownerReferences"] == []
+    assert old_pod not in client.pods
     client.pods.append(_pod(client.jobs[source["name"]], "train-new", "pod-new"))
     client.log_text["train-new"] = "2026-01-01T00:00:02Z new attempt\n"
 
     old_logs = service.job_logs(source, failed_only=True)
     new_logs = service.job_logs(restarted)
-    assert [entry["pod"] for entry in old_logs["logs"]] == ["train-old"]
-    assert "old failure" in old_logs["logs"][0]["stdout"]
+    assert old_logs["logs"] == []
     assert [entry["pod"] for entry in new_logs["logs"]] == ["train-new"]
     with pytest.raises(MCPServiceError, match="not an attempt"):
         service.job_logs(restarted, pods=["train-old"])
@@ -723,11 +736,6 @@ def test_restart_preserves_old_pod_logs_without_mixing_attempts(tmp_path: Path) 
         service.cancel_job(source)
     with pytest.raises(StaleJobReference):
         service.job_logs({**source, "uid": "unrecorded-uid"})
-    # A conflicting owner takes precedence over an orphan's retained labels.
-    old_pod["metadata"]["ownerReferences"] = [
-        {"kind": "Job", "name": source["name"], "uid": "another-job"},
-    ]
-    assert service.job_logs(source, failed_only=True)["logs"] == []
     asyncio.run(service.close())
 
 
@@ -747,6 +755,96 @@ def test_restart_replay_cannot_delete_a_later_same_name_attempt(tmp_path: Path) 
     assert len(client.created_manifests) == 3
     assert len(client.deleted) == 2
     assert list(service._state_dir.glob("pending-restart-*.json")) == []
+    asyncio.run(service.close())
+
+
+def test_restart_implicit_identity_survives_reconnect_and_new_attempt(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    first = service.restart_job(source)["job"]
+    asyncio.run(service.close())
+    service = _service(tmp_path, client)
+    assert service.restart_job(source)["job"] == first
+    assert len(client.created_manifests) == 2
+    with pytest.raises(IdempotencyConflict):
+        service.restart_job(source, overrides={"cpu": "2"})
+    client.jobs[first["name"]]["status"] = {"conditions": [{"type": "Failed", "status": "True"}]}
+    second = service.restart_job(first)["job"]
+    assert len({source["uid"], first["uid"], second["uid"]}) == 3
+    assert service.restart_job(source)["job"] == first
+    assert client.jobs[second["name"]]["metadata"]["uid"] == second["uid"]
+    asyncio.run(service.close())
+
+
+def test_implicit_restart_recovers_legacy_orphan_pending_operation(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    pod = _pod(client.jobs[source["name"]], "old-attempt", "old-pod", phase="Failed")
+    client.pods.append(pod)
+    original_delete = client.delete_job_uid
+
+    def pending(*args, **kwargs):
+        client.jobs[source["name"]]["metadata"].update(
+            deletionTimestamp="2026-10-22T00:00:00Z", finalizers=["orphan"],
+        )
+
+    monkeypatch.setattr(client, "delete_job_uid", pending)
+    monkeypatch.setattr("falcon.mcp_service._RESTART_DELETE_TIMEOUT_SECONDS", 0)
+    with pytest.raises(MCPServiceError, match="same Job reference"):
+        service.restart_job(source, "legacy-pending")
+    monkeypatch.setattr(client, "delete_job_uid", original_delete)
+    result = service.restart_job(source)
+    assert result["uid"] != source["uid"]
+    assert result["name"] == source["name"]
+    assert pod not in client.pods
+    assert len(client.created_manifests) == 2
+    assert len(client.pods) == 0
+    asyncio.run(service.close())
+
+
+def test_restart_recovers_stuck_orphan_and_deletes_old_pods(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    pod = _pod(client.jobs[source["name"]], "old-attempt", "old-pod", phase="Failed")
+    client.pods.append(pod)
+    original_delete = client.delete_job_uid
+
+    def pending(*args, **kwargs):
+        client.jobs[source["name"]]["metadata"].update(
+            deletionTimestamp="2026-10-22T00:00:00Z", finalizers=["orphan"],
+        )
+
+    monkeypatch.setattr(client, "delete_job_uid", pending)
+    monkeypatch.setattr("falcon.mcp_service._RESTART_DELETE_TIMEOUT_SECONDS", 0)
+    with pytest.raises(MCPServiceError, match="same Job reference"):
+        service.restart_job(source, "pending-orphan")
+    monkeypatch.setattr(client, "delete_job_uid", original_delete)
+    result = service.restart_job(source)
+    assert result["uid"] != source["uid"]
+    assert result["name"] == source["name"]
+    assert pod not in client.pods
+    assert len(client.created_manifests) == 2
+    assert len(client.pods) == 0
+    assert service.restart_job(source)["job"] == result["job"]
+    asyncio.run(service.close())
+
+
+def test_restart_leaves_unrelated_finalizers_and_does_not_create_replacement(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    client.jobs[source["name"]]["metadata"].update(
+        deletionTimestamp="2026-10-22T00:00:00Z", finalizers=["unrelated", "orphan"],
+    )
+    monkeypatch.setattr("falcon.mcp_service._RESTART_DELETE_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(client, "delete_job_uid", lambda *a, **k: None)
+    with pytest.raises(MCPServiceError, match="deletion is still pending"):
+        service.restart_job(source)
+    assert client.jobs[source["name"]]["metadata"]["finalizers"] == ["unrelated"]
+    assert len(client.created_manifests) == 1
     asyncio.run(service.close())
 
 
@@ -818,7 +916,7 @@ def test_restart_waits_for_deletion_and_retries_safely(
 
     monkeypatch.setattr(client, "delete_job_uid", pending_delete)
     monkeypatch.setattr("falcon.mcp_service._RESTART_DELETE_TIMEOUT_SECONDS", 0)
-    with pytest.raises(MCPServiceError, match="same idempotency key"):
+    with pytest.raises(MCPServiceError, match="same Job reference"):
         service.restart_job(source, "pending-delete")
     assert len(client.created_manifests) == 1
     monkeypatch.setattr(client, "delete_job_uid", original_delete)

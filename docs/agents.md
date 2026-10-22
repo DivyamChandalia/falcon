@@ -240,10 +240,13 @@ inspect the reported failure and make an explicit disposition: prefer
 `restart_job` for a repairable terminal Job, or use `cancel_job` when it should
 not continue. Restarting replaces the terminal Job under the **same name**,
 with a new UID and new Pod names. Monitor the returned Job reference, including
-its new UID. Old terminated Pods are orphaned rather than deleted; `job_logs`
-can read them using the previous Job reference while Kubernetes retains them.
-They are not adopted by the replacement Job. A private, temporary manifest
-checkpoint allows the same idempotency key to recover an interrupted
+its new UID. Restart retries are identified internally by the source Job UID;
+the model supplies only the Job reference and optional overrides, not an
+idempotency key. Repeat the same arguments to resume an interrupted restart.
+The old Job and its Pods are deleted, including their Kubernetes logs. Read
+failure logs before restarting if needed; Falcon does not archive them.
+No orphan Pods or retention Jobs are created. A private, temporary manifest
+checkpoint allows the same source reference and arguments to recover an interrupted
 delete/create sequence; it is removed once the replacement UID is recorded.
 Use a new `submit_job` only for an independent run or when restart cannot
 express the required change; use `plan_job` first when sizing is uncertain.
