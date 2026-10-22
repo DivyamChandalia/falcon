@@ -214,25 +214,35 @@ for authentication and workspace requirements.
 ## Agent-managed Jobs via MCP
 
 Falcon can expose a local stdio [Model Context Protocol](https://modelcontextprotocol.io/)
-server for coding agents. Install the optional extra, then print the client
-snippet you need:
+server for coding agents. The MCP support is included in the normal Falcon
+installation; then print the client snippet you need:
 
 ```console
-pip install 'falcon-k8s[mcp]'
+pip install falcon-k8s
 falcon mcp config --agent codex
 falcon mcp config --agent claude
 falcon mcp config --agent opencode
 ```
 
-Add the printed snippet to the selected client; Falcon never edits client
-configuration files. The server is started as `falcon mcp serve`, uses the
-user's existing kubeconfig and Falcon namespace, and exposes planning,
+Add the printed snippet to the selected client, or let guided setup configure
+all supported clients automatically by accepting its MCP prompt. For scripts,
+use `falcon setup --non-interactive --configure-mcp all`. Setup only merges
+Falcon's entry and creates a timestamped backup before changing an existing
+file. The server is started as `falcon mcp serve`, uses the user's existing
+kubeconfig and Falcon namespace, and exposes planning,
 submission, inspection, logs, metrics, event waiting, cancellation, and
 restart tools. It does not change client permissions or grant host
 permissions. MCP submit/restart requests require idempotency keys, and event
 waits return a cursor for reuse on the next wait. See [Coder and agent
 workflows](docs/agents.md) for the tool list, legacy-job compatibility,
 long-wait behavior, and job safety rules.
+
+If an agent should keep using Falcon's previous direct-CLI skill instead of
+MCP, install that mode explicitly:
+
+```console
+falcon setup --install-skills codex,claude,opencode --skill-mode legacy
+```
 
 ## Configuration
 

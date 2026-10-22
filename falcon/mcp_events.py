@@ -2,16 +2,13 @@
 
 The MCP service deliberately keeps this module separate from the command and
 submission paths.  A monitor observes Jobs, Pods, and Kubernetes Events; it
-does not create, retry, or recover workloads.  The small amount of subprocess
-code here is an async equivalent of ``kubectl get --watch`` and is kept local
-so the existing synchronous Kubernetes adapter does not need a public API
-change.
+does not create, retry, or recover workloads. Kubernetes stream transport and
+reconnection are shared with Dashboard through ``kubernetes_watch``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import codecs
 import inspect
 import json
 import os
@@ -21,18 +18,24 @@ import stat
 import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import datetime, timezone
-from json import JSONDecodeError, JSONDecoder
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 import anyio
 
+from .agent_presence import HEARTBEAT_SECONDS, WaitPresence
 from .kubernetes import KubernetesClient
+from .kubernetes_watch import WatchError as _WatchError
+from .kubernetes_watch import WatchTransport, watch_resource
+from .mcp_config import DEFAULT_WAIT_TIMEOUT_SECONDS
 
 MAX_EVENT_RECORDS = 10_000
 MAX_EVENT_DETAILS_BYTES = 4 * 1024
 MAX_WAIT_RESPONSE_BYTES = 32 * 1024
-DEFAULT_WAIT_TIMEOUT = 12 * 60 * 60.0
+# A single server-side wait may cover a week.  Clients get a small amount of
+# extra time in their generated configuration so they do not cut it off.
+DEFAULT_WAIT_TIMEOUT = float(DEFAULT_WAIT_TIMEOUT_SECONDS)
 METRICS_INTERVAL = 1.0
 
 # These are the events that can change what an MCP caller should do next.  The
@@ -41,16 +44,46 @@ METRICS_INTERVAL = 1.0
 ACTIONABLE_EVENT_TYPES = (
     "succeeded",
     "failed",
-    "deleted",
     "pod_failed",
     "evicted",
     "warning",
     "eviction_risk",
-    "eviction_risk_cleared",
+)
+# Health transitions are internal diagnostics, never public wait events.
+# Monitoring outages must not wake an agent or consume a model turn.
+MONITOR_HEALTH_EVENT_TYPES = (
     "monitor_unavailable",
     "monitor_recovered",
 )
-SUPPORTED_EVENT_TYPES = ACTIONABLE_EVENT_TYPES + ("running", "pending")
+SUPPORTED_EVENT_TYPES = ACTIONABLE_EVENT_TYPES
+# One failed list/watch/metrics operation is common during a busy control
+# plane.  Only report an outage after several consecutive failures.  Explicit
+# watch/store gaps still bypass this threshold because they describe possible
+# event loss rather than ordinary transient latency.
+MONITOR_HEALTH_FAILURE_THRESHOLD = 3
+
+SCHEDULING_POLICIES = ("report_blocked", "wait_for_capacity")
+
+
+def _capacity_warning(event: Mapping[str, Any]) -> bool:
+    """Only suppress recognized scheduler shortages; unknown warnings stay visible."""
+    details = event.get("details") or {}
+    if event.get("type") != "warning" or str(details.get("reason", "")).lower() not in {
+        "failedscheduling", "unschedulable",
+    }:
+        return False
+    message = str(details.get("message") or "").lower()
+    # Volume and configuration faults can coexist with capacity shortages.
+    if any(value in message for value in (
+        "persistentvolume", "persistent volume", "unbound", "not found",
+        "invalid", "volume node affinity conflict",
+    )):
+        return False
+    return bool(re.search(
+        r"\binsufficient (?:cpu|memory|nvidia\.com/gpu|ephemeral-storage)\b|\btoo many pods\b"
+        r"|\b(?:didn't|did not) have enough resources:\s*(?:cpu(?: cores)?|memory|gpus?)\b",
+        message,
+    ))
 
 _TERMINAL_TYPES = frozenset(("succeeded", "failed"))
 _SECRET_KEY = re.compile(
@@ -568,33 +601,11 @@ class EventStore:
             self._connection.close()
 
 
-class _WatchError(RuntimeError):
-    def __init__(self, message: str, *, code: int | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-class _WatchGone(_WatchError):
-    pass
-
-
 def _watch_code(value: Any) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-async def _read_limited(stream: Any, limit: int = 4096) -> bytes:
-    """Drain a subprocess stream while keeping diagnostics bounded."""
-
-    captured = bytearray()
-    while True:
-        chunk = await stream.read(4096)
-        if not chunk:
-            return bytes(captured)
-        if len(captured) < limit:
-            captured.extend(chunk[: limit - len(captured)])
 
 
 def _resource_version(value: Mapping[str, Any]) -> str:
@@ -653,29 +664,6 @@ def _condition_details(job: Mapping[str, Any], event_type: str) -> dict[str, Any
         "completionTime",
         "startTime",
         "uncountedTerminatedPods",
-    ):
-        if status.get(key) is not None:
-            selected[key] = status[key]
-    return _json_safe(selected)
-
-
-def _job_state_type(job: Mapping[str, Any]) -> str | None:
-    if _terminal_type(job) is not None:
-        return None
-    status = job.get("status") if isinstance(job.get("status"), Mapping) else {}
-    active = _watch_code(status.get("active"))
-    return "running" if active is not None and active > 0 else "pending"
-
-
-def _state_details(job: Mapping[str, Any], event_type: str) -> dict[str, Any]:
-    status = job.get("status") if isinstance(job.get("status"), Mapping) else {}
-    selected: dict[str, Any] = {"state": event_type}
-    for key in (
-        "active",
-        "succeeded",
-        "failed",
-        "completionTime",
-        "startTime",
     ):
         if status.get(key) is not None:
             selected[key] = status[key]
@@ -814,9 +802,10 @@ class Monitor:
         self._waiter_number = 0
         self._watch_tasks: set[asyncio.Task[Any]] = set()
         self._metrics_task: asyncio.Task[Any] | None = None
-        self._processes: set[asyncio.subprocess.Process] = set()
+        self._transport = WatchTransport(client, namespace)
         self._resource_versions: dict[str, str] = {}
         self._health_failures: set[str] = set()
+        self._health_failure_counts: dict[str, int] = {}
         self._seen_pod_events: set[tuple[Any, ...]] = set()
         self._seen_kubernetes_events: set[tuple[Any, ...]] = set()
         self._reported_cursor_gaps: set[tuple[int, int]] = set()
@@ -839,6 +828,47 @@ class Monitor:
             return f"uid:{identity['uid']}"
         return f"name:{identity['namespace']}/{identity['name']}"
 
+    @staticmethod
+    def _update_source(entry: dict[str, Any], job: Mapping[str, Any]) -> None:
+        """Keep a full Job snapshot when a later wait supplies only an identity.
+
+        MCP callers intentionally pass compact ``{name, namespace, uid}``
+        references to every wait.  Replacing the cached Kubernetes object with
+        that reference discards ``spec.template`` and makes GPU jobs disappear
+        from the metrics sampler.  Merge richer updates so a partial status
+        update cannot discard the previously cached spec either.
+        """
+
+        current = entry.get("source")
+        reference_fields = {"name", "namespace", "uid"}
+        identity_only = set(job).issubset(reference_fields)
+        if identity_only and isinstance(current, Mapping) and not set(current).issubset(
+            reference_fields
+        ):
+            return
+        if isinstance(current, Mapping) and not set(current).issubset(reference_fields):
+            merged = dict(current)
+            merged.update(job)
+            entry["source"] = merged
+        else:
+            entry["source"] = dict(job)
+
+    async def _disconnect(self, key: str) -> None:
+        """Stop observing a Job deleted outside the MCP lifecycle.
+
+        Deletion is an operator action, not a workload outcome for the agent
+        to recover from.  Mark it internally so metrics and watches stop, but
+        do not append or emit a ``deleted`` event.
+        """
+
+        entry = self._tracked.get(key)
+        if entry is None or entry.get("disconnected"):
+            return
+        entry["disconnected"] = True
+        entry["retained"] = False
+        self._risk_state.pop(key, None)
+        await self._notify()
+
     def _track(self, job: Mapping[str, Any], waiter: int) -> str:
         identity = _job_identity(job)
         key = self._job_key(job)
@@ -852,11 +882,12 @@ class Monitor:
                 "terminal": set(),
                 "state": None,
                 "retained": False,
+                "disconnected": False,
             }
             self._tracked[key] = entry
         else:
             entry["identity"] = identity
-            entry["source"] = dict(job)
+            self._update_source(entry, job)
         entry["refs"].add(waiter)
         if identity["uid"]:
             self._uid_to_key[identity["uid"]] = key
@@ -972,6 +1003,9 @@ class Monitor:
             function = self._list_provider
             return await self._invoke_list_source(function, resource)
 
+        if isinstance(self.client, KubernetesClient):
+            return await self._transport.list_json(resource)
+
         list_json = getattr(self.client, "list_json", None)
         if callable(list_json):
             return await self._invoke_list_source(list_json, resource)
@@ -1049,7 +1083,7 @@ class Monitor:
             found = self._entry_for_job_object(job)
             if found is None or found[0] not in keys:
                 continue
-            found[1]["source"] = dict(job)
+            self._update_source(found[1], job)
             await self._handle_job("ADDED", job)
 
         for key in keys:
@@ -1058,14 +1092,7 @@ class Monitor:
                 continue
             uid = entry["identity"]["uid"]
             if uid and uid not in seen_uids:
-                await self._emit_job_once(
-                    key,
-                    "deleted",
-                    {
-                        "name": entry["identity"]["name"],
-                        "reason": "Job absent from namespace list",
-                    },
-                )
+                await self._disconnect(key)
 
     async def _reconcile_initial_jobs(
         self,
@@ -1076,7 +1103,7 @@ class Monitor:
             if found is None:
                 continue
             key, entry = found
-            entry["source"] = dict(job)
+            self._update_source(entry, job)
             uid = entry["identity"]["uid"]
             if uid:
                 existing = self.store.read(
@@ -1092,7 +1119,7 @@ class Monitor:
                 # sets so a fresh waiter receives terminal replay without
                 # appending a second durable status event.
                 entry["emitted"].update(entry["terminal"])
-            if "deleted" in entry["emitted"]:
+            if entry.get("disconnected"):
                 continue
             terminal = _terminal_type(job)
             if terminal:
@@ -1101,18 +1128,9 @@ class Monitor:
                     terminal,
                     _condition_details(job, terminal),
                 )
-            else:
-                state_type = _job_state_type(job)
-                if state_type and state_type != entry.get("state"):
-                    entry["state"] = state_type
-                    await self._emit(
-                        state_type,
-                        _state_details(job, state_type),
-                        key=key,
-                    )
 
     async def _start_background(self) -> None:
-        if self._started or self._closed:
+        if self._started or self._closed or not self._has_observation_targets():
             return
         self._started = True
         for resource in ("jobs.batch", "pods", "events"):
@@ -1136,6 +1154,8 @@ class Monitor:
             tasks.append(self._metrics_task)
         if not tasks:
             self._started = False
+            self._health_failures.clear()
+            self._health_failure_counts.clear()
             return
         for task in tasks:
             if not task.done():
@@ -1145,6 +1165,8 @@ class Monitor:
         self._watch_tasks.clear()
         self._metrics_task = None
         self._started = False
+        self._health_failures.clear()
+        self._health_failure_counts.clear()
 
     async def _register(
         self,
@@ -1157,6 +1179,7 @@ class Monitor:
                 raise RuntimeError("Monitor is closed")
             self._waiter_number += 1
             waiter = self._waiter_number
+            known_keys = set(self._tracked)
             keys = {self._track(job, waiter) for job in jobs}
             self._active_waiters[waiter] = keys
             restart_gap = report_restart_gap and self._restart_gap_pending
@@ -1168,7 +1191,15 @@ class Monitor:
                 # earlier monitor process or an explicitly stopped monitor.
                 self._restart_gap_pending = False
             try:
-                await self._refresh_baseline(keys)
+                # The first waiter (or a waiter adding a new Job) needs a
+                # snapshot to establish ownership and resource versions.  A
+                # second wait for the same active monitor already has the
+                # watches running; repeating three namespace-wide lists here
+                # only adds API load and can turn a transient timeout into a
+                # stream of health notifications.
+                needs_baseline = not self._started or bool(keys - known_keys)
+                if needs_baseline:
+                    await self._refresh_baseline(keys)
                 await self._reconcile_initial_jobs(jobs)
                 await self._start_background()
             except BaseException:
@@ -1198,7 +1229,7 @@ class Monitor:
                 if entry is None:
                     continue
                 entry["refs"].discard(waiter)
-                if retain:
+                if retain and not entry.get("disconnected"):
                     entry["retained"] = True
                     continue
                 if entry["refs"] or entry.get("retained"):
@@ -1221,12 +1252,21 @@ class Monitor:
     def _targets(self, key: str | None) -> list[tuple[str, dict[str, Any]]]:
         if key is not None:
             entry = self._tracked.get(key)
-            return [(key, entry)] if entry is not None else []
-        return list(self._tracked.items())
+            return (
+                [(key, entry)]
+                if entry is not None and not entry.get("disconnected")
+                else []
+            )
+        return [
+            (target_key, entry)
+            for target_key, entry in self._tracked.items()
+            if not entry.get("disconnected")
+        ]
 
     def _has_observation_targets(self) -> bool:
         return any(
-            bool(entry["refs"]) or bool(entry.get("retained"))
+            not entry.get("disconnected")
+            and (bool(entry["refs"]) or bool(entry.get("retained")))
             for entry in self._tracked.values()
         )
 
@@ -1275,18 +1315,32 @@ class Monitor:
             raise
 
     async def _mark_unavailable(self, source: str, details: Mapping[str, Any]) -> None:
-        if source in self._health_failures or self._closed:
+        if self._closed:
+            return
+        count = self._health_failure_counts.get(source, 0) + 1
+        self._health_failure_counts[source] = count
+        forced = bool(details.get("gap"))
+        if source in self._health_failures or (
+            not forced and count < MONITOR_HEALTH_FAILURE_THRESHOLD
+        ):
             return
         was_healthy = not self._health_failures
         self._health_failures.add(source)
         if was_healthy:
             await self._emit(
                 "monitor_unavailable",
-                {"source": source, **dict(details)},
+                {
+                    "source": source,
+                    "consecutive_failures": count,
+                    **dict(details),
+                },
             )
 
     async def _mark_recovered(self, source: str) -> None:
-        if source not in self._health_failures or self._closed:
+        if self._closed:
+            return
+        self._health_failure_counts.pop(source, None)
+        if source not in self._health_failures:
             return
         self._health_failures.remove(source)
         if not self._health_failures:
@@ -1301,16 +1355,9 @@ class Monitor:
             return
         key, entry = found
         if action == "DELETED":
-            await self._emit_job_once(
-                key,
-                "deleted",
-                {
-                    "name": entry["identity"]["name"],
-                    "reason": "Job object deleted",
-                },
-            )
+            await self._disconnect(key)
             return
-        entry["source"] = dict(job)
+        self._update_source(entry, job)
         terminal = _terminal_type(job)
         if terminal:
             await self._emit_job_once(
@@ -1319,10 +1366,6 @@ class Monitor:
                 _condition_details(job, terminal),
             )
             return
-        state_type = _job_state_type(job)
-        if state_type and state_type != entry.get("state"):
-            entry["state"] = state_type
-            await self._emit(state_type, _state_details(job, state_type), key=key)
 
     async def _handle_pod(self, action: str, pod: Mapping[str, Any]) -> None:
         owner_uid = _owner_job_uid(pod)
@@ -1447,12 +1490,6 @@ class Monitor:
             }
         await self._emit("warning", _json_safe(details), key=key)
 
-    @staticmethod
-    def _watch_payload(raw: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
-        if isinstance(raw.get("object"), Mapping):
-            return _string(raw.get("type") or "MODIFIED").upper(), raw["object"]
-        return _string(raw.get("type") or "MODIFIED").upper(), raw
-
     async def _watch_json(
         self,
         resource: str,
@@ -1504,161 +1541,25 @@ class Monitor:
             if callable(close):
                 await close()
 
-    def _client_argv(self, args: list[str]) -> list[str]:
-        command_argv = getattr(self.client, "command_argv", None)
-        if callable(command_argv):
-            value = command_argv(args)
-            if value:
-                return [str(item) for item in value]
-        argv_builder = getattr(self.client, "_argv", None)
-        if callable(argv_builder):
-            try:
-                value = argv_builder(args)
-            except TypeError:
-                value = argv_builder(*args)
-            if value:
-                return [str(item) for item in value]
-        executable = _string(getattr(self.client, "executable", "kubectl")) or "kubectl"
-        argv = [executable, *args]
-        context = getattr(self.client, "context", None) or getattr(
-            self.client, "_context", None
-        )
-        if context:
-            argv.extend(["--context", _string(context)])
-        return argv
+    def _client_argv(self, args):
+        return self._transport.command_argv(args)
 
-    @staticmethod
-    def _decoder_objects(
-        decoder: JSONDecoder,
-        buffer: str,
-        *,
-        final: bool = False,
-    ) -> tuple[list[Mapping[str, Any]], str]:
-        objects: list[Mapping[str, Any]] = []
-        while True:
-            stripped = buffer.lstrip()
-            if not stripped:
-                return objects, ""
-            try:
-                value, end = decoder.raw_decode(stripped)
-            except JSONDecodeError:
-                if final:
-                    raise _WatchError("kubectl watch ended with incomplete JSON")
-                return objects, stripped
-            buffer = stripped[end:]
-            if isinstance(value, Mapping):
-                objects.append(value)
-
-    async def _subprocess_watch_json(
-        self,
-        resource: str,
-        resource_version: str | None,
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        args = [
-            "get",
-            resource,
-            "--namespace",
-            self.namespace,
-            "--watch",
-            "--output-watch-events",
-            "--output",
-            "json",
-        ]
-        if resource_version:
-            args.extend(["--resource-version", resource_version])
-        argv = self._client_argv(args)
+    async def _subprocess_watch_json(self, resource, resource_version):
+        stream = self._transport.watch_json(resource, resource_version)
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            raise _WatchError(f"could not start {argv[0]!r}: executable not found") from exc
-        except OSError as exc:
-            raise _WatchError(f"could not start Kubernetes watch: {exc}") from exc
-
-        self._processes.add(process)
-        stderr_task = (
-            asyncio.create_task(_read_limited(process.stderr))
-            if process.stderr
-            else None
-        )
-        decoder = JSONDecoder()
-        utf8 = codecs.getincrementaldecoder("utf-8")()
-        buffer = ""
-        try:
-            assert process.stdout is not None
-            while True:
-                chunk = await process.stdout.read(4096)
-                if not chunk:
-                    break
-                buffer += utf8.decode(chunk, final=False)
-                objects, buffer = self._decoder_objects(decoder, buffer)
-                for value in objects:
-                    yield value
-            buffer += utf8.decode(b"", final=True)
-            objects, buffer = self._decoder_objects(decoder, buffer, final=True)
-            for value in objects:
-                yield value
-            returncode = await process.wait()
-            stderr = ""
-            if stderr_task is not None:
-                stderr = (await stderr_task).decode("utf-8", errors="replace")
-            if returncode:
-                code = 410 if "410" in stderr or "too old resource version" in stderr.lower() else returncode
-                if code == 410:
-                    raise _WatchGone(stderr.strip() or "watch resource version is gone", code=410)
-                raise _WatchError(
-                    stderr.strip() or f"kubectl watch exited {returncode}",
-                    code=code,
-                )
-            raise _WatchError("kubectl watch stream ended")
+            async for raw in stream:
+                yield raw
         finally:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2.0)
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    if process.returncode is None:
-                        process.kill()
-                        await process.wait()
-            if stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-                await asyncio.gather(stderr_task, return_exceptions=True)
-            self._processes.discard(process)
+            await stream.aclose()
 
-    async def _terminate_processes(self) -> None:
-        processes = list(self._processes)
-        for process in processes:
-            if process.returncode is not None:
-                continue
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                continue
-        if processes:
-            await asyncio.gather(
-                *(
-                    asyncio.wait_for(process.wait(), timeout=2.0)
-                    for process in processes
-                    if process.returncode is None
-                ),
-                return_exceptions=True,
-            )
-        for process in processes:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+    async def _terminate_processes(self):
+        await self._transport.close()
 
     async def _load_for_watch(self, resource: str) -> None:
         if not self._has_list_support():
             return
-        payload = await self._safe_list_resource(resource)
-        if payload is None:
-            return
+        payload = await self._list_resource(resource)
+        await self._mark_recovered(resource)
         version = _string((payload.get("metadata") or {}).get("resourceVersion")) if isinstance(payload, Mapping) else ""
         if version:
             self._resource_versions[resource] = version
@@ -1673,85 +1574,20 @@ class Monitor:
                 await self._handle_kubernetes_event("ADDED", value)
 
     async def _watch_loop(self, resource: str) -> None:
-        delay = 0.25
-        while not self._closed:
-            if not self._has_observation_targets():
-                return
-            source: Any = None
-            try:
-                if not self._resource_versions.get(resource):
-                    await self._load_for_watch(resource)
-                source = self._watch_json(resource, self._resource_versions.get(resource))
-                if inspect.isawaitable(source):
-                    source = await source
-                yielded = False
-                async for raw in source:
-                    if self._closed:
-                        return
-                    if not isinstance(raw, Mapping):
-                        continue
-                    yielded = True
-                    action, obj = self._watch_payload(raw)
-                    if action == "ERROR":
-                        code = _watch_code(obj.get("code") or obj.get("status"))
-                        if code == 410:
-                            raise _WatchGone(
-                                _string(obj.get("message") or obj.get("reason") or "watch gap"),
-                                code=410,
-                            )
-                        raise _WatchError(
-                            _string(obj.get("message") or obj.get("reason") or "watch error"),
-                            code=code,
-                        )
-                    await self._mark_recovered(resource)
-                    version = _resource_version(obj)
-                    if version:
-                        self._resource_versions[resource] = version
-                    if action == "BOOKMARK":
-                        continue
-                    if resource == "jobs.batch":
-                        await self._handle_job(action, obj)
-                    elif resource == "pods":
-                        await self._handle_pod(action, obj)
-                    else:
-                        await self._handle_kubernetes_event(action, obj)
-                if self._closed:
-                    return
-                raise _WatchError(
-                    f"{resource} watch stream ended"
-                    + (" after an event" if yielded else "")
-                )
-            except asyncio.CancelledError:
-                raise
-            except _WatchGone as exc:
-                self._resource_versions.pop(resource, None)
-                await self._mark_unavailable(
-                    resource,
-                    {"operation": "watch", "gap": True, "error": _string(exc)},
-                )
-                # Re-list immediately to obtain a current resourceVersion.
-                if self._closed or not self._has_observation_targets():
-                    return
-                await asyncio.sleep(delay)
-                delay = min(delay * 2.0, 30.0)
-                continue
-            except Exception as exc:  # noqa: BLE001 - watcher must stay alive
-                await self._mark_unavailable(
-                    resource,
-                    {"operation": "watch", "error": _string(exc)},
-                )
-                if self._closed or not self._has_observation_targets():
-                    return
-                await asyncio.sleep(delay)
-                delay = min(delay * 2.0, 30.0)
+        async def handle(resource, action, obj):
+            if resource == "jobs.batch":
+                await self._handle_job(action, obj)
+            elif resource == "pods":
+                await self._handle_pod(action, obj)
             else:
-                delay = 0.25
-            finally:
-                if source is not None and hasattr(source, "aclose"):
-                    try:
-                        await source.aclose()
-                    except Exception:  # noqa: BLE001 - cleanup must not mask watch error
-                        pass
+                await self._handle_kubernetes_event(action, obj)
+
+        await watch_resource(
+            resource, versions=self._resource_versions,
+            load=self._load_for_watch, stream=self._watch_json, handle=handle,
+            unavailable=self._mark_unavailable, recovered=self._mark_recovered,
+            active=lambda: not self._closed and self._has_observation_targets(),
+        )
 
     async def _metrics_loop(self) -> None:
         while not self._closed and self._has_observation_targets():
@@ -1761,7 +1597,7 @@ class Monitor:
             active: list[tuple[str, str, str]] = []
             for key, entry in self._tracked.items():
                 source = entry.get("source") or {}
-                if "deleted" in entry["emitted"]:
+                if entry.get("disconnected"):
                     continue
                 if _terminal_type(source):
                     continue
@@ -1825,8 +1661,26 @@ class Monitor:
                         )
                         continue
                     at_risk = bool(value.get("at_risk"))
+                    risk_details: dict[str, Any] = {}
+                    metrics = value.get("metrics")
+                    policy = (
+                        metrics.get("eviction_policy")
+                        if isinstance(metrics, Mapping)
+                        else None
+                    )
+                    if isinstance(policy, Mapping):
+                        for field in (
+                            "phase",
+                            "window_seconds",
+                            "gpu_ema_percent",
+                            "vram_ema_percent",
+                            "per_gpu",
+                        ):
+                            if field in policy:
+                                risk_details[field] = policy[field]
                 elif isinstance(value, bool):
                     at_risk = value
+                    risk_details = {}
                 else:
                     metrics_unavailable = True
                     await self._mark_unavailable(
@@ -1840,17 +1694,13 @@ class Monitor:
                     continue
                 previous = self._risk_state.get(key)
                 self._risk_state[key] = at_risk
-                if previous is None:
-                    if at_risk:
-                        await self._emit(
-                            "eviction_risk",
-                            {"at_risk": True, "source": "metrics"},
-                            key=key,
-                        )
-                elif previous != at_risk:
+                if at_risk and previous is not True:
+                    details = {"at_risk": True, "source": "metrics"}
+                    if risk_details:
+                        details["risk"] = risk_details
                     await self._emit(
-                        "eviction_risk" if at_risk else "eviction_risk_cleared",
-                        {"at_risk": at_risk, "source": "metrics"},
+                        "eviction_risk",
+                        details,
                         key=key,
                     )
             if not metrics_unavailable:
@@ -1968,12 +1818,26 @@ class Monitor:
                 key=key,
             )
 
+    def _read_wait_events(self, job_uids, cursor, allowed, scheduling_policy):
+        while True:
+            events = self.store.read(job_uids, cursor=cursor, event_types=allowed, limit=50)
+            visible = [
+                event for event in events
+                if scheduling_policy != "wait_for_capacity" or not _capacity_warning(event)
+            ]
+            if visible or not events:
+                return visible, cursor
+            # Advance over suppressed warnings, including multi-page backlogs,
+            # without moving past any event this waiter needs to receive.
+            cursor = int(events[-1]["cursor"])
+
     async def wait(
         self,
         jobs: list[dict],
         cursor: int | None = None,
         event_types: list[str] | None = None,
         timeout: float = DEFAULT_WAIT_TIMEOUT,
+        scheduling_policy: str = "report_blocked",
     ) -> dict:
         """Wait for selected actionable events, or explicitly time out.
 
@@ -1991,6 +1855,8 @@ class Monitor:
             raise ValueError("cursor must be None or a non-negative integer")
         if timeout < 0:
             raise ValueError("timeout must not be negative")
+        if scheduling_policy not in SCHEDULING_POLICIES:
+            raise ValueError("scheduling_policy must be report_blocked or wait_for_capacity")
         normalized_jobs = [
             job for job in jobs if isinstance(job, Mapping)
         ]
@@ -2003,29 +1869,50 @@ class Monitor:
                 "timed_out": True,
             }
         waiter: int | None = None
+        presence = None
+        heartbeat = None
         normal_return = False
         try:
             waiter, keys, restart_gap = await self._register(
                 normalized_jobs,
                 report_restart_gap=cursor is not None,
             )
+            presence = WaitPresence(
+                getattr(self.client, "context", None), self.namespace,
+                [self._tracked[key]["identity"]["uid"] for key in keys],
+            )
+            presence.renew()
+
+            async def keep_presence():
+                while True:
+                    await asyncio.sleep(HEARTBEAT_SECONDS)
+                    presence.uids = {
+                        self._tracked[key]["identity"]["uid"] for key in keys
+                        if key in self._tracked and not self._tracked[key].get("disconnected")
+                    }
+                    presence.renew()
+
+            heartbeat = asyncio.create_task(keep_presence())
             deadline = asyncio.get_running_loop().time() + float(timeout)
             if cursor is not None:
                 if restart_gap:
                     await self._report_restart_gap(start_cursor, keys)
                 await self._report_cursor_gap(start_cursor, keys)
             replay = self._terminal_replays(keys, start_cursor, allowed) if cursor is None else []
-            job_uids = [
-                self._tracked[key]["identity"]["uid"]
-                for key in keys
-                if key in self._tracked and self._tracked[key]["identity"]["uid"]
-            ]
             while True:
-                events = self.store.read(
-                    job_uids,
-                    cursor=start_cursor,
-                    event_types=allowed,
-                    limit=50,
+                active_keys = {
+                    key
+                    for key in keys
+                    if key in self._tracked
+                    and not self._tracked[key].get("disconnected")
+                }
+                job_uids = [
+                    self._tracked[key]["identity"]["uid"]
+                    for key in active_keys
+                    if self._tracked[key]["identity"]["uid"]
+                ]
+                events, start_cursor = self._read_wait_events(
+                    job_uids, start_cursor, allowed, scheduling_policy,
                 )
                 events = self._merge_events(replay, events)
                 events = self._fit_wait_events(events, start_cursor)
@@ -2040,6 +1927,14 @@ class Monitor:
                         "cursor": max(start_cursor, int(events[-1]["cursor"])),
                         "timed_out": False,
                     }
+                if not active_keys:
+                    normal_return = True
+                    return {
+                        "events": [],
+                        "cursor": max(start_cursor, self.store.latest_cursor()),
+                        "timed_out": False,
+                        "disconnected": True,
+                    }
                 remaining = deadline - asyncio.get_running_loop().time()
                 latest = max(start_cursor, self.store.latest_cursor())
                 if self._closed or remaining <= 0:
@@ -2048,11 +1943,27 @@ class Monitor:
                 async with self._condition:
                     # Recheck while holding the condition to close the
                     # append-vs-wait race without polling.
-                    events = self.store.read(
-                        job_uids,
-                        cursor=start_cursor,
-                        event_types=allowed,
-                        limit=50,
+                    active_keys = {
+                        key
+                        for key in keys
+                        if key in self._tracked
+                        and not self._tracked[key].get("disconnected")
+                    }
+                    if not active_keys:
+                        normal_return = True
+                        return {
+                            "events": [],
+                            "cursor": max(start_cursor, self.store.latest_cursor()),
+                            "timed_out": False,
+                            "disconnected": True,
+                        }
+                    job_uids = [
+                        self._tracked[key]["identity"]["uid"]
+                        for key in active_keys
+                        if self._tracked[key]["identity"]["uid"]
+                    ]
+                    events, start_cursor = self._read_wait_events(
+                        job_uids, start_cursor, allowed, scheduling_policy,
                     )
                     events = self._fit_wait_events(events, start_cursor)
                     if events:
@@ -2072,6 +1983,12 @@ class Monitor:
                             "timed_out": True,
                         }
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with anyio.CancelScope(shield=True):
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+            if presence is not None:
+                presence.close()
             if waiter is not None:
                 with anyio.CancelScope(shield=True):
                     await self._unregister(
@@ -2109,6 +2026,8 @@ __all__ = [
     "MAX_EVENT_DETAILS_BYTES",
     "MAX_EVENT_RECORDS",
     "MAX_WAIT_RESPONSE_BYTES",
+    "MONITOR_HEALTH_EVENT_TYPES",
+    "MONITOR_HEALTH_FAILURE_THRESHOLD",
     "METRICS_INTERVAL",
     "Monitor",
     "SUPPORTED_EVENT_TYPES",

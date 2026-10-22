@@ -6,13 +6,17 @@ from importlib import resources
 from pathlib import Path
 
 from falcon.agent_skills import (
+    LEGACY_SKILL_BUNDLE_VERSION,
     METADATA_FILE,
     SKILL_BUNDLE_VERSION,
+    SKILL_MODES,
     SUPPORTED_AGENTS,
     agent_skill_path,
     detect_agents,
     install_skill,
     install_skills,
+    installed_skill_mode,
+    refresh_installed_skills,
     uninstall_skill,
     uninstall_skills,
 )
@@ -33,7 +37,7 @@ def bundle_digest(hashes):
 
 
 class AgentSkillTests(unittest.TestCase):
-    def test_packaged_skill_is_one_concise_human_command_workflow(self):
+    def test_packaged_skill_is_one_concise_mcp_first_workflow(self):
         root = resources.files("falcon.skills").joinpath("falcon")
         skill = root.joinpath("SKILL.md").read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
@@ -41,17 +45,21 @@ class AgentSkillTests(unittest.TestCase):
         self.assertIn("name: falcon", frontmatter)
         self.assertIn("description:", frontmatter)
         self.assertNotIn("allowed-tools:", frontmatter)
-        self.assertLessEqual(len(skill.splitlines()), 30)
-        self.assertEqual(skill.count("- `falcon "), 5)
-        self.assertIn("falcon logs JOB --no-follow --tail 100", skill)
-        self.assertIn("falcon metrics JOB --interval 60", skill)
-        self.assertIn("falcon kill JOB", skill)
-        self.assertIn("report its name, and return", skill)
-        self.assertIn("Do not add `-f`", skill)
-        self.assertIn("H100 and PRO6000 must stay at or above 75%", skill)
-        self.assertIn("A6000 and 2080Ti must stay at or above 10%", skill)
-        self.assertIn("one targeted `kubectl` command", skill)
+        self.assertLessEqual(len(skill.splitlines()), 45)
+        self.assertIn("falcon setup --non-interactive --configure-mcp all", skill)
+        for tool in (
+            "plan_job", "submit_job", "wait_for_events", "job_logs",
+            "job_metrics", "restart_job", "cancel_job",
+        ):
+            self.assertIn(f"`{tool}`", skill)
+        self.assertIn("H100/PRO6000 use 75%", skill)
+        self.assertIn("A6000/2080Ti use 10%", skill)
+        self.assertIn("seven days", skill)
         for removed in (
+            "falcon h100x2",
+            "falcon logs JOB",
+            "falcon metrics JOB",
+            "falcon kill JOB",
             "falcon jobs",
             "falcon get",
             "falcon resources",
@@ -60,6 +68,75 @@ class AgentSkillTests(unittest.TestCase):
             "reference.md",
         ):
             self.assertNotIn(removed, skill)
+
+    def test_packaged_legacy_skill_preserves_direct_cli_workflow(self):
+        root = resources.files("falcon.skills").joinpath("falcon-legacy")
+        skill = root.joinpath("SKILL.md").read_text(encoding="utf-8")
+
+        self.assertEqual(SKILL_MODES, ("mcp", "legacy"))
+        self.assertIn("falcon logs JOB", skill)
+        self.assertIn("falcon metrics JOB", skill)
+        self.assertNotIn("plan_job", skill)
+
+    def test_skill_mode_can_switch_between_legacy_and_mcp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = install_skill("codex", home=directory, mode="legacy")
+            marker_path = legacy.path / METADATA_FILE
+            legacy_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(legacy.status, "installed")
+            self.assertEqual(legacy_marker["mode"], "legacy")
+            self.assertEqual(
+                legacy_marker["bundle_version"], LEGACY_SKILL_BUNDLE_VERSION
+            )
+            self.assertIn(
+                "falcon logs JOB",
+                (legacy.path / "SKILL.md").read_text(encoding="utf-8"),
+            )
+
+            mcp = install_skill("codex", home=directory, mode="mcp")
+            mcp_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(mcp.status, "updated")
+            self.assertEqual(mcp_marker["mode"], "mcp")
+            self.assertEqual(mcp_marker["bundle_version"], SKILL_BUNDLE_VERSION)
+            self.assertIn(
+                "plan_job",
+                (mcp.path / "SKILL.md").read_text(encoding="utf-8"),
+            )
+
+    def test_refresh_installed_skills_preserves_each_agent_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install_skill("codex", home=directory, mode="legacy")
+            install_skill("claude", home=directory, mode="mcp")
+
+            self.assertEqual(
+                installed_skill_mode("codex", home=directory), "legacy"
+            )
+            self.assertEqual(
+                installed_skill_mode("claude", home=directory), "mcp"
+            )
+            refreshed = refresh_installed_skills(home=directory)
+
+            self.assertEqual(
+                [(operation.agent, operation.status) for operation in refreshed],
+                [("codex", "unchanged"), ("claude", "unchanged")],
+            )
+            self.assertIn(
+                "falcon logs JOB",
+                (agent_skill_path("codex", home=directory) / "SKILL.md")
+                .read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "plan_job",
+                (agent_skill_path("claude", home=directory) / "SKILL.md")
+                .read_text(encoding="utf-8"),
+            )
+
+    def test_unknown_skill_mode_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "unsupported Falcon skill mode"):
+                install_skill("codex", home=directory, mode="unknown")
 
     def test_official_agent_paths_and_explicit_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -138,7 +215,7 @@ class AgentSkillTests(unittest.TestCase):
 
             self.assertEqual(updated.status, "updated")
             self.assertIn(
-                "falcon h100",
+                "plan_job",
                 (result.path / "SKILL.md").read_text(encoding="utf-8"),
             )
             self.assertEqual(new_marker["bundle_version"], SKILL_BUNDLE_VERSION)

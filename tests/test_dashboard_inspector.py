@@ -8,9 +8,13 @@ from unittest.mock import patch
 
 from textual import events
 
-from falcon.dashboard import JobUsage, PodAttempt
+from falcon.dashboard import JobUsage, PodAttempt, _is_agent_managed_metadata
 from falcon.dashboard_logs import DashboardLogManager
-from falcon.dashboard_ui import FalconDashboard
+from falcon.dashboard_ui import (
+    FalconDashboard,
+    _active_pod_state_display,
+    _job_status_display,
+)
 from falcon.kubernetes import ProcessResult
 
 
@@ -68,7 +72,13 @@ class _Collector:
         return None
 
 
-def _job(*attempts: PodAttempt, status: str = "Running") -> JobUsage:
+def _job(
+    *attempts: PodAttempt,
+    status: str = "Running",
+    agent_managed: bool = False,
+    agent_state: str = "",
+    at_risk: bool = False,
+) -> JobUsage:
     active = next(
         (attempt for attempt in reversed(attempts) if attempt.running),
         attempts[-1] if attempts else None,
@@ -89,11 +99,13 @@ def _job(*attempts: PodAttempt, status: str = "Running") -> JobUsage:
         memory_used_gib=2.0,
         memory_requested_gib=16.0,
         age="3m",
-        at_risk=False,
+        at_risk=at_risk,
+        agent_managed=agent_managed,
+        agent_state=agent_state,
         uid="job-uid",
         active_pod=active.name if active else "",
         active_pod_uid=active.uid if active else "",
-        active_pod_state=active.phase if active else "No active pod",
+        active_pod_state=active.phase if active else "—",
         command="python -u train.py " + " ".join(f"--arg-{i}" for i in range(30)),
         gpu_requested_type="h100",
         gpu_requested_count=1,
@@ -111,6 +123,131 @@ def _job(*attempts: PodAttempt, status: str = "Running") -> JobUsage:
 
 
 class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
+    def test_agent_managed_metadata_uses_the_mcp_marker_only(self) -> None:
+        self.assertTrue(
+            _is_agent_managed_metadata(
+                {"labels": {"falcon.dev/agent-managed": "true"}}
+            )
+        )
+        self.assertTrue(
+            _is_agent_managed_metadata(
+                {"annotations": {"falcon.dev/managed-by": "mcp"}}
+            )
+        )
+        self.assertFalse(
+            _is_agent_managed_metadata(
+                {"labels": {"falcon.dev/managed": "true"}}
+            )
+        )
+
+    def test_agent_status_uses_spinner_failure_and_fixing_states(self) -> None:
+        running = _job(agent_managed=True, agent_state="connected")
+        self.assertEqual(_job_status_display(running, 0)[0], "◴")
+        self.assertEqual(_job_status_display(running, 1)[0], "◷")
+        for status in ("Pending", "Queued", "Suspended"):
+            connected = _job(status=status, agent_managed=True, agent_state="connected")
+            ordinary = _job_status_display(_job(status=status))
+            self.assertEqual(_job_status_display(connected, 0), ("◴", *ordinary[1:]))
+            self.assertEqual(_job_status_display(connected, 1), ("◷", *ordinary[1:]))
+            self.assertTrue(FalconDashboard._agent_is_connected(connected))
+        risk = _job(agent_managed=True, agent_state="connected", at_risk=True)
+        ordinary_risk = _job_status_display(_job(at_risk=True))
+        self.assertEqual(_job_status_display(risk, 0), ("◴", *ordinary_risk[1:]))
+        self.assertEqual(_job_status_display(risk, 1), ("◷", *ordinary_risk[1:]))
+        for status, icon in (("Failed", "✕"), ("Succeeded", "✓")):
+            terminal = _job(status=status, agent_managed=True, agent_state="connected")
+            self.assertEqual(_job_status_display(terminal, 1)[0], icon)
+            self.assertFalse(FalconDashboard._agent_is_connected(terminal))
+        for state in ("", "disconnected", "offline"):
+            disconnected = _job(agent_managed=True, agent_state=state)
+            self.assertEqual(
+                _job_status_display(disconnected, 1), _job_status_display(_job(), 1)
+            )
+            self.assertFalse(FalconDashboard._agent_is_connected(disconnected))
+        for status in ("Pending", "Queued", "Suspended", "Succeeded", "Failed"):
+            with self.subTest(status=status):
+                ordinary = _job_status_display(_job(status=status), 0)
+                managed = _job_status_display(_job(status=status, agent_managed=True), 0)
+                self.assertEqual(managed, ordinary)
+                for state in ("disconnected", "offline"):
+                    self.assertEqual(
+                        _job_status_display(
+                            _job(status=status, agent_managed=True, agent_state=state), 0
+                        ),
+                        ordinary,
+                    )
+
+        self.assertEqual(
+            _job_status_display(
+                _job(agent_managed=True, agent_state="disconnected", at_risk=True)
+            ),
+            _job_status_display(_job(at_risk=True)),
+        )
+
+        failed = _job(status="Failed", agent_managed=True)
+        self.assertEqual(_job_status_display(failed, 0)[0], "✕")
+
+        fixing = _job(
+            status="Pending",
+            agent_managed=True,
+            agent_state="fixing",
+        )
+        icon, label, _color = _job_status_display(fixing, 0)
+        self.assertEqual((icon, label), ("↻", "Fixing"))
+
+    def test_missing_active_pod_state_is_compact(self) -> None:
+        self.assertEqual(_active_pod_state_display("No active pod"), "—")
+        self.assertEqual(_active_pod_state_display(""), "—")
+
+    async def test_selected_status_updates_without_repainting_logs(self) -> None:
+        row = _job(
+            PodAttempt("current-attempt", "current-uid", "Running"),
+            agent_managed=True,
+            agent_state="connected",
+        )
+        app = FalconDashboard(
+            _Collector(row),
+            refresh_seconds=999,
+            log_manager=DashboardLogManager("team", client=_Client()),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.6)
+            await pilot.press("4", "enter")
+            await pilot.pause(0.2)
+            logs = app.query_one("#selected-logs-scroll")
+            app._spinner = 1
+            with patch.object(logs, "replace_content", wraps=logs.replace_content) as replace:
+                app._render_selected_status()
+            self.assertEqual(replace.call_count, 0)
+            self.assertEqual(app._selected_detail_cache[1][1], ("Status", "◷ Running"))
+
+    async def test_agent_managed_jobs_pulse_without_changing_log_view(self) -> None:
+        row = _job(
+            PodAttempt("current-attempt", "current-uid", "Running"),
+            agent_managed=True,
+            agent_state="connected",
+        )
+        app = FalconDashboard(
+            _Collector(row),
+            refresh_seconds=999,
+            log_manager=DashboardLogManager("team", client=_Client()),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.6)
+            self.assertTrue(app._agent_is_connected(row))
+            self.assertTrue(
+                any(glyph in app.export_screenshot(simplify=True) for glyph in "◴◷◶◵")
+            )
+            app._spinner = 1
+            app._render_jobs(layout=False)
+            self.assertEqual(_job_status_display(row, app._spinner)[0], "◷")
+
+            await pilot.press("4", "enter")
+            await pilot.pause(0.2)
+            logs = app.query_one("#selected-logs-scroll")
+            self.assertNotIn("MCP AGENT", logs.border_title)
+            self.assertNotIn("MCP AGENT", app.query_one("#selected-pane").border_subtitle)
+
     def test_copy_to_clipboard_uses_available_host_clipboard(self) -> None:
         app = FalconDashboard(_Collector(_job()))
         with patch(

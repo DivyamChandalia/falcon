@@ -9,6 +9,7 @@ import anyio
 import pytest
 
 from falcon.mcp_events import EventStore, Monitor
+from falcon.mcp_risk import McpGpuRiskEvaluator
 
 
 def job(*, completed=False, gpu=False):
@@ -116,6 +117,47 @@ async def test_waiters_share_watches_but_not_event_consumption(tmp_path, cancel_
 
 
 @pytest.mark.asyncio
+async def test_background_wait_delivers_vram_risk_after_irregular_samples(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    store = EventStore(tmp_path / "events.db")
+    streams = Streams()
+    evaluator = McpGpuRiskEvaluator()
+    sample_index = 0
+
+    async def metrics(names):
+        nonlocal sample_index
+        policy = evaluator.evaluate("job-uid", [{
+            "index": 0, "uuid": "gpu-0", "utilization": 99,
+            "memory_used_gib": 1, "memory_total_gib": 96,
+        }], 75, now=sample_index * 1.37)
+        sample_index += 1
+        return {"job-uid": {
+            "available": True, "at_risk": policy["at_risk"],
+            "metrics": {"eviction_policy": {"per_gpu": policy["devices"]}},
+        }}
+
+    monitor = Monitor(
+        SimpleNamespace(executable="kubectl"), "mine", store,
+        watcher=streams, metrics_provider=metrics,
+    )
+    monitor._metrics_interval = 0.001
+    waiting = asyncio.create_task(monitor.wait([job(gpu=True)], timeout=3))
+    try:
+        await streams.started()
+        result = await asyncio.wait_for(waiting, 2)
+        assert not result["timed_out"]
+        assert [event["type"] for event in result["events"]] == ["eviction_risk"]
+        device = result["events"][0]["details"]["risk"]["per_gpu"][0]
+        assert device["vram_at_risk"]
+        assert not device["gpu_at_risk"]
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_missing_metrics_do_not_falsely_clear_an_existing_risk(tmp_path):
     store = EventStore(tmp_path / "events.db")
     streams = Streams()
@@ -129,13 +171,25 @@ async def test_missing_metrics_do_not_falsely_clear_an_existing_risk(tmp_path):
         watcher=streams, metrics_provider=metrics,
     )
     monitor._metrics_interval = 0.01
-    waiting = asyncio.create_task(monitor.wait(
-        [job(gpu=True)], event_types=["eviction_risk_cleared"], timeout=3,
-    ))
+    first_wait = asyncio.create_task(
+        monitor.wait([job(gpu=True)], event_types=["eviction_risk"], timeout=3)
+    )
     try:
         await streams.started()
         await samples.put({"available": True, "at_risk": True})
-        await samples.put({"available": False, "at_risk": None})
+        first = await asyncio.wait_for(first_wait, 2)
+        assert first["events"][0]["type"] == "eviction_risk"
+
+        waiting = asyncio.create_task(
+            monitor.wait(
+                [job(gpu=True)],
+                cursor=first["cursor"],
+                event_types=["eviction_risk"],
+                timeout=0.3,
+            )
+        )
+        for _ in range(3):
+            await samples.put({"available": False, "at_risk": None})
         for _ in range(100):
             if any(event["type"] == "monitor_unavailable" for event in store.read(["job-uid"])):
                 break
@@ -144,11 +198,16 @@ async def test_missing_metrics_do_not_falsely_clear_an_existing_risk(tmp_path):
         assert not store.read(["job-uid"], event_types=["eviction_risk_cleared"])
         await samples.put({"available": True, "at_risk": False})
         result = await asyncio.wait_for(waiting, 2)
-        assert result["events"][0]["type"] == "eviction_risk_cleared"
+        assert result["events"] == []
+        assert result["timed_out"] is True
+        assert not store.read(["job-uid"], event_types=["eviction_risk_cleared"])
         assert len(store.read(["job-uid"], event_types=["eviction_risk"])) == 1
     finally:
-        waiting.cancel()
-        await asyncio.gather(waiting, return_exceptions=True)
+        first_wait.cancel()
+        await asyncio.gather(first_wait, return_exceptions=True)
+        if "waiting" in locals():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
         await monitor.close()
         store.close()
 

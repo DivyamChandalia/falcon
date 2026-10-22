@@ -6,8 +6,17 @@ sizes through wide monitoring displays. At `160×30` and larger, Dashboard uses
 two equal-width columns: Jobs occupies the upper half of the left column,
 Events occupies the remaining left-column space, Selected Job fills the right
 column above Resources, and Resources remains six rows high at the bottom.
-Below that breakpoint Dashboard keeps its stacked layout. Dashboard and
-Resources refresh on the same one-second cadence. At the shortest supported
+Below that breakpoint Dashboard keeps its stacked layout. Resources retains
+its one-second refresh cadence. Dashboard Job, Pod, and
+Event inventory updates arrive through Kubernetes watches, coalesced over
+100 milliseconds, rather than five-second full listings. CPU/memory metrics
+still refresh every five seconds and GPU telemetry streams roughly once per
+second. Each Dashboard owns three namespace watch streams using the same
+watch code as MCP; the processes do not share live connections.
+Transient interruptions retain the last valid data; expired resource versions
+trigger a fresh snapshot. If watching is forbidden but listing is allowed,
+that resource falls back to five-second polling and retries watches once per
+minute. `r` requests a fresh snapshot. At the shortest supported
 heights Events is temporarily hidden and returns automatically when space is
 available.
 The Resources header keeps its view selector on the title row. The summary

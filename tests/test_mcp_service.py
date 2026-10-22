@@ -995,6 +995,40 @@ async def test_wait_rejects_closed_service_before_creating_event_store(
 
 
 @pytest.mark.asyncio
+async def test_wait_accepts_longer_gpu_startup_grace_and_rejects_shorter_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    ref = {"name": "train", "namespace": "research", "uid": "job-uid-1"}
+
+    class Monitor:
+        def __init__(self, client, namespace, store, metrics_provider=None):
+            del client, namespace, store, metrics_provider
+
+        async def wait(self, jobs, *, cursor=None, event_types=None, timeout=0,
+                       scheduling_policy="report_blocked"):
+            assert scheduling_policy == "wait_for_capacity"
+            del jobs, cursor, event_types, timeout
+            return {"events": [], "cursor": 0, "timed_out": True}
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("falcon.mcp_events.Monitor", Monitor)
+    await service.wait_for_events(
+        [ref], timeout=0, startup_time_seconds=300,
+        scheduling_policy="wait_for_capacity",
+    )
+    assert service._monitor_startup_times["job-uid-1"] == 300.0
+    with pytest.raises(MCPServiceError, match="between 120 and"):
+        await service.wait_for_events(
+            [ref], timeout=0, startup_time_seconds=119
+        )
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_wait_reuses_one_monitor_and_closes_before_event_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1031,7 +1065,9 @@ async def test_wait_reuses_one_monitor_and_closes_before_event_store(
             del client, namespace, store, metrics_provider
             Monitor.instances += 1
 
-        async def wait(self, jobs, *, cursor=None, event_types=None, timeout=0):
+        async def wait(self, jobs, *, cursor=None, event_types=None, timeout=0,
+                       scheduling_policy="report_blocked"):
+            assert scheduling_policy == "report_blocked"
             assert jobs == [ref]
             assert timeout == 0
             return {

@@ -9,9 +9,12 @@ from falcon.mcp_config import (
     CLIENT_TOOL_TIMEOUT_MILLISECONDS,
     CLIENT_TOOL_TIMEOUT_SECONDS,
     client_config,
+    client_config_path,
     config_command,
     configuration,
+    detected_agents,
     render_config,
+    setup_configs,
 )
 
 
@@ -33,7 +36,7 @@ class MCPConfigTests(unittest.TestCase):
             "[mcp_servers.falcon]\n"
             'command = "falcon"\n'
             'args = ["mcp", "serve"]\n'
-            "tool_timeout_sec = 46800",
+            "tool_timeout_sec = 608400",
         )
 
     def test_claude_uses_stdio_and_millisecond_timeout(self) -> None:
@@ -94,6 +97,96 @@ class MCPConfigTests(unittest.TestCase):
             configuration("cursor")
         with self.assertRaisesRegex(ValueError, "unsupported MCP client"):
             render_config("cursor")
+
+    def test_client_paths_and_detected_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            (home / ".codex").mkdir(parents=True)
+            (home / ".config" / "opencode").mkdir(parents=True)
+
+            self.assertEqual(
+                client_config_path("codex", home=home),
+                home / ".codex" / "config.toml",
+            )
+            self.assertEqual(
+                client_config_path("claude", home=home), home / ".claude.json"
+            )
+            self.assertEqual(
+                client_config_path("opencode", home=home),
+                home / ".config" / "opencode" / "opencode.json",
+            )
+            self.assertEqual(
+                detected_agents(home=home, environ={"PATH": ""}),
+                ["codex", "opencode"],
+            )
+
+    def test_setup_merges_all_clients_and_backs_up_existing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            codex = home / ".codex" / "config.toml"
+            claude = home / ".claude.json"
+            opencode = home / ".config" / "opencode" / "opencode.json"
+            codex.parent.mkdir(parents=True)
+            claude.parent.mkdir(parents=True, exist_ok=True)
+            opencode.parent.mkdir(parents=True)
+            codex.write_text(
+                '[mcp_servers.other]\ncommand = "other"\n', encoding="utf-8"
+            )
+            claude.write_text(
+                json.dumps({"theme": "dark", "mcpServers": {"other": {}}}),
+                encoding="utf-8",
+            )
+            opencode.write_text(
+                json.dumps({"mcp": {"servers": {"other": {}}}}),
+                encoding="utf-8",
+            )
+
+            results = setup_configs(all_agents=True, home=home)
+
+            self.assertEqual([result.status for result in results], [
+                "configured", "configured", "configured"
+            ])
+            self.assertIn("[mcp_servers.other]", codex.read_text(encoding="utf-8"))
+            self.assertIn("[mcp_servers.falcon]", codex.read_text(encoding="utf-8"))
+            self.assertTrue(list(codex.parent.glob("config.toml.falcon-backup-*")))
+            claude_value = json.loads(claude.read_text(encoding="utf-8"))
+            self.assertEqual(claude_value["theme"], "dark")
+            self.assertIn("falcon", claude_value["mcpServers"])
+            opencode_value = json.loads(opencode.read_text(encoding="utf-8"))
+            self.assertIn("falcon", opencode_value["mcp"]["servers"])
+
+            unchanged = setup_configs(all_agents=True, home=home)
+            self.assertEqual(
+                [result.status for result in unchanged],
+                ["unchanged", "unchanged", "unchanged"],
+            )
+
+    def test_setup_dry_run_does_not_write_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            results = setup_configs(
+                ["codex", "claude", "opencode"], home=home, dry_run=True
+            )
+
+            self.assertEqual(
+                [result.status for result in results],
+                ["would configure", "would configure", "would configure"],
+            )
+            self.assertFalse(home.exists())
+
+    def test_setup_preserves_existing_opencode_direct_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            path = client_config_path("opencode", home=home)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"mcp": {"other": {}}}), encoding="utf-8")
+
+            setup_configs(["opencode"], home=home)
+
+            value = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn("other", value["mcp"])
+            self.assertIn("falcon", value["mcp"])
+            self.assertNotIn("servers", value["mcp"])
 
 
 if __name__ == "__main__":

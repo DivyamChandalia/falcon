@@ -72,6 +72,15 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
             assert tools["submit_job"].annotations.idempotentHint
             schema = tools["submit_job"].inputSchema
             assert "idempotency_key" in schema["required"]
+            policy = tools["wait_for_events"].inputSchema["properties"]["scheduling_policy"]
+            assert "timeout" not in tools["wait_for_events"].inputSchema["properties"]
+            assert policy["default"] == "report_blocked"
+            assert policy["enum"] == ["report_blocked", "wait_for_capacity"]
+            event_filter = tools["wait_for_events"].inputSchema["properties"]["event_types"]
+            choices = next(item for item in event_filter["anyOf"] if item["type"] == "array")
+            assert set(choices["items"]["enum"]) == {
+                "succeeded", "failed", "pod_failed", "evicted", "eviction_risk", "warning",
+            }
             service.assert_not_called()
 
 
@@ -97,7 +106,7 @@ async def test_protocol_submission_and_schema_validation():
 
 
 @pytest.mark.asyncio
-async def test_wait_does_not_block_other_tools_or_produce_empty_updates():
+async def test_synchronous_wait_stays_pending_until_event_and_allows_other_tools():
     service = FakeService(DEFAULT_CONFIG)
     server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
     async with create_connected_server_and_client_session(server) as session:
@@ -109,7 +118,103 @@ async def test_wait_does_not_block_other_tools_or_produce_empty_updates():
         service.release.set()
         event = await asyncio.wait_for(waiting, 2)
         assert event.structuredContent["events"][0]["type"] == "failed"
-        assert service.calls[0][2]["timeout"] == 43200
+        assert service.calls[0][2]["timeout"] == 604800
+        assert service.calls[0][2]["scheduling_policy"] == "report_blocked"
+
+
+@pytest.mark.asyncio
+async def test_expired_wait_offers_cursor_safe_continuation_with_original_settings():
+    service = FakeService(DEFAULT_CONFIG)
+
+    async def wait(jobs, **kwargs):
+        service.calls.append(("wait", jobs, kwargs))
+        if len(service.calls) == 1:
+            return {"events": [], "cursor": 71, "timed_out": True}
+        return {"events": [{"type": "succeeded", "job": jobs[0]}], "cursor": 72}
+
+    service.wait_for_events = wait
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("wait_for_events", {
+            "jobs": [REF], "cursor": 12, "event_types": ["succeeded", "failed"],
+            "scheduling_policy": "wait_for_capacity", "startup_time_seconds": 600,
+        })
+        assert not result.isError
+        continuation = result.structuredContent["continuation"]
+        assert continuation["arguments"] == {
+            "jobs": [REF], "cursor": 71, "event_types": ["succeeded", "failed"],
+            "scheduling_policy": "wait_for_capacity", "startup_time_seconds": 600,
+        }
+        assert service.calls[0][2]["timeout"] == 604800
+        resumed = await session.call_tool(continuation["tool"], continuation["arguments"])
+        assert resumed.structuredContent["events"][0]["type"] == "succeeded"
+        assert "continuation" not in resumed.structuredContent
+        assert service.calls[1][2]["cursor"] == 71
+        assert service.calls[1][2]["timeout"] == 604800
+
+
+@pytest.mark.asyncio
+async def test_deleted_job_does_not_offer_wait_continuation():
+    service = FakeService(DEFAULT_CONFIG)
+
+    async def wait(jobs, **kwargs):
+        return {"events": [], "cursor": 71, "timed_out": False, "disconnected": True}
+
+    service.wait_for_events = wait
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("wait_for_events", {"jobs": [REF]})
+        assert not result.isError
+        assert result.structuredContent["disconnected"]
+        assert "continuation" not in result.structuredContent
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_shorten_the_fixed_wait():
+    service = FakeService(DEFAULT_CONFIG)
+    service.release.set()
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("wait_for_events", {
+            "jobs": [REF], "timeout": 0,
+        })
+        # Hosts may reject unknown arguments or ignore them, but an old caller
+        # must never be able to shorten the wait through a removed parameter.
+        if result.isError:
+            assert not service.calls
+        else:
+            assert service.calls[0][2]["timeout"] == 604800
+
+
+@pytest.mark.asyncio
+async def test_protocol_wait_accepts_capacity_policy_and_rejects_unknown_value():
+    service = FakeService(DEFAULT_CONFIG)
+    service.release.set()
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("wait_for_events", {
+            "jobs": [REF], "scheduling_policy": "wait_for_capacity",
+        })
+        assert not result.isError
+        assert service.calls[0][2]["scheduling_policy"] == "wait_for_capacity"
+        invalid = await session.call_tool("wait_for_events", {
+            "jobs": [REF], "scheduling_policy": "later",
+        })
+        assert invalid.isError
+        assert len(service.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["monitor_unavailable", "monitor_recovered"])
+async def test_protocol_rejects_internal_monitor_events(event_type):
+    with patch("falcon.mcp_server.JobService") as service:
+        server = create_server(DEFAULT_CONFIG)
+        async with create_connected_server_and_client_session(server) as session:
+            result = await session.call_tool("wait_for_events", {
+                "jobs": [REF], "event_types": [event_type],
+            })
+            assert result.isError
+            service.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -135,7 +240,7 @@ def test_cli_mcp_help_without_loading_sdk_or_starting_a_server():
     assert args.mcp_command == "config"
 
 
-def test_cli_missing_optional_dependency_has_actionable_message():
+def test_cli_missing_mcp_dependency_has_actionable_message():
     import builtins
 
     from falcon.cli import main
@@ -143,7 +248,7 @@ def test_cli_missing_optional_dependency_has_actionable_message():
     original = builtins.__import__
 
     def without_sdk(name, *args, **kwargs):
-        if name == "mcp_server":
+        if name in {"mcp_server", "falcon.mcp_server"}:
             raise ImportError("mcp not installed")
         return original(name, *args, **kwargs)
 
@@ -152,5 +257,6 @@ def test_cli_missing_optional_dependency_has_actionable_message():
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(["mcp", "serve"])
     assert code == 2
-    assert "falcon-k8s[mcp]" in err.getvalue()
+    assert "pip install --force-reinstall falcon-k8s" in err.getvalue()
+    assert "optional" not in err.getvalue().lower()
     assert out.getvalue() == ""

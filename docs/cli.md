@@ -154,12 +154,25 @@ than attempting to scrape either dashboard.
 ## Setup
 
 ```text
-falcon setup [--non-interactive] [--no-shell]
+falcon setup [--non-interactive] [--no-shell] [--configure-mcp [AGENTS]]
+             [--skill-mode mcp|legacy]
 falcon setup --install-skills codex,claude,opencode
 falcon setup --uninstall-skills codex
 falcon completion [bash|zsh]
 falcon config
 ```
+
+Interactive setup offers to configure Falcon's MCP server for detected Codex,
+Claude Code, and OpenCode installations. Use
+`falcon setup --non-interactive --configure-mcp all` to configure all three
+without prompting, `--mcp-dry-run` to preview changes, or `--skip-mcp` to
+skip the offer. Existing client files are merged safely and backed up before
+they are changed.
+
+The MCP-first skill is the default. Use
+`falcon setup --install-skills codex,claude,opencode --skill-mode legacy` to
+retain the previous direct-CLI skill; legacy mode skips MCP configuration
+unless `--configure-mcp` is explicitly supplied.
 
 `falcon setup` detects the active `kubectl`. When the executable is installed
 outside the user's home directory, setup copies it to
@@ -182,7 +195,9 @@ falcon update --check
 the official `DivyamChandalia/falcon` GitHub repository. A virtualenv or Conda
 environment is updated in place; a system interpreter uses the user site and
 does not request administrator access. After a successful update, Falcon
-prints up to three short entries from the latest `CHANGELOG.md` section. If
+refreshes existing Falcon-managed agent skills in their recorded mode (MCP or
+legacy) without installing new skills or overwriting edited copies, and prints
+up to three short entries from the latest `CHANGELOG.md` section. If
 the changelog cannot be fetched, the update still succeeds. `--check` only
 compares the installed semantic version with the version declared on the
 repository's `main` branch.

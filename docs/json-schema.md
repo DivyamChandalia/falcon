@@ -34,8 +34,11 @@ and memory utilization over one bounded observation interval. Percentages use
 only the current active allocation. The response also includes raw allocation
 denominators and the configured average GPU/VRAM-utilization eviction floors.
 The `eviction_policy` object reports the GPU and VRAM floors and whether each
-observed average meets its floor; the dashboard treats either failing metric as
-eviction risk.
+observed average meets its floor; the dashboard treats either failing metric on
+any physical GPU as eviction risk. Monitoring applies a 120-second minimum
+startup grace, a 30-second minimum qualification window, and then a rolling
+window that grows to five minutes. A slower ten-minute EMA is also exposed for
+diagnostics.
 Missing telemetry remains `null`. `falcon metrics` always emits this JSON
 object; no output-format flag is required.
 

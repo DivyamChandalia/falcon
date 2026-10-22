@@ -31,11 +31,13 @@ from textual.css.query import NoMatches
 from textual.geometry import NULL_OFFSET, Offset, Region, Size
 from textual.layout import ArrangeResult, Layout, WidgetPlacement
 from textual.layouts.vertical import VerticalLayout
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Button, Input, RichLog, Static
 
+from .agent_presence import connected_jobs
 from .dashboard import (
     KUBERNETES_USAGE_SECONDS,
     JobEvent,
@@ -73,6 +75,21 @@ from .theme import (
     YELLOW,
     configure_color,
 )
+
+
+class InventoryChanged(Message):
+    """Coalesced wakeup from the namespace watch thread."""
+
+
+AGENT_PRESENCE_REFRESH_SECONDS = 1.0
+
+
+class AgentPresenceChanged(Message):
+    """Local wait leases changed independently of Kubernetes inventory."""
+
+    def __init__(self, uids: Set[str]) -> None:
+        super().__init__()
+        self.uids = uids
 
 
 def _restart_job_manifest(job: Dict, new_name: str, namespace: str) -> Dict:
@@ -190,7 +207,7 @@ RESOURCE_PANE_HEIGHT = 6
 # selected/mark indicator are both rendered in full.
 JOBS_MARK_WIDTH = 6
 JOBS_STATUS_WIDTH = 15  # ``● Eviction risk``
-JOBS_ACTIVE_POD_WIDTH = 13  # ``No active pod``
+JOBS_ACTIVE_POD_WIDTH = 13  # Keep the fixed column wide enough for pod states.
 JOBS_NODE_WIDTH = 12
 JOBS_GPU_WIDTH = 9  # ``pro6000x2``
 JOBS_RESTARTS_WIDTH = 8
@@ -202,6 +219,16 @@ def _display_log_line(value: str) -> str:
     """Keep pathological single-line output from dominating Rich layout."""
 
     return _truncate(value, MAX_DISPLAY_LOG_LINE_CHARS)
+
+
+NO_ACTIVE_POD = "—"
+
+
+def _active_pod_state_display(value: str) -> str:
+    """Use a compact marker when a Job has no current Pod attempt."""
+
+    state = str(value or "").strip()
+    return NO_ACTIVE_POD if not state or state.casefold() == "no active pod" else state
 
 
 class DashboardBodyLayout(Layout):
@@ -436,8 +463,21 @@ def _status_style(status: str) -> Tuple[str, str]:
     return ("●", PALETTE.warning)
 
 
-def _job_status_display(row: JobUsage) -> Tuple[str, str, str]:
+def _job_status_display(row: JobUsage, spinner: int = 0) -> Tuple[str, str, str]:
     """Return icon, label, and color for the Jobs-table status cell."""
+    if row.agent_managed:
+        state = row.agent_state.strip().lower()
+        status = row.status.strip().lower()
+        if status in {"failed", "unknown"}:
+            return "✕", row.status, PALETTE.danger
+        if state == "fixing" and status not in {"running", "succeeded"}:
+            return "↻", "Fixing", PALETTE.warning
+        if status in {"succeeded", "completed"}:
+            return "✓", row.status, PALETTE.success
+        if state == "connected":
+            if row.at_risk:
+                return "◴◷◶◵"[spinner % 4], "Eviction risk", PALETTE.warning
+            return "◴◷◶◵"[spinner % 4], row.status, _status_style(row.status)[1]
     if row.at_risk:
         return "●", "Eviction risk", PALETTE.warning
     icon, color = _status_style(row.status)
@@ -1143,6 +1183,13 @@ class SelectedJobInspector(Container):
             attempt_label=attempt_label,
         )
 
+    def update_details(self, detail_columns) -> None:
+        """Refresh metadata without rebuilding the log viewport."""
+
+        left_details, right_details = detail_columns
+        self.query_one("#selected-details-left", Static).update(left_details)
+        self.query_one("#selected-details-right", Static).update(right_details)
+
     def update_logs(
         self,
         logs: LogSnapshot,
@@ -1717,6 +1764,12 @@ class FalconDashboard(App):
         self.histories: Dict[str, Deque[MetricPoint]] = {}
         self.summary_history: Deque[MetricPoint] = deque(maxlen=120)
         self._refreshing = False
+        self._inventory_notification_lock = threading.Lock()
+        self._inventory_notification_pending = False
+        self._inventory_unsubscribe = None
+        self._presence_stop = threading.Event()
+        self._presence_thread = None
+        self._last_api_error = None
         self._stale = False
         self._spinner = 0
         self._result_queue = __import__("queue").Queue(maxsize=1)
@@ -1731,6 +1784,9 @@ class FalconDashboard(App):
         self._resource_pane_scroll_callback_pending = False
         self._building_expanded_resource = False
         self._selected_log_view_key: Optional[Tuple[str, str, int]] = None
+        self._selected_detail_cache: Optional[
+            Tuple[str, List[Tuple[str, str]], List[Tuple[str, str]]]
+        ] = None
         self._jobs_render_pending = False
         self._selection_render_pending = False
 
@@ -1770,6 +1826,11 @@ class FalconDashboard(App):
             scroll_visible=False,
         )
         self._apply_layout()
+        self._start_presence_monitor()
+        source = getattr(self.collector, "inventory_source", None)
+        if source is not None:
+            self._inventory_unsubscribe = source.subscribe(self._inventory_changed)
+            self._inventory_changed()
         self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
@@ -1784,6 +1845,9 @@ class FalconDashboard(App):
         self._render_all()
 
     def on_unmount(self) -> None:
+        self._presence_stop.set()
+        if self._inventory_unsubscribe:
+            self._inventory_unsubscribe()
         for sessions in self._terminals.values():
             for session in sessions:
                 session.close()
@@ -1792,6 +1856,45 @@ class FalconDashboard(App):
         close = getattr(self.collector, "close", None)
         if close:
             close()
+
+    def _start_presence_monitor(self) -> None:
+        namespace = getattr(self.collector, "namespace", None)
+        if not namespace:
+            return
+        context = getattr(self.collector, "context", None)
+
+        def monitor():
+            previous = None
+            while not self._presence_stop.is_set():
+                uids = connected_jobs(context, namespace)
+                if uids != previous and not self._presence_stop.is_set():
+                    self.post_message(AgentPresenceChanged(uids))
+                    previous = uids
+                if self._presence_stop.wait(AGENT_PRESENCE_REFRESH_SECONDS):
+                    break
+
+        self._presence_thread = threading.Thread(
+            target=monitor, name="falcon-dashboard-presence", daemon=True,
+        )
+        self._presence_thread.start()
+
+    def on_agent_presence_changed(self, message: AgentPresenceChanged) -> None:
+        changed = set()
+        for row in self.rows:
+            if not row.agent_managed or row.status.lower() in {
+                "failed", "unknown", "succeeded", "completed",
+            }:
+                continue
+            state = "connected" if row.uid in message.uids else "disconnected"
+            if state != row.agent_state:
+                row.agent_state = state
+                changed.add(row.uid)
+        if not changed:
+            return
+        self._render_jobs(layout=False)
+        selected = self._selected_row()
+        if selected is not None and selected.uid in changed:
+            self._render_selected_status()
 
     def on_resize(self, event: events.Resize) -> None:
         # Some terminal backends dispatch Resize before Textual commits the
@@ -1829,9 +1932,25 @@ class FalconDashboard(App):
         self._spinner = (self._spinner + 1) % 4
         try:
             self._render_header()
+            # Repaint only the Jobs table while an agent-owned workload is
+            # active. Keep the selected-job status in sync without making the
+            # log/metrics panes redraw on every frame.
+            if any(self._agent_is_connected(row) for row in self.filtered_rows):
+                self._render_jobs(layout=False)
+                selected = self._selected_row()
+                if selected is not None and self._agent_is_connected(selected):
+                    self._render_selected_status()
         except Exception:
             # A timer may race with Textual tearing down the default screen.
             return
+
+    @staticmethod
+    def _agent_is_connected(row: JobUsage) -> bool:
+        """Animate nonterminal Jobs with an active wait_for_events lease."""
+        return (
+            row.agent_managed and row.agent_state == "connected"
+            and row.status.strip().lower() not in {"failed", "unknown", "succeeded", "completed"}
+        )
 
     def pane_focused(self, pane: str) -> None:
         self.state.focused_pane = pane
@@ -2061,6 +2180,50 @@ class FalconDashboard(App):
         ram = _percent(sum(row.memory_used_gib for row in self.rows), sum(row.memory_requested_gib for row in self.rows))
         self.summary_history.append(MetricPoint(time.time(), gpu, None, cpu, ram))
 
+    def _inventory_changed(self) -> None:
+        with self._inventory_notification_lock:
+            if self._inventory_notification_pending:
+                return
+            self._inventory_notification_pending = True
+        self.post_message(InventoryChanged())
+
+    def on_inventory_changed(self, message: InventoryChanged) -> None:
+        self.set_timer(0.1, self._flush_inventory)
+
+    def _flush_inventory(self) -> None:
+        with self._inventory_notification_lock:
+            self._inventory_notification_pending = False
+        if not self.is_mounted:
+            return
+        previous_uid = self.state.cursor_job_uid
+        previous_events = self.job_events
+        previous_stale = self._stale
+        rows = self.collector.collect_inventory()
+        rows_changed = rows != self.rows
+        self.rows = rows
+        self.state.marked_job_uids.intersection_update(row.uid for row in self.rows)
+        self._filter_rows()
+        selected = self._selected_row()
+        self.job_events = (
+            self.collector.events(selected)
+            if selected and "events" not in self.state.hidden_panes else []
+        )
+        self._stale = bool(self.collector.last_error)
+        self.state.last_successful_refresh = self.collector.last_successful_refresh
+        if rows_changed and self.log_manager is not None:
+            self.log_manager.reconcile(self.rows)
+        if rows_changed:
+            self._render_summary()
+            self._render_controls()
+            self._render_jobs(layout=False)
+            self._render_selected()
+            self._render_resources()
+            self._render_footer()
+        if previous_events != self.job_events or previous_uid != self.state.cursor_job_uid:
+            self._render_events()
+        if previous_stale != self._stale:
+            self._render_header()
+
     def _request_update(self) -> None:
         if self._refreshing:
             return
@@ -2101,6 +2264,12 @@ class FalconDashboard(App):
         self._refreshing = False
         self.state.loading_states["refresh"] = False
         if rows is not None:
+            if getattr(self.collector, "inventory_source", None) is not None:
+                # An inventory event can arrive while the metrics worker is
+                # blocked in kubectl top. Never restore its older Job state.
+                rows = self.collector.collect_inventory()
+                error = self.collector.last_error or None
+                refreshed_at = self.collector.last_successful_refresh
             current_uids = {row.uid for row in rows}
             self.state.marked_job_uids.intersection_update(current_uids)
             self.rows = rows
@@ -2111,16 +2280,21 @@ class FalconDashboard(App):
             self._stale = bool(error)
             self._record_history()
             self._filter_rows()
+            if getattr(self.collector, "inventory_source", None) is not None:
+                selected = self._selected_row()
+                self.job_events = self.collector.events(selected) if selected else []
+                event_uid = self.state.cursor_job_uid
             if self.log_manager is not None:
                 self.log_manager.reconcile(self.rows)
-            if error:
+            if error and error != self._last_api_error:
                 self.notify(f"API error: {error} · retrying…", severity="warning")
             if event_uid != self.state.cursor_job_uid:
                 self._request_update()
         else:
             self._stale = True
-            if error:
+            if error and error != self._last_api_error:
                 self.notify(f"API error: {error} · retrying…", severity="error")
+        self._last_api_error = error
         try:
             self._render_all()
         except NoMatches:
@@ -2346,14 +2520,14 @@ class FalconDashboard(App):
             marked = row.uid in self.state.marked_job_uids
             marker = ">" if selected else " "
             mark = "[x]" if marked else "[ ]"
-            icon, status_text, status_color = _job_status_display(row)
+            icon, status_text, status_color = _job_status_display(row, self._spinner)
             selection_active = selected and jobs_focused
             cells: List[Text] = [Text(f"{marker}{mark}", style=CYAN if selection_active or marked else GRAY)]
             name_style = f"bold {WHITE}" if selected else WHITE
             cells.append(Text(row.job, style=name_style, no_wrap=True, overflow="ellipsis"))
             cells.append(Text(f"{icon} {status_text}", style=status_color))
             if show_active_pod:
-                cells.append(Text(row.active_pod_state, style=WHITE, no_wrap=True, overflow="ellipsis"))
+                cells.append(Text(_active_pod_state_display(row.active_pod_state), style=WHITE, no_wrap=True, overflow="ellipsis"))
             if show_node:
                 cells.append(Text(row.nodes, style=WHITE))
             if show_gpu:
@@ -2998,6 +3172,70 @@ class FalconDashboard(App):
         self._set_selected_subtitle()
         self._render_selected()
 
+    def _selected_detail_table(
+        self,
+        row: JobUsage,
+        values: List[Tuple[str, str]],
+        status_color: str,
+    ) -> Table:
+        table = Table.grid(expand=True, padding=(0, 1))
+        # Keep each metadata item to one terminal row. In addition to avoiding
+        # wrapped pod names, this guarantees that the Command row cannot
+        # overlap the right column's last row.
+        table.add_column(
+            style=GRAY, width=18, no_wrap=True, overflow="ellipsis"
+        )
+        table.add_column(
+            style=WHITE, ratio=1, no_wrap=True, overflow="ellipsis"
+        )
+        for label, value in values:
+            value_style = (
+                status_color
+                if label == "Status"
+                else RED
+                if label == "Eviction risk" and row.at_risk
+                else WHITE
+            )
+            table.add_row(label, Text(value, style=value_style))
+        return table
+
+    def _render_selected_status(self) -> None:
+        """Update selected-job status without repainting logs or charts."""
+
+        row = self._selected_row()
+        if row is None:
+            return
+        if not self._selected_inspector_visible():
+            self._render_selected()
+            return
+        try:
+            inspector = self.query_one("#selected-inspector", SelectedJobInspector)
+        except NoMatches:
+            return
+        # Demo mode may intentionally render its legacy overview in the parent
+        # pane even though the inspector layout is logically selected.
+        if not inspector.display:
+            self._render_selected()
+            return
+        cache = self._selected_detail_cache
+        if cache is None or cache[0] != row.uid:
+            self._render_selected()
+            return
+        status_icon, status_label, status_color = _job_status_display(
+            row, self._spinner
+        )
+        details = list(cache[1])
+        if len(details) > 1 and details[1][0] == "Status":
+            details[1] = ("Status", f"{status_icon} {status_label}")
+        right_details = list(cache[2])
+        inspector.update_details(
+            (
+                self._selected_detail_table(row, details, status_color),
+                self._selected_detail_table(row, right_details, status_color),
+            )
+        )
+        self._selected_detail_cache = (row.uid, details, right_details)
+
     def _render_selected(self) -> None:
         row = self._selected_row()
         target = self.query_one("#selected-pane", DashboardPane)
@@ -3009,6 +3247,7 @@ class FalconDashboard(App):
         inspector = target.query_one("#selected-inspector", SelectedJobInspector)
         if not row:
             self._selected_log_view_key = None
+            self._selected_detail_cache = None
             compact_content.update(Text("No Job selected", style=MUTED))
             inspector.clear()
             compact_content.display = True
@@ -3017,17 +3256,17 @@ class FalconDashboard(App):
         if inspector_visible:
             compact_content.display = False
             inspector.display = True
-            status_icon, status_color = _status_style(row.status)
+            status_icon, status_label, status_color = _job_status_display(row, self._spinner)
             attempt = self._selected_attempt(row)
             attempts = self._selected_attempts(row)
             attempt_index = attempts.index(attempt) if attempt in attempts else -1
             selected_pod = attempt.name if attempt is not None else (row.active_pod or "—")
-            pod_phase = attempt.phase if attempt is not None else (row.active_pod_state or "—")
+            pod_phase = attempt.phase if attempt is not None else _active_pod_state_display(row.active_pod_state)
             pod_uid = _truncate(attempt.uid, 16) if attempt is not None and attempt.uid else "—"
             pod_container = attempt.container if attempt is not None and attempt.container else "—"
             details = [
-                ("Job", row.job), ("Status", f"{status_icon} {row.status}"),
-                ("Active pod state", row.active_pod_state), ("Active pod", row.active_pod or "—"),
+                ("Job", row.job), ("Status", f"{status_icon} {status_label}"),
+                ("Active pod state", _active_pod_state_display(row.active_pod_state)), ("Active pod", row.active_pod or "—"),
                 ("Node", row.nodes), ("Age", row.age),
                 (
                     "GPU requested",
@@ -3089,29 +3328,15 @@ class FalconDashboard(App):
                         else "—",
                     ),
                 ]
-            def detail_table(values: List[Tuple[str, str]]) -> Table:
-                table = Table.grid(expand=True, padding=(0, 1))
-                # Keep each metadata item to one terminal row.  In addition
-                # to avoiding wrapped pod names, this guarantees that the
-                # Command row cannot overlap the right column's last row.
-                table.add_column(
-                    style=GRAY, width=18, no_wrap=True, overflow="ellipsis"
-                )
-                table.add_column(
-                    style=WHITE, ratio=1, no_wrap=True, overflow="ellipsis"
-                )
-                for label, value in values:
-                    value_style = (
-                        status_color
-                        if label == "Status"
-                        else RED
-                        if label == "Eviction risk" and row.at_risk
-                        else WHITE
-                    )
-                    table.add_row(label, Text(value, style=value_style))
-                return table
-
-            detail_columns = (detail_table(details), detail_table(right_details))
+            self._selected_detail_cache = (
+                row.uid,
+                list(details),
+                list(right_details),
+            )
+            detail_columns = (
+                self._selected_detail_table(row, details, status_color),
+                self._selected_detail_table(row, right_details, status_color),
+            )
             # Demo collectors do not own a Kubernetes log manager. Keep their
             # explicit full-screen rendering as a single Rich page so the
             # deterministic visual/scroll fixtures remain useful without
@@ -3190,7 +3415,10 @@ class FalconDashboard(App):
         command = _truncate(row.command or "—", max(8, self.size.width // 3))
         marked = len(self.state.marked_job_uids)
         text = Text(row.job, style=f"bold {WHITE}")
-        text.append(f"   {row.status}   Active pod: {row.active_pod_state}   {row.nodes}   {row.age}", style=GRAY)
+        status_icon, status_label, status_color = _job_status_display(row, self._spinner)
+        text.append("   ", style=GRAY)
+        text.append(f"{status_icon} {status_label}", style=status_color)
+        text.append(f"   Active pod: {_active_pod_state_display(row.active_pod_state)}   {row.nodes}   {row.age}", style=GRAY)
         if command and self.size.width >= 90:
             text.append(f"   {command}", style=WHITE)
         if marked:
@@ -3422,7 +3650,7 @@ class FalconDashboard(App):
         return grid
 
     def _selected_resource_strip(self, row: JobUsage, layout: str) -> Panel:
-        icon, status_color = _status_style(row.status)
+        icon, status_label, status_color = _job_status_display(row, self._spinner)
         command = row.command or "—"
         risk = ""
         if row.at_risk:
@@ -3439,21 +3667,21 @@ class FalconDashboard(App):
         if layout == "wide":
             text.append("Selected job: ", style=GRAY)
             text.append(_truncate(row.job, max(20, self.size.width // 4)), style=f"bold {CYAN_2}")
-            text.append(f"   {icon} {row.status}", style=status_color)
-            text.append(f"   Active Pod {row.active_pod_state}   ", style=GRAY)
+            text.append(f"   {icon} {status_label}", style=status_color)
+            text.append(f"   Active Pod {_active_pod_state_display(row.active_pod_state)}   ", style=GRAY)
             text.append(row.nodes, style=CYAN_2)
             text.append(f"   {row.age}   ", style=GRAY)
             text.append(_truncate(command, max(12, self.size.width - 106)), style=WHITE)
         elif layout == "compact":
             text.append("Job: ", style=GRAY)
             text.append(_truncate(row.job, max(20, self.size.width - 8)), style=f"bold {CYAN_2}")
-            text.append(f"\n{icon} {row.status} | Pod {row.active_pod_state} | ", style=status_color)
+            text.append(f"\n{icon} {status_label} | Pod {_active_pod_state_display(row.active_pod_state)} | ", style=status_color)
             text.append(f"{row.nodes} | {row.age} | ", style=GRAY)
             text.append(_truncate(command, max(12, self.size.width // 2)), style=WHITE)
         else:
             text.append("Job: ", style=GRAY)
             text.append(_truncate(row.job, max(12, self.size.width // 3)), style=f"bold {CYAN_2}")
-            text.append(f" | {row.status} | Pod {row.active_pod_state} | {row.nodes} | {row.age} | ", style=GRAY)
+            text.append(f" | {status_label} | Pod {_active_pod_state_display(row.active_pod_state)} | {row.nodes} | {row.age} | ", style=GRAY)
             text.append(_truncate(command, max(8, self.size.width // 4)), style=WHITE)
         if risk:
             text.append("\n" + risk, style=f"bold {RED}")
@@ -4035,7 +4263,11 @@ class FalconDashboard(App):
                 force=True,
                 immediate=False,
             )
-        self._request_update()
+        if getattr(self.collector, "inventory_source", None) is not None:
+            selected = self._selected_row()
+            self.job_events = self.collector.events(selected) if selected else []
+        else:
+            self._request_update()
         self._schedule_selection_render()
 
     def _schedule_selection_render(self) -> None:
@@ -4674,7 +4906,7 @@ class FalconDashboard(App):
                     detail = f" · {failures[0]}" if failures else ""
                     self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed{detail}", severity="error")
                 invalidate = getattr(self.collector, "invalidate", None)
-                if invalidate:
+                if invalidate and getattr(self.collector, "inventory_source", None) is None:
                     invalidate()
                 self._request_update()
             self.call_from_thread(finish)

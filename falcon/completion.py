@@ -76,7 +76,8 @@ OPTIONS: Dict[str, List[str]] = {
     ],
     "setup": [
         "--force", "--non-interactive", "--no-shell", "--install-skills",
-        "--skip-skills", "--uninstall-skills",
+        "--skip-skills", "--uninstall-skills", "--configure-mcp", "--skip-mcp",
+        "--mcp-dry-run", "--skill-mode", "mcp", "legacy",
     ],
     "completion": ["bash", "zsh"],
     "update": ["--check"],

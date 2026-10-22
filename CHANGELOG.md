@@ -6,11 +6,49 @@
   new Pods. Old terminated Pods remain available for logs, and interrupted
   restarts can be safely resumed with the same idempotency key.
 
+- Simplified agent monitoring to one synchronous, long-lived MCP wait; removed
+  advice to background the call and end the turn before an event arrives.
+
+- Fixed MCP GPU/VRAM risk remaining stuck in qualification when real sampling
+  intervals do not align exactly with the minimum rolling window.
+
+- Agent-facing `wait_for_events` now always waits up to seven days, without
+  exposing a timeout parameter that encourages short polling calls. On expiry,
+  a continuation lets the agent follow the same Jobs for another seven days.
+
+- Dashboard agent animation now requires an active `wait_for_events`
+  connection; otherwise Jobs retain their original status dot and colour.
+  Retained background watches alone no longer imply agent presence.
+  Connected Pending and eviction-risk Jobs also animate, keeping their colours.
+- Fixed wait reconnection indicators remaining stale while Dashboard metrics
+  requests are blocked or Kubernetes inventory is unchanged.
+
+- Added `wait_for_events(scheduling_policy="wait_for_capacity")` for agents
+  scheduling Jobs that may queue for resources; other errors still wake the
+  agent. Restored Pending status colours while retaining the managed-running
+  animation.
+
+- Dashboard Job, Pod, and Event updates now use Kubernetes watches for prompt
+  status changes and fewer full inventory downloads; metrics retain their
+  existing sampling intervals.
+- Fixed MCP monitoring on kubectl versions without `get --resource-version`:
+  watches now resume through raw Kubernetes API URLs with the resource version
+  preserved in the query, avoiding flag errors and needless reconnect gaps.
+
 - Added optional MCP job tools for coding agents, with server-side event waits,
   bounded per-attempt logs, metrics, and retry-safe submission/relaunch.
 - Agent-managed Jobs disable automatic retries so failures return control to
   the agent. Existing CLI retry settings and agent permissions are unchanged.
 - Added `falcon mcp config` snippets for Codex, Claude Code, and OpenCode.
+- `falcon setup` can now configure Falcon MCP automatically for Codex, Claude
+  Code, and OpenCode, with safe merges, backups, and a dry-run option.
+- Added `--skill-mode legacy` to retain the pre-MCP direct-CLI agent skill.
+- `falcon update` now refreshes existing Falcon-managed agent skills while
+  preserving each agent's MCP or legacy mode and protecting edited copies.
+- MCP event waits now keep all monitor health changes internal, retry outages
+  until recovery without an outage deadline (subject to wait timeout/cancellation),
+  debounce persistent outages, and avoid repeating namespace-wide baseline
+  lists when an active wait is re-armed.
 
 ## 0.4.7 — 2026-10-13
 

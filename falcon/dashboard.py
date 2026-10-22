@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
+from .agent_presence import connected_jobs
 from .coder import CoderClient, CoderError, resolve_connection
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
@@ -20,7 +21,9 @@ from .config import (
     save_dashboard_sort,
     save_hidden_panes,
 )
+from .dashboard_inventory import DashboardInventory
 from .dashboard_logs import DashboardLogManager
+from .kubernetes import KubernetesClient
 from .resource_service import ResourceServiceCollector
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
@@ -108,10 +111,15 @@ class JobUsage:
     memory_requested_gib: float
     age: str
     at_risk: bool
+    # MCP-created Jobs opt into Falcon's agent-owned lifecycle. Keep this as
+    # row metadata rather than adding another table column; the Dashboard can
+    # use it for the status-cell animation.
+    agent_managed: bool = False
+    agent_state: str = ""
     uid: str = ""
     active_pod: str = ""
     active_pod_uid: str = ""
-    active_pod_state: str = "Unknown"
+    active_pod_state: str = "—"
     command: str = ""
     created_at: str = ""
     started_at: str = ""
@@ -344,6 +352,63 @@ def _gpu_model(spec: Dict, metadata: Optional[Dict] = None) -> str:
         (metadata.get("annotations", {}) or {}).get("falcon.dev/gpu-type"),
     ]
     return next((str(value) for value in candidates if value), "-")
+
+
+def _is_agent_managed_metadata(metadata: Optional[Mapping[str, Any]]) -> bool:
+    """Return whether Kubernetes metadata identifies an MCP-owned Job.
+
+    The MCP service writes ``falcon.dev/agent-managed=true`` on both the Job
+    and its Pod template. The value-based aliases keep the Dashboard useful
+    for older or hand-authored manifests without treating the ordinary
+    ``falcon.dev/managed=true`` label as agent-owned.
+    """
+
+    if not isinstance(metadata, Mapping):
+        return False
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    if not isinstance(labels, Mapping):
+        labels = {}
+    if not isinstance(annotations, Mapping):
+        annotations = {}
+    if str(labels.get("falcon.dev/agent-managed") or "").strip().lower() in {
+        "1", "true", "yes"
+    }:
+        return True
+    for values in (labels, annotations):
+        for key in ("falcon.dev/managed-by", "app.kubernetes.io/managed-by"):
+            value = str(values.get(key) or "").strip().lower()
+            if value in {"mcp", "falcon-mcp", "falcon mcp", "agent"}:
+                return True
+    return False
+
+
+def _agent_state_metadata(metadata: Optional[Mapping[str, Any]]) -> str:
+    """Return a small UI state for an agent-owned Job, if metadata has one."""
+
+    if not isinstance(metadata, Mapping):
+        return ""
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    if not isinstance(labels, Mapping):
+        labels = {}
+    if not isinstance(annotations, Mapping):
+        annotations = {}
+    state = str(
+        labels.get("falcon.dev/agent-state")
+        or annotations.get("falcon.dev/agent-state")
+        or ""
+    ).strip().lower()
+    if state in {"fixing", "repairing", "restarting"}:
+        return "fixing"
+    if state in {"disconnected", "offline"}:
+        return "disconnected"
+    # MCP restart Jobs already carry this durable link. A pending linked Job
+    # is the one point at which the Dashboard can distinguish an agent repair
+    # from an ordinary first submission without polling the MCP process.
+    if str(annotations.get("falcon.dev/previous-job-uid") or "").strip():
+        return "fixing"
+    return ""
 
 
 def _short_cpu(value: float) -> str:
@@ -807,9 +872,15 @@ class UsageCollector:
         collect_availability: bool = True,
         resource_source: Optional[Any] = None,
         context: Optional[str] = None,
+        inventory_source: Optional[Any] = None,
     ):
         self.namespace = namespace
         self.context = context
+        self.inventory_source = inventory_source
+        self._projection_lock = threading.RLock()
+        self._latest_samples: Dict[str, GpuSample] = {}
+        self._latest_live: Dict[str, Tuple[float, float]] = {}
+        self._latest_metrics_at = 0.0
         self.thresholds = thresholds
         self.ema_alpha = ema_alpha
         self.job_filter = job_filter
@@ -852,8 +923,12 @@ class UsageCollector:
     def invalidate(self) -> None:
         self._items_at = 0.0
         self._live_at = 0.0
+        if self.inventory_source is not None:
+            self.inventory_source.resync()
 
     def close(self) -> None:
+        if self.inventory_source is not None:
+            self.inventory_source.close()
         if self._gpu_sampler:
             self._gpu_sampler.close()
         if self.resource_source is not None:
@@ -963,7 +1038,7 @@ class UsageCollector:
     def events(self, row: JobUsage, force: bool = False) -> List[JobEvent]:
         cached = self._event_cache.get(row.uid)
         now = time.monotonic()
-        if cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
+        if self.inventory_source is None and cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
             return cached[1]
         names = {row.job} | {
             name for name in row.attempt_pods if name and name != row.job
@@ -971,18 +1046,24 @@ class UsageCollector:
         collected: Dict[Tuple[str, str, str, str], JobEvent] = {}
         # One namespace query is considerably cheaper than one subprocess per
         # historical attempt, especially for retried Jobs.
-        raw = self._kubectl(
+        raw = None if self.inventory_source is not None else self._kubectl(
             ["get", "events", "-n", self.namespace, "-o", "json"],
             timeout=15,
         )
         try:
-            items = json.loads(raw).get("items", []) if raw is not None else []
+            items = (
+                self.inventory_source.events_for(
+                    {row.uid} | {attempt.uid for attempt in row.attempt_details}, names,
+                )
+                if self.inventory_source is not None
+                else json.loads(raw).get("items", []) if raw is not None else []
+            )
         except json.JSONDecodeError:
             items = []
             raw = None
         for item in items:
             object_name = str(
-                item.get("involvedObject", {}).get("name") or ""
+                (item.get("involvedObject") or item.get("regarding") or {}).get("name") or ""
             )
             if object_name not in names:
                 continue
@@ -997,7 +1078,7 @@ class UsageCollector:
                 timestamp=str(timestamp),
                 event_type=str(item.get("type") or "Normal"),
                 reason=str(item.get("reason") or "Unknown"),
-                message=str(item.get("message") or ""),
+                message=str(item.get("note") or item.get("message") or ""),
                 object_name=object_name,
                 count=int(
                     item.get("count")
@@ -1017,7 +1098,7 @@ class UsageCollector:
             else:
                 collected[key] = event
         events = sorted(collected.values(), key=lambda value: _timestamp(value.timestamp))[-200:]
-        if raw is not None:
+        if raw is not None or self.inventory_source is not None:
             self._event_cache[row.uid] = (now, events)
             return events
         # Cache the failed attempt time while retaining the last valid data so
@@ -1074,7 +1155,9 @@ class UsageCollector:
         now = time.monotonic()
         if self.collect_availability:
             self._refresh_gpu_availability(now)
-        if self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
+        if self.inventory_source is not None:
+            self._items = self._inventory_items()
+        elif self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
             # Job objects do not normally carry the controller's ``job-name``
             # Pod label, so a combined label-filtered query loses the durable
             # Job template.  Fetch the named Job and its attempts separately.
@@ -1123,10 +1206,6 @@ class UsageCollector:
         if self._items is None:
             return []
         all_items = self._items
-        job_items = {
-            item.get("metadata", {}).get("name", ""): item
-            for item in all_items if item.get("kind") == "Job"
-        }
         items = [item for item in all_items if item.get("kind") != "Job"]
         if self._live is None or now - self._live_at >= KUBERNETES_USAGE_SECONDS:
             top_args = ["top", "pods", "-n", self.namespace]
@@ -1141,7 +1220,6 @@ class UsageCollector:
                     for line in top.splitlines() if len(parts := line.split()) >= 3
                 }
         live = self._live or {}
-        live_pods = set(live)
         running_gpu_pods: Dict[str, int] = {}
         for item in items:
             spec = item.get("spec", {})
@@ -1168,6 +1246,42 @@ class UsageCollector:
                     zip(pod_names, pool.map(load_metrics, pod_names))
                 )
 
+        with self._projection_lock:
+            self._latest_samples = samples
+            self._latest_live = dict(live)
+            self._latest_metrics_at = time.time()
+            if self.inventory_source is not None:
+                all_items = self._inventory_items()
+            return self._build_rows(all_items, live, samples, sample_metrics=True)
+
+    def collect_inventory(self) -> List[JobUsage]:
+        """Project the latest watch revision without performing network I/O."""
+        with self._projection_lock:
+            return self._build_rows(
+                self._inventory_items(), self._latest_live,
+                self._latest_samples, sample_metrics=False,
+            )
+
+    def _inventory_items(self):
+        snapshot = self.inventory_source.snapshot(include_events=False)
+        self.last_error = snapshot.error
+        self.last_successful_refresh = snapshot.observed_at
+        return snapshot.items
+
+    def _build_rows(self, all_items, live, samples, *, sample_metrics):
+        waiting_uids = connected_jobs(self.context, self.namespace)
+        if self.job_filter:
+            all_items = [item for item in all_items if (
+                item.get("kind") == "Job" and item.get("metadata", {}).get("name") == self.job_filter
+                or item.get("kind") != "Job" and (
+                    item.get("metadata", {}).get("labels", {}).get("job-name") == self.job_filter
+                    or any(owner.get("kind") == "Job" and owner.get("name") == self.job_filter
+                           for owner in item.get("metadata", {}).get("ownerReferences", []))
+                ))]
+        job_items = {item.get("metadata", {}).get("name", ""): item
+                     for item in all_items if item.get("kind") == "Job"}
+        items = [item for item in all_items if item.get("kind") != "Job"]
+        live_pods = set(live)
         def new_group(job_item: Optional[Dict]) -> Dict:
             template = (
                 (job_item or {}).get("spec", {}).get("template", {})
@@ -1220,7 +1334,14 @@ class UsageCollector:
             is_running = status.get("phase") == "Running"
             pod = metadata.get("name", "")
             labels = metadata.get("labels", {})
-            job = labels.get("job-name", pod)
+            owner = next((owner for owner in metadata.get("ownerReferences", [])
+                          if owner.get("kind") == "Job"), {})
+            job = owner.get("name") or labels.get("job-name", pod)
+            template = job_items.get(job)
+            if template is not None and owner.get("uid") and (
+                owner["uid"] != template.get("metadata", {}).get("uid")
+            ):
+                continue
             group = groups.setdefault(job, new_group(job_items.get(job)))
             group["pod_items"].append(item)
             group["statuses"].append(status.get("phase", "Unknown"))
@@ -1276,16 +1397,23 @@ class UsageCollector:
             ema = None
             risk_average = None
             if utilization is not None:
-                ema = self._update_ema(job, utilization)
-                risk_average = self._update_risk_average(job, utilization)
+                if sample_metrics:
+                    ema = self._update_ema(job, utilization)
+                    risk_average = self._update_risk_average(job, utilization)
+                else:
+                    ema = self.ema.get(job)
+                    values = self.risk_samples.get(job, ())
+                    risk_average = sum(values) / len(values) if values else None
             vram_utilization = _percent(
                 group["vram_used"], group["vram_total"]
             )
             vram_risk_average = None
             if vram_utilization is not None:
-                vram_risk_average = self._update_vram_risk_average(
-                    job, vram_utilization
-                )
+                if sample_metrics:
+                    vram_risk_average = self._update_vram_risk_average(job, vram_utilization)
+                else:
+                    values = self.vram_risk_samples.get(job, ())
+                    vram_risk_average = sum(values) / len(values) if values else None
             active_attempts = [
                 pod for pod in group["pod_items"]
                 if pod.get("status", {}).get("phase")
@@ -1326,6 +1454,20 @@ class UsageCollector:
             status = _job_status(group.get("job_item"), statuses)
             job_metadata = (group.get("job_item") or {}).get("metadata", {})
             job_spec = (group.get("job_item") or {}).get("spec", {})
+            agent_managed = _is_agent_managed_metadata(job_metadata) or any(
+                _is_agent_managed_metadata(pod.get("metadata"))
+                for pod in group["pod_items"]
+            )
+            agent_state = _agent_state_metadata(job_metadata)
+            if not agent_state:
+                agent_state = next(
+                    (
+                        state
+                        for pod in group["pod_items"]
+                        if (state := _agent_state_metadata(pod.get("metadata")))
+                    ),
+                    "",
+                )
             created = job_metadata.get("creationTimestamp") or min(
                 (value for value in group["created"] if value), default=""
             )
@@ -1334,6 +1476,8 @@ class UsageCollector:
                 {},
             )
             uid = str(job_metadata.get("uid") or owner.get("uid") or job)
+            if agent_managed and status.lower() not in {"failed", "unknown", "succeeded", "completed"}:
+                agent_state = "connected" if uid in waiting_uids else "disconnected"
             restarts = sum(
                 int(container_status.get("restartCount", 0) or 0)
                 for pod in group["pod_items"]
@@ -1384,17 +1528,19 @@ class UsageCollector:
                 memory_requested_gib=group["memory_requested"],
                 age=_age(created),
                 at_risk=at_risk,
+                agent_managed=agent_managed,
+                agent_state=agent_state,
                 uid=uid,
                 active_pod=str(relevant_metadata.get("name") or ""),
                 active_pod_uid=str(relevant_metadata.get("uid") or ""),
-                active_pod_state=_pod_state(relevant) if relevant else "No active pod",
+                active_pod_state=_pod_state(relevant) if relevant else "—",
                 command=group["command"],
                 created_at=created,
                 started_at=str(relevant_status.get("startTime") or ""),
                 restarts=restarts,
                 completions=completions,
                 metrics_updated_at=(
-                    time.time()
+                    (self._latest_metrics_at if self.inventory_source is not None else time.time())
                     if (
                         utilization is not None
                         or vram_utilization is not None
@@ -1525,7 +1671,7 @@ class DemoUsageCollector:
                     at_risk="eviction-risk" in job.name,
                     uid=job.uid,
                     active_pod=job.attempts.active_pod or "",
-                    active_pod_state="Running" if running else "No active pod",
+                    active_pod_state="Running" if running else "—",
                     command=" ".join(job.command),
                     created_at=job.created_at or "",
                     started_at=job.started_at or "",
@@ -1635,6 +1781,12 @@ def run_dashboard(
     from .resources_history import stop_legacy_history_collector
 
     namespace = namespace or config["cluster"]["namespace"]
+    inventory = None
+    context = None
+    if not demo_state:
+        probe = KubernetesClient(namespace)
+        context = probe._run(["config", "current-context"]).stdout.strip() or None
+        inventory = DashboardInventory(KubernetesClient(namespace, context=context))
     thresholds = {
         preset["gpu_type"].lower(): float(preset.get("minimum_utilization", 30))
         for preset in config["presets"].values()
@@ -1648,6 +1800,8 @@ def run_dashboard(
             job_filter=job,
             ema_warmup_samples=EMA_WARMUP_SAMPLES,
             streaming_gpu=True,
+            inventory_source=inventory,
+            context=context,
             metrics_url=(
                 config.get("cluster", {}).get("kube_state_metrics_url")
                 if config.get("cluster", {}).get("resource_service_url") is None
@@ -1667,7 +1821,7 @@ def run_dashboard(
     log_manager = (
         None
         if demo_state
-        else DashboardLogManager(namespace)
+        else DashboardLogManager(namespace, client=KubernetesClient(namespace, context=context))
     )
 
     FalconDashboard(

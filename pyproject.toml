@@ -27,6 +27,7 @@ license = "Apache-2.0"
 dependencies = [
     "PyYAML>=6.0",
     "httpx>=0.23.0",
+    "mcp>=1.30,<2",
     "packaging>=23.0",
     "pyte>=0.8.2,<0.9",
     "textual>=2.0,<8",
@@ -52,7 +53,7 @@ exclude = ["tests*"]
 version = {attr = "falcon.__version__"}
 
 [tool.setuptools.package-data]
-falcon = ["skills/falcon/*.md"]
+falcon = ["skills/falcon/*.md", "skills/falcon-legacy/*.md"]
 
 [tool.setuptools.data-files]
 "share/falcon-k8s/systemd" = [
@@ -63,7 +64,9 @@ falcon = ["skills/falcon/*.md"]
 "share/doc/falcon-k8s" = ["docs/resource-service.md"]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.30,<2"]
+# Kept as a compatibility alias for older install instructions. MCP is now a
+# core dependency and is installed by every normal Falcon installation.
+mcp = []
 test = ["pytest>=8", "pytest-asyncio>=0.24"]
 dev = ["build>=1.2", "ruff>=0.9"]
 

@@ -43,6 +43,13 @@ from .dashboard import UsageCollector
 from .kubernetes import KubernetesClient, KubernetesError, ProcessResult
 from .launcher import resolve_environment
 from .manifest import build_job_manifest
+from .mcp_config import (
+    DEFAULT_EVICTION_STARTUP_SECONDS,
+    DEFAULT_WAIT_TIMEOUT_SECONDS,
+    MAX_EVICTION_STARTUP_SECONDS,
+    MIN_EVICTION_STARTUP_SECONDS,
+)
+from .mcp_risk import McpGpuRiskEvaluator
 from .models import GPURequest, JobRequest, ResourcePlan
 from .planning import canonical_gpu, plan_cpu_resources, plan_resources
 from .resource_service import ResourceServiceClient, snapshot_nodes
@@ -367,10 +374,16 @@ class JobService:
         self._metrics_lock = threading.RLock()
         self._metrics_collectors: dict[tuple[str, str, str], Any] = {}
         self._metrics_snapshots: dict[tuple[str, str, str], tuple[float, Any]] = {}
+        self._risk_evaluators: dict[tuple[str, str, str], McpGpuRiskEvaluator] = {}
+        self._risk_snapshots: dict[tuple[str, str, str], Optional[dict[str, Any]]] = {}
         self._event_lock = threading.RLock()
         self._event_store: Any = None
         self._monitor: Any = None
         self._monitor_refs: dict[str, dict[str, str]] = {}
+        # Startup grace is an observation preference, not Job state. Keep it
+        # in memory alongside the monitor so a later wait can adjust it
+        # without changing the Kubernetes manifest.
+        self._monitor_startup_times: dict[str, float] = {}
         self._closed = False
         # mcp_events.Monitor consumes this callback.  Keeping it as an
         # attribute also gives the server a narrow seam for a custom monitor.
@@ -1455,12 +1468,17 @@ class JobService:
                 now = time.monotonic()
                 if cached is not None and now - cached[0] < 1.0:
                     rows = cached[1]
+                    risk_policy = self._risk_snapshots.get(key)
                 else:
-                    # UsageCollector owns mutable EMA/risk/streaming sampler
-                    # state.  Keep the whole sample under this lock so a
-                    # monitor callback cannot race an MCP metrics tool call.
+                    # UsageCollector owns mutable EMA/streaming sampler state,
+                    # while the MCP evaluator owns eviction-risk state. Keep
+                    # both under this lock so a monitor callback cannot race a
+                    # metrics tool call or advance risk without a new sample.
                     rows = collector.collect()
+                    row = _select_metric_row(rows, ref["name"])
+                    risk_policy = self._evaluate_mcp_risk(ref, row)
                     self._metrics_snapshots[key] = (time.monotonic(), rows)
+                    self._risk_snapshots[key] = risk_policy
             row = _select_metric_row(rows, ref["name"])
             if row is None:
                 return {
@@ -1470,7 +1488,7 @@ class JobService:
                     "at_risk": None,
                     "error": str(getattr(collector, "last_error", "") or "") or None,
                 }
-            metrics = _metric_mapping(row)
+            metrics = _metric_mapping(row, risk_policy=risk_policy)
             return {
                 "job": ref,
                 "available": True,
@@ -1489,6 +1507,53 @@ class JobService:
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+    def _evaluate_mcp_risk(
+        self,
+        ref: Mapping[str, str],
+        row: Any,
+    ) -> Optional[dict[str, Any]]:
+        """Evaluate MCP-only risk from the row's physical GPU samples."""
+
+        if row is None:
+            return None
+
+        def value(name: str, default: Any = None) -> Any:
+            if isinstance(row, Mapping):
+                return row.get(name, default)
+            return getattr(row, name, default)
+
+        devices = value("gpu_devices", [])
+        if not devices:
+            # Older/custom collectors may expose only aggregate metrics. Keep
+            # their compatibility output, but do not claim per-GPU policy
+            # without physical-device samples.
+            return None
+        key = (ref["namespace"], ref["name"], ref["uid"])
+        evaluator = self._risk_evaluators.get(key)
+        startup_time = self._monitor_startup_times.get(
+            ref["uid"], DEFAULT_EVICTION_STARTUP_SECONDS
+        )
+        if evaluator is None:
+            evaluator = McpGpuRiskEvaluator(startup_time)
+            self._risk_evaluators[key] = evaluator
+        else:
+            evaluator.set_startup_time_seconds(startup_time)
+        gpu_type = (
+            value("gpu_requested_type")
+            or value("gpu_allocated_type")
+            or value("gpu_type")
+            or ""
+        )
+        thresholds = {
+            canonical_gpu(str(item.get("gpu_type"))): float(
+                item.get("minimum_utilization", 30)
+            )
+            for item in (self.config.get("presets") or {}).values()
+            if isinstance(item, Mapping) and item.get("gpu_type")
+        }
+        threshold = thresholds.get(canonical_gpu(str(gpu_type)), 30.0)
+        return evaluator.evaluate(ref["uid"], devices, threshold)
+
     def _collector_for(self, ref: Mapping[str, str]) -> Any:
         if self._closed:
             raise MCPServiceError("JobService is closed")
@@ -1498,6 +1563,8 @@ class JobService:
                 if old_key[:2] == key[:2] and old_key != key:
                     old = self._metrics_collectors.pop(old_key)
                     self._metrics_snapshots.pop(old_key, None)
+                    self._risk_evaluators.pop(old_key, None)
+                    self._risk_snapshots.pop(old_key, None)
                     close = getattr(old, "close", None)
                     if callable(close):
                         close()
@@ -1954,10 +2021,14 @@ class JobService:
         jobs: list[dict],
         cursor: Optional[int] = None,
         event_types: Optional[list[str]] = None,
-        timeout: float = 43200,
+        timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+        startup_time_seconds: Optional[float] = None,
+        scheduling_policy: str = "report_blocked",
     ) -> dict:
         if not isinstance(jobs, list):
             raise MCPServiceError("jobs must be an array of Job references")
+        if scheduling_policy not in ("report_blocked", "wait_for_capacity"):
+            raise MCPServiceError("scheduling_policy must be report_blocked or wait_for_capacity")
         refs = [self._job_ref(value) for value in jobs]
         if cursor is not None and (
             isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0
@@ -1976,6 +2047,21 @@ class JobService:
             or timeout < 0
         ):
             raise MCPServiceError("timeout must be a finite non-negative number")
+        if startup_time_seconds is not None:
+            if (
+                isinstance(startup_time_seconds, bool)
+                or not isinstance(startup_time_seconds, (int, float))
+                or not math.isfinite(float(startup_time_seconds))
+                or not MIN_EVICTION_STARTUP_SECONDS
+                <= float(startup_time_seconds)
+                <= MAX_EVICTION_STARTUP_SECONDS
+            ):
+                raise MCPServiceError(
+                    "startup_time_seconds must be between "
+                    f"{int(MIN_EVICTION_STARTUP_SECONDS)} and "
+                    f"{int(MAX_EVICTION_STARTUP_SECONDS)} seconds"
+                )
+            startup_time_seconds = float(startup_time_seconds)
         try:
             from .mcp_events import EventStore, Monitor
         except ImportError as exc:
@@ -1996,12 +2082,15 @@ class JobService:
             for ref in refs:
                 self._monitor_refs[ref["uid"]] = dict(ref)
                 self._monitor_refs[ref["name"]] = dict(ref)
+                if startup_time_seconds is not None:
+                    self._monitor_startup_times[ref["uid"]] = startup_time_seconds
             monitor = self._monitor
         result = await monitor.wait(
             refs,
             cursor=cursor,
             event_types=event_types,
             timeout=float(timeout),
+            scheduling_policy=scheduling_policy,
         )
         return await self._enrich_failure_events(result, refs)
 
@@ -2095,6 +2184,7 @@ class JobService:
             event_store = self._event_store
             self._event_store = None
             self._monitor_refs.clear()
+            self._monitor_startup_times.clear()
         # Monitor owns watch subprocesses/tasks.  It must be stopped before
         # any collector or SQLite resource it can still call is closed.
         if monitor is not None:
@@ -2103,6 +2193,8 @@ class JobService:
             collectors = list(self._metrics_collectors.values())
             self._metrics_collectors.clear()
             self._metrics_snapshots.clear()
+            self._risk_evaluators.clear()
+            self._risk_snapshots.clear()
             # Keep the lock while closing: no in-flight collector can still
             # be executing, and a concurrent call cannot create a replacement
             # collector after the map is cleared.
@@ -3204,7 +3296,11 @@ def _select_metric_row(rows: Any, name: str) -> Any:
     return None
 
 
-def _metric_mapping(row: Any) -> dict[str, Any]:
+def _metric_mapping(
+    row: Any,
+    *,
+    risk_policy: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
     def value(name: str, default: Any = None) -> Any:
         if isinstance(row, Mapping):
             return row.get(name, default)
@@ -3227,6 +3323,58 @@ def _metric_mapping(row: Any) -> dict[str, Any]:
         at_risk = bool(value("gpu_at_risk") or value("vram_at_risk"))
     if has_gpu and not bool(gpu_available):
         at_risk = None
+    if risk_policy is not None:
+        at_risk = risk_policy.get("at_risk")
+    risk_average = (
+        risk_policy.get("gpu_average")
+        if risk_policy is not None
+        else value("gpu_risk_average")
+    )
+    vram_risk_average = (
+        risk_policy.get("vram_average")
+        if risk_policy is not None
+        else value("vram_risk_average")
+    )
+    risk_ema = (
+        risk_policy.get("gpu_ema")
+        if risk_policy is not None
+        else value("gpu_risk_ema")
+    )
+    vram_risk_ema = (
+        risk_policy.get("vram_ema")
+        if risk_policy is not None
+        else value("vram_risk_ema")
+    )
+    risk_phase = (
+        risk_policy.get("phase")
+        if risk_policy is not None
+        else value("risk_phase")
+    )
+    startup_remaining = (
+        risk_policy.get("startup_remaining_seconds")
+        if risk_policy is not None
+        else value("risk_startup_remaining_seconds")
+    )
+    risk_window = (
+        risk_policy.get("window_seconds")
+        if risk_policy is not None
+        else value("risk_window_seconds")
+    )
+    per_gpu = (
+        risk_policy.get("devices", [])
+        if risk_policy is not None
+        else value("gpu_risk_devices", [])
+    )
+    gpu_at_risk = (
+        risk_policy.get("gpu_at_risk")
+        if risk_policy is not None
+        else value("gpu_at_risk")
+    )
+    vram_at_risk = (
+        risk_policy.get("vram_at_risk")
+        if risk_policy is not None
+        else value("vram_at_risk")
+    )
 
     gpu = {
         "requested_type": value("gpu_requested_type", value("gpu_type")),
@@ -3242,8 +3390,12 @@ def _metric_mapping(row: Any) -> dict[str, Any]:
             if gpu_available
             else None
         ),
-        "risk_average_percent": value("gpu_risk_average") if gpu_available else None,
+        "risk_average_percent": risk_average if gpu_available else None,
         "risk_threshold_percent": value("gpu_risk_threshold") if gpu_available else None,
+        "risk_ema_percent": risk_ema if gpu_available else None,
+        "risk_phase": risk_phase,
+        "startup_remaining_seconds": startup_remaining,
+        "risk_window_seconds": risk_window,
         "available": bool(gpu_available),
     }
     cpu = {
@@ -3285,8 +3437,18 @@ def _metric_mapping(row: Any) -> dict[str, Any]:
         "available": bool(gpu_available or cpu_available),
         "freshness": freshness,
         "at_risk": at_risk,
-        "gpu_at_risk": value("gpu_at_risk") if gpu_available else None,
-        "vram_at_risk": value("vram_at_risk") if gpu_available else None,
+        "gpu_at_risk": gpu_at_risk if gpu_available else None,
+        "vram_at_risk": vram_at_risk if gpu_available else None,
+        "eviction_policy": {
+            "phase": risk_phase,
+            "startup_remaining_seconds": startup_remaining,
+            "window_seconds": risk_window,
+            "gpu_ema_percent": risk_ema if gpu_available else None,
+            "gpu_average_percent": risk_average if gpu_available else None,
+            "vram_average_percent": vram_risk_average if gpu_available else None,
+            "vram_ema_percent": vram_risk_ema if gpu_available else None,
+            "per_gpu": per_gpu if gpu_available else [],
+        },
     }
 
 

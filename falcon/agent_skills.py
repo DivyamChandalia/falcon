@@ -14,11 +14,17 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Uni
 
 SKILL_NAME = "falcon"
 SKILL_BUNDLE_VERSION = 18
+LEGACY_SKILL_BUNDLE_VERSION = 1
 METADATA_FILE = ".falcon-skill.json"
 SUPPORTED_AGENTS: Tuple[str, ...] = ("codex", "claude", "opencode")
+SKILL_MODES: Tuple[str, ...] = ("mcp", "legacy")
 
 _RESOURCE_PACKAGE = "falcon.skills"
 _BUNDLE_FILES = ("SKILL.md",)
+_SKILL_DIRECTORIES = {
+    "mcp": "falcon",
+    "legacy": "falcon-legacy",
+}
 _AGENT_PATHS = {
     "codex": Path(".agents/skills") / SKILL_NAME,
     "claude": Path(".claude/skills") / SKILL_NAME,
@@ -38,6 +44,7 @@ _OWNER = "falcon"
 _METADATA_FORMAT = 1
 
 AgentSelection = Optional[Union[str, Iterable[str]]]
+SkillMode = str
 
 
 @dataclass(frozen=True)
@@ -123,8 +130,24 @@ def _bundle_digest(hashes: Mapping[str, str]) -> str:
     return digest.hexdigest()
 
 
-def _bundle() -> Tuple[Dict[str, bytes], Dict[str, str]]:
-    root = resources.files(_RESOURCE_PACKAGE).joinpath(SKILL_NAME)
+def _normalize_skill_mode(mode: SkillMode) -> SkillMode:
+    normalized = str(mode).strip().lower()
+    if normalized not in SKILL_MODES:
+        supported = ", ".join(SKILL_MODES)
+        raise ValueError(
+            f"unsupported Falcon skill mode {mode!r}; expected one of {supported}"
+        )
+    return normalized
+
+
+def _bundle_version(mode: SkillMode) -> int:
+    return LEGACY_SKILL_BUNDLE_VERSION if mode == "legacy" else SKILL_BUNDLE_VERSION
+
+
+def _bundle(mode: SkillMode = "mcp") -> Tuple[Dict[str, bytes], Dict[str, str]]:
+    root = resources.files(_RESOURCE_PACKAGE).joinpath(
+        _SKILL_DIRECTORIES[_normalize_skill_mode(mode)]
+    )
     files: Dict[str, bytes] = {}
     for name in _BUNDLE_FILES:
         source = root.joinpath(name)
@@ -134,13 +157,19 @@ def _bundle() -> Tuple[Dict[str, bytes], Dict[str, str]]:
     return files, {name: _sha256(content) for name, content in files.items()}
 
 
-def _metadata(agent: str, hashes: Mapping[str, str]) -> Dict[str, object]:
+def _metadata(
+    agent: str,
+    hashes: Mapping[str, str],
+    mode: SkillMode = "mcp",
+) -> Dict[str, object]:
+    normalized_mode = _normalize_skill_mode(mode)
     return {
         "format": _METADATA_FORMAT,
         "owner": _OWNER,
         "skill": SKILL_NAME,
         "agent": agent,
-        "bundle_version": SKILL_BUNDLE_VERSION,
+        "bundle_version": _bundle_version(normalized_mode),
+        "mode": normalized_mode,
         "source_hash": _bundle_digest(hashes),
         "files": dict(sorted(hashes.items())),
     }
@@ -243,6 +272,7 @@ def install_skill(
     *,
     home: Optional[Union[str, os.PathLike[str]]] = None,
     force: bool = False,
+    mode: SkillMode = "mcp",
 ) -> SkillOperation:
     """Install or update Falcon's skill for one coding agent.
 
@@ -251,10 +281,11 @@ def install_skill(
     symlinks remain conflicts so unrelated user content is not overwritten.
     """
 
+    normalized_mode = _normalize_skill_mode(mode)
     target = agent_skill_path(agent, home=home)
     normalized_agent = _normalize_agents([agent])[0]
-    files, hashes = _bundle()
-    desired_metadata = _metadata(normalized_agent, hashes)
+    files, hashes = _bundle(normalized_mode)
+    desired_metadata = _metadata(normalized_agent, hashes, normalized_mode)
 
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         return _conflict(normalized_agent, target, "skill path is not a managed directory")
@@ -290,7 +321,8 @@ def install_skill(
             )
     if (
         current_hashes == desired_metadata["files"]
-        and current_metadata.get("bundle_version") == SKILL_BUNDLE_VERSION
+        and current_metadata.get("bundle_version") == _bundle_version(normalized_mode)
+        and current_metadata.get("mode", "mcp") == normalized_mode
         and current_metadata.get("source_hash") == desired_metadata["source_hash"]
         and managed_unchanged
     ):
@@ -313,15 +345,55 @@ def install_skills(
     home: Optional[Union[str, os.PathLike[str]]] = None,
     which: Callable[[str], Optional[str]] = shutil.which,
     force: bool = False,
+    mode: SkillMode = "mcp",
 ) -> List[SkillOperation]:
     """Install selected agents, optionally refreshing owned copies."""
 
+    normalized_mode = _normalize_skill_mode(mode)
     selected = (
         detect_agents(home=home, which=which)
         if agents is None
         else _normalize_agents(agents)
     )
-    return [install_skill(agent, home=home, force=force) for agent in selected]
+    return [
+        install_skill(agent, home=home, force=force, mode=normalized_mode)
+        for agent in selected
+    ]
+
+
+def installed_skill_mode(
+    agent: str, *, home: Optional[Union[str, os.PathLike[str]]] = None
+) -> Optional[SkillMode]:
+    """Return the mode of an unchanged Falcon-managed skill, if installed."""
+
+    normalized_agent = _normalize_agents([agent])[0]
+    target = agent_skill_path(normalized_agent, home=home)
+    if target.is_symlink() or not target.is_dir():
+        return None
+    metadata, _error = _read_metadata(target, normalized_agent)
+    if metadata is None:
+        return None
+    mode = str(metadata.get("mode", "mcp")).strip().lower()
+    return mode if mode in SKILL_MODES else None
+
+
+def refresh_installed_skills(
+    *, home: Optional[Union[str, os.PathLike[str]]] = None
+) -> List[SkillOperation]:
+    """Refresh existing Falcon-owned skills while preserving each mode.
+
+    Update should not install a skill for an agent that has never opted into
+    Falcon, and it should not silently replace an unmanaged or edited skill.
+    The mode recorded at installation time is the source of truth: MCP and
+    legacy users are refreshed independently.
+    """
+
+    operations: List[SkillOperation] = []
+    for agent in SUPPORTED_AGENTS:
+        mode = installed_skill_mode(agent, home=home)
+        if mode is not None:
+            operations.append(install_skill(agent, home=home, mode=mode))
+    return operations
 
 
 def uninstall_skill(
@@ -378,14 +450,18 @@ def uninstall_skills(
 
 __all__ = [
     "METADATA_FILE",
+    "LEGACY_SKILL_BUNDLE_VERSION",
     "SKILL_BUNDLE_VERSION",
     "SKILL_NAME",
+    "SKILL_MODES",
     "SUPPORTED_AGENTS",
     "SkillOperation",
     "agent_skill_path",
     "detect_agents",
+    "installed_skill_mode",
     "install_skill",
     "install_skills",
+    "refresh_installed_skills",
     "uninstall_skill",
     "uninstall_skills",
 ]

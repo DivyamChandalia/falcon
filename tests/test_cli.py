@@ -54,6 +54,24 @@ class CliHarness(unittest.TestCase):
 
 
 class ParserTests(CliHarness):
+    def test_setup_can_configure_mcp_clients(self) -> None:
+        args = _parser(DEFAULT_CONFIG).parse_args([
+            "setup",
+            "--non-interactive",
+            "--configure-mcp",
+            "all",
+            "--mcp-dry-run",
+        ])
+
+        self.assertEqual(args.configure_mcp, "all")
+        self.assertTrue(args.mcp_dry_run)
+        self.assertFalse(args.skip_mcp)
+
+        legacy = _parser(DEFAULT_CONFIG).parse_args([
+            "setup", "--install-skills", "codex", "--skill-mode", "legacy"
+        ])
+        self.assertEqual(legacy.skill_mode, "legacy")
+
     def test_tui_color_mode_options_are_explicit(self) -> None:
         parser = _parser(DEFAULT_CONFIG)
         for command in ("dashboard", "resources"):

@@ -10,8 +10,11 @@ import pytest
 
 import falcon.mcp_events as mcp_events
 from falcon.mcp_events import (
+    ACTIONABLE_EVENT_TYPES,
     MAX_EVENT_DETAILS_BYTES,
     MAX_WAIT_RESPONSE_BYTES,
+    MONITOR_HEALTH_EVENT_TYPES,
+    MONITOR_HEALTH_FAILURE_THRESHOLD,
     SUPPORTED_EVENT_TYPES,
     EventStore,
     Monitor,
@@ -89,12 +92,51 @@ def _success_job(uid: str = "job-uid") -> dict:
 
 
 @pytest.fixture
-def store(tmp_path: Path):
+def store(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     value = EventStore(tmp_path / "private" / "events.sqlite3")
     try:
         yield value
     finally:
         value.close()
+
+
+@pytest.mark.asyncio
+async def test_presence_only_lasts_for_active_wait_not_retained_watch(store: EventStore):
+    from falcon.agent_presence import connected_jobs
+
+    watcher = FakeWatcher()
+    monitor = Monitor(_client(), "research", store, watcher=watcher)
+    waiting = asyncio.create_task(monitor.wait([_job()], timeout=10))
+    try:
+        await watcher.started.wait()
+        await asyncio.sleep(0)
+        assert connected_jobs(None, "research") == {"job-uid"}
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert connected_jobs(None, "research") == set()
+        result = await monitor.wait([_job()], timeout=0.01)
+        assert result["timed_out"]
+        assert monitor._started
+        assert connected_jobs(None, "research") == set()
+        waiting = asyncio.create_task(monitor.wait([_job()], timeout=10))
+
+        async def reconnected():
+            while not connected_jobs(None, "research"):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(reconnected(), 2)
+        assert connected_jobs(None, "research") == {"job-uid"}
+        assert not waiting.done()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert connected_jobs(None, "research") == set()
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
 
 
 def test_event_store_is_private_and_cursor_stable(tmp_path: Path) -> None:
@@ -175,7 +217,7 @@ def test_event_details_are_bounded_with_explicit_message_truncation(
 
 
 @pytest.mark.asyncio
-async def test_missing_job_baseline_deletes_old_uid_without_adopting_replacement(
+async def test_missing_job_baseline_silently_disconnects_old_uid(
     store: EventStore,
 ) -> None:
     watcher = FakeWatcher()
@@ -194,15 +236,16 @@ async def test_missing_job_baseline_deletes_old_uid_without_adopting_replacement
         watcher=watcher,
         list_provider=list_provider,
     )
-    result = await monitor.wait([old_job], event_types=["deleted"], timeout=0.2)
+    result = await monitor.wait([old_job], timeout=0.2)
 
-    assert [event["type"] for event in result["events"]] == ["deleted"]
-    assert result["events"][0]["job"]["uid"] == "old-uid"
+    assert result["events"] == []
+    assert result["disconnected"] is True
+    assert not store.read(["old-uid"])
     await monitor.close()
 
 
 @pytest.mark.asyncio
-async def test_missing_job_after_410_relist_emits_deleted(store: EventStore) -> None:
+async def test_missing_job_after_410_relist_silently_disconnects(store: EventStore) -> None:
     watcher = FakeWatcher()
     job = _job(uid="lost-uid")
     job_list_calls = 0
@@ -226,7 +269,7 @@ async def test_missing_job_after_410_relist_emits_deleted(store: EventStore) -> 
         list_provider=list_provider,
     )
     waiting = asyncio.create_task(
-        monitor.wait([job], event_types=["deleted"], timeout=2.0)
+        monitor.wait([job], event_types=["succeeded"], timeout=2.0)
     )
     await watcher.started.wait()
     await watcher.put(
@@ -238,7 +281,10 @@ async def test_missing_job_after_410_relist_emits_deleted(store: EventStore) -> 
     )
 
     result = await waiting
-    assert [event["type"] for event in result["events"]] == ["deleted"]
+    assert result["events"] == []
+    assert result["disconnected"] is True
+    assert not store.read(["lost-uid"], event_types=["deleted"])
+    assert store.read(["lost-uid"], event_types=["monitor_unavailable"])
     assert job_list_calls >= 2
     await monitor.close()
 
@@ -302,7 +348,7 @@ async def test_empty_selection_does_not_start_watches_or_wait(store: EventStore)
     watcher = FakeWatcher()
     monitor = Monitor(_client(), "research", store, watcher=watcher)
 
-    result = await monitor.wait([], timeout=12 * 60 * 60)
+    result = await monitor.wait([], timeout=7 * 24 * 60 * 60)
 
     assert result == {"events": [], "cursor": 0, "timed_out": True}
     assert watcher.calls == []
@@ -311,23 +357,111 @@ async def test_empty_selection_does_not_start_watches_or_wait(store: EventStore)
 
 
 @pytest.mark.asyncio
-async def test_state_edges_are_opt_in_and_invalid_types_fail_fast(
+async def test_state_edges_are_not_reported_and_invalid_types_fail_fast(
     store: EventStore,
 ) -> None:
     watcher = FakeWatcher()
     monitor = Monitor(_client(), "research", store, watcher=watcher)
 
-    result = await monitor.wait(
-        [_job(status={"active": 1})],
-        event_types=["running"],
-        timeout=0.2,
-    )
-    assert [event["type"] for event in result["events"]] == ["running"]
-    assert "running" in SUPPORTED_EVENT_TYPES
-    assert "pending" in SUPPORTED_EVENT_TYPES
+    assert "running" not in SUPPORTED_EVENT_TYPES
+    assert "pending" not in SUPPORTED_EVENT_TYPES
+    assert set(MONITOR_HEALTH_EVENT_TYPES).isdisjoint(SUPPORTED_EVENT_TYPES)
+    assert not set(MONITOR_HEALTH_EVENT_TYPES).intersection(ACTIONABLE_EVENT_TYPES)
+    for state_type in ("running", "pending", *MONITOR_HEALTH_EVENT_TYPES):
+        with pytest.raises(ValueError, match="unsupported event type"):
+            await monitor.wait([_job(status={"active": 1})], event_types=[state_type], timeout=0)
 
     with pytest.raises(ValueError, match="unsupported event type"):
         await monitor.wait([_job()], event_types=["not-supported"], timeout=0)
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_transient_monitor_health_is_silent_by_default(
+    store: EventStore,
+) -> None:
+    watcher = FakeWatcher()
+    monitor = Monitor(_client(), "research", store, watcher=watcher)
+    job = _job()
+    waiting = asyncio.create_task(monitor.wait([job], timeout=0.2))
+    await watcher.started.wait()
+
+    for _ in range(MONITOR_HEALTH_FAILURE_THRESHOLD):
+        await monitor._mark_unavailable(
+            "jobs.batch", {"operation": "list", "error": "timeout"}
+        )
+
+    # Health is recorded, but the default event filter only wakes the agent
+    # for events that require a workload decision.
+    assert not waiting.done()
+    result = await waiting
+    assert result["timed_out"] is True
+    assert store.read(["job-uid"], event_types=["monitor_unavailable"])
+
+    diagnostics = store.read(["job-uid"], event_types=["monitor_unavailable"])
+    assert diagnostics[0]["details"]["consecutive_failures"] == (
+        MONITOR_HEALTH_FAILURE_THRESHOLD
+    )
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_outage_and_recovery_keep_wait_open_until_job_succeeds(store: EventStore) -> None:
+    watcher = FakeWatcher()
+    monitor = Monitor(_client(), "research", store, watcher=watcher)
+    waiting = asyncio.create_task(
+        monitor.wait([_job()], event_types=list(SUPPORTED_EVENT_TYPES), timeout=10)
+    )
+    try:
+        await watcher.started.wait()
+        for _ in range(MONITOR_HEALTH_FAILURE_THRESHOLD + 10):
+            await monitor._mark_unavailable(
+                "jobs.batch", {"operation": "watch", "error": "offline"}
+            )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        await monitor._mark_recovered("jobs.batch")
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        assert {event["type"] for event in store.read(["job-uid"])} == set(
+            MONITOR_HEALTH_EVENT_TYPES
+        )
+        await watcher.put("jobs.batch", {"type": "MODIFIED", "object": _success_job()})
+        result = await asyncio.wait_for(waiting, 2)
+        assert [event["type"] for event in result["events"]] == ["succeeded"]
+        assert not result["timed_out"]
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_rearming_existing_monitor_does_not_repeat_namespace_baseline(
+    store: EventStore,
+) -> None:
+    watcher = FakeWatcher()
+    calls = {"jobs.batch": 0, "pods": 0, "events": 0}
+    job = _job()
+
+    async def list_provider(resource: str, namespace: str | None = None) -> dict:
+        del namespace
+        calls[resource] += 1
+        items = [job] if resource == "jobs.batch" else []
+        return {"metadata": {"resourceVersion": str(calls[resource])}, "items": items}
+
+    monitor = Monitor(
+        _client(), "research", store, watcher=watcher, list_provider=list_provider
+    )
+    first = await monitor.wait([job], event_types=["warning"], timeout=0)
+    assert first["timed_out"] is True
+    assert calls == {"jobs.batch": 1, "pods": 1, "events": 1}
+
+    second = await monitor.wait(
+        [job], cursor=first["cursor"], event_types=["warning"], timeout=0
+    )
+    assert second["timed_out"] is True
+    assert calls == {"jobs.batch": 1, "pods": 1, "events": 1}
     await monitor.close()
 
 
@@ -340,7 +474,17 @@ async def test_normal_rearm_keeps_observation_and_risk_state(
 
     async def metrics(names: list[str]) -> dict:
         return {
-            name: {"available": True, "at_risk": risk}
+            name: {
+                "available": True,
+                "at_risk": risk,
+                "metrics": {
+                    "eviction_policy": {
+                        "phase": "steady",
+                        "window_seconds": 300,
+                        "per_gpu": [{"index": 1, "gpu_at_risk": True}],
+                    },
+                },
+            }
             for name in names
         }
 
@@ -353,16 +497,22 @@ async def test_normal_rearm_keeps_observation_and_risk_state(
     )
     monitor._metrics_interval = 0.01
     job = _job(gpu=True)
+    job_reference = {
+        "name": job["metadata"]["name"],
+        "namespace": job["metadata"]["namespace"],
+        "uid": job["metadata"]["uid"],
+    }
 
     first = await monitor.wait([job], event_types=["eviction_risk"], timeout=1.0)
     assert [event["type"] for event in first["events"]] == ["eviction_risk"]
+    assert first["events"][0]["details"]["risk"]["per_gpu"][0]["index"] == 1
 
     second_wait = asyncio.create_task(
         monitor.wait(
-            [job],
+            [job_reference],
             cursor=first["cursor"],
-            event_types=["eviction_risk", "eviction_risk_cleared"],
-            timeout=1.0,
+            event_types=["eviction_risk"],
+            timeout=0.2,
         )
     )
     await asyncio.sleep(0.05)
@@ -370,20 +520,70 @@ async def test_normal_rearm_keeps_observation_and_risk_state(
 
     risk = False
     second = await second_wait
-    assert [event["type"] for event in second["events"]] == [
-        "eviction_risk_cleared"
-    ]
-    assert second["cursor"] > first["cursor"]
+    assert second["events"] == []
+    assert second["timed_out"] is True
+    assert not store.read(
+        ["job-uid"],
+        cursor=first["cursor"],
+        event_types=["eviction_risk_cleared"],
+    )
     assert store.read(
         ["job-uid"],
         cursor=first["cursor"],
         event_types=["monitor_unavailable"],
     ) == []
+
+    risk = True
+    third = await monitor.wait(
+        [job_reference],
+        cursor=second["cursor"],
+        event_types=["eviction_risk"],
+        timeout=1.0,
+    )
+    assert [event["type"] for event in third["events"]] == ["eviction_risk"]
     await monitor.close()
 
 
 @pytest.mark.asyncio
-async def test_cancelled_last_waiter_reports_a_watch_gap(
+async def test_deleted_job_silently_disconnects_wait(store: EventStore) -> None:
+    watcher = FakeWatcher()
+    monitor = Monitor(_client(), "research", store, watcher=watcher)
+    job = _job()
+    waiting = asyncio.create_task(monitor.wait([job], timeout=5.0))
+
+    await watcher.started.wait()
+    await watcher.put("jobs.batch", {"type": "DELETED", "object": job})
+    result = await asyncio.wait_for(waiting, 2.0)
+
+    assert result["events"] == []
+    assert result["disconnected"] is True
+    assert not store.read(["job-uid"])
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_wait_timeout_does_not_restart_watches_or_report_gap(store: EventStore) -> None:
+    watcher = FakeWatcher()
+    monitor = Monitor(_client(), "research", store, watcher=watcher)
+    try:
+        first = await monitor.wait([_job()], timeout=.01)
+        assert first["timed_out"] is True
+        assert len(watcher.calls) == 3
+        second = await monitor.wait(
+            [_job()], cursor=first["cursor"], timeout=.01,
+            event_types=list(SUPPORTED_EVENT_TYPES),
+        )
+        assert second["events"] == []
+        assert second["timed_out"] is True
+        assert len(watcher.calls) == 3
+        assert monitor._started
+        assert not store.read(["job-uid"])
+    finally:
+        await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_last_waiter_records_watch_gap_internally(
     store: EventStore,
 ) -> None:
     watcher = FakeWatcher()
@@ -401,17 +601,17 @@ async def test_cancelled_last_waiter_reports_a_watch_gap(
     second = await monitor.wait(
         [job],
         cursor=store.latest_cursor(),
-        event_types=["monitor_unavailable"],
+        event_types=list(SUPPORTED_EVENT_TYPES),
         timeout=0.2,
     )
 
-    assert [event["type"] for event in second["events"]] == [
-        "monitor_unavailable"
-    ]
-    assert second["events"][0]["details"] == {
-        "cursor": 1,
+    assert second["events"] == []
+    assert second["timed_out"] is True
+    diagnostics = store.read(["job-uid"], event_types=["monitor_unavailable"])
+    assert diagnostics[0]["details"] == {
+        "cursor": 0,
         "gap": True,
-        "last_observed_cursor": 1,
+        "last_observed_cursor": 0,
         "reason": "watch_restarted",
         "source": "monitor",
     }

@@ -21,6 +21,7 @@ from . import __version__
 from .agent_skills import (
     detect_agents,
     install_skills,
+    refresh_installed_skills,
     uninstall_skills,
 )
 from .cluster import (
@@ -440,6 +441,33 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     setup.add_argument("--force", action="store_true")
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-shell", action="store_true")
+    mcp_setup = setup.add_mutually_exclusive_group()
+    mcp_setup.add_argument(
+        "--configure-mcp",
+        nargs="?",
+        const="all",
+        metavar="AGENTS",
+        help=(
+            "Configure Falcon MCP for Codex, Claude Code, and OpenCode; "
+            "optionally pass a comma-separated subset"
+        ),
+    )
+    mcp_setup.add_argument(
+        "--skip-mcp",
+        action="store_true",
+        help="Skip the interactive MCP configuration offer",
+    )
+    setup.add_argument(
+        "--mcp-dry-run",
+        action="store_true",
+        help="Show MCP configuration changes without writing client files",
+    )
+    setup.add_argument(
+        "--skill-mode",
+        choices=("mcp", "legacy"),
+        default="mcp",
+        help="Skill installed for coding agents (default: mcp)",
+    )
     skills = setup.add_mutually_exclusive_group()
     skills.add_argument(
         "--install-skills",
@@ -1931,17 +1959,21 @@ def _resources_command(
 
 
 def _skills_setup(args: argparse.Namespace) -> int:
+    skill_mode = getattr(args, "skill_mode", "mcp")
     operations = []
     if args.uninstall_skills:
         operations = uninstall_skills(args.uninstall_skills)
     elif args.install_skills:
-        operations = install_skills(args.install_skills, force=True)
+        operations = install_skills(
+            args.install_skills, force=True, mode=skill_mode
+        )
     elif not args.skip_skills and not args.non_interactive:
         detected = detect_agents()
         if detected:
             default = ",".join(detected)
+            skill_label = "MCP-first" if skill_mode == "mcp" else "legacy CLI"
             print(
-                "WARNING: Installing the Falcon skill may increase coding-agent "
+                f"WARNING: Installing the {skill_label} Falcon skill may increase coding-agent "
                 "and tool usage, and allows agents to launch CPU/GPU workloads "
                 "on your Kubernetes cluster."
             )
@@ -1950,7 +1982,9 @@ def _skills_setup(args: argparse.Namespace) -> int:
                 f"[{default}] (comma-separated, 'none' to skip): "
             ).strip()
             if response.lower() not in {"none", "no", "skip"}:
-                operations = install_skills(response or detected, force=True)
+                operations = install_skills(
+                    response or detected, force=True, mode=skill_mode
+                )
     conflict = False
     for operation in operations:
         print(f"Skill {operation.agent}: {operation.status} ({operation.path})")
@@ -2051,6 +2085,78 @@ def _setup_kubectl_for_coder(*, non_interactive: bool) -> None:
     )
 
 
+def _setup_mcp_clients(args: argparse.Namespace, config_path: Optional[str]) -> int:
+    """Offer or perform the one-time MCP client configuration from setup."""
+
+    if args.skip_mcp:
+        return 0
+
+    from .mcp_config import MCPConfigError, detected_agents, setup_configs
+
+    requested = args.configure_mcp
+    if requested is None:
+        if getattr(args, "skill_mode", "mcp") == "legacy":
+            print(
+                "Legacy CLI skill selected; MCP configuration was skipped. "
+                "Use --configure-mcp explicitly if both are wanted."
+            )
+            return 0
+        # Non-interactive setup must remain safe for scripts and CI: explicit
+        # --configure-mcp is required before editing agent-owned files.
+        if args.non_interactive:
+            return 0
+        agents = detected_agents()
+        if not agents:
+            print(
+                "No supported coding-agent installation was detected; MCP "
+                "configuration was skipped. Use --configure-mcp all to force it."
+            )
+            return 0
+        labels = ", ".join(
+            {"codex": "Codex", "claude": "Claude Code", "opencode": "OpenCode"}[agent]
+            for agent in agents
+        )
+        print(
+            "Falcon can configure its MCP server for "
+            f"{labels}. The server will be started automatically by the agent."
+        )
+        answer = input(
+            "Configure Falcon MCP in the detected agent settings? [Y/n]: "
+        ).strip().lower()
+        if answer in {"n", "no"}:
+            print("Skipped MCP configuration.")
+            return 0
+    elif requested.strip().lower() == "all":
+        agents = None
+        all_agents = True
+    else:
+        agents = [item.strip() for item in requested.split(",") if item.strip()]
+        all_agents = False
+
+    # The interactive detected-client path reaches here with ``agents`` set;
+    # the explicit ``all`` path uses all supported clients.
+    if requested is None:
+        all_agents = False
+    try:
+        results = setup_configs(
+            agents,
+            all_agents=all_agents,
+            config_path=config_path,
+            dry_run=args.mcp_dry_run,
+        )
+    except (MCPConfigError, ValueError, OSError) as exc:
+        print(f"Warning: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if not results:
+        print("No MCP client configuration was changed.")
+        return 0
+    for result in results:
+        suffix = f" (backup: {result.backup})" if result.backup else ""
+        print(f"MCP {result.agent}: {result.status} ({result.path}){suffix}")
+    return 0
+
+
 def _update_command(args: argparse.Namespace) -> int:
     """Check for or install the latest Falcon release."""
 
@@ -2080,6 +2186,17 @@ def _update_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_UPDATE
+    try:
+        skill_operations = refresh_installed_skills()
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A skill refresh must never turn a successful package upgrade into a
+        # failed Falcon update; the user can retry it with ``falcon setup``.
+        print(f"Warning: could not refresh agent skills: {exc}", file=sys.stderr)
+        skill_operations = []
+    for operation in skill_operations:
+        print(f"Skill {operation.agent}: {operation.status} ({operation.path})")
+        if operation.detail:
+            print(f"  {operation.detail}", file=sys.stderr)
     print("Falcon updated. Start a new shell or rerun the command.")
     try:
         changelog_version, entries = latest_changelog()
@@ -2157,8 +2274,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 from .mcp_server import serve as serve_mcp
             except ImportError as exc:
                 raise CliError(
-                    "MCP requires the optional dependencies: install 'falcon-k8s[mcp]' "
-                    "(uv tool users: uv tool install --force 'falcon-k8s[mcp]')"
+                    "MCP dependencies are unavailable; reinstall Falcon with "
+                    "'pip install --force-reinstall falcon-k8s' "
+                    "(uv tool users: uv tool install --force falcon-k8s)"
                 ) from exc
             serve_mcp(config, state_dir=args.state_dir)
             return 0
@@ -2216,9 +2334,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if rc:
                 print(f"Completion: {rc}")
             _setup_kubectl_for_coder(non_interactive=args.non_interactive)
+            mcp_code = _setup_mcp_clients(args, config_arg)
             skills_code = _skills_setup(args)
             _print_setup_welcome()
-            return skills_code
+            return mcp_code or skills_code
         if args.command_name == "completion":
             shell = args.shell or detect_shell()[0]
             print(shell_script(shell, config=config), end="")
