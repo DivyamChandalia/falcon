@@ -212,15 +212,17 @@ def create_server(
         """Cancel this exact job UID, leaving unrelated or replacement jobs untouched."""
         return await invoke("cancel_job", job.model_dump())
 
-    @server.tool(annotations=write, structured_output=True)
+    @server.tool(annotations=destructive, structured_output=True)
     async def restart_job(
         job: JobReference, idempotency_key: str, overrides: Optional[RestartOverrides] = None,
     ) -> dict[str, Any]:
-        """Relaunch a terminal job with optional fixes as a linked, non-retrying job.
+        """Restart a terminal job under the same name, with optional fixes and no retries.
 
         Requires a retained Job with a terminal Kubernetes condition. For an
         active job, cancel it and use submit_job for a new run instead. The
-        previous failed job and its logs are not deleted by this operation.
+        Job is replaced with a new UID and new Pod names. Terminated old Pods
+        are retained for logs; job_logs accepts the previous Job reference.
+        Monitor the returned new Job reference, never the old UID.
         """
         return await invoke(
             "restart_job", job.model_dump(), idempotency_key,

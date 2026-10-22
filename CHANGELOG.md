@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- MCP restarts now keep the Job name while returning a new UID and creating
+  new Pods. Old terminated Pods remain available for logs, and interrupted
+  restarts can be safely resumed with the same idempotency key.
+
 - Added optional MCP job tools for coding agents, with server-side event waits,
   bounded per-attempt logs, metrics, and retry-safe submission/relaunch.
 - Agent-managed Jobs disable automatic retries so failures return control to

@@ -31,6 +31,23 @@ def test_default_context_keeps_existing_cli_argv():
     assert KubernetesClient().command_argv(["get", "pods"]) == ["kubectl", "get", "pods"]
 
 
+def test_uid_delete_can_preserve_old_pods_for_restart():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    client = KubernetesClient("mine", runner=run)
+    client.delete_job_uid("train", "old-uid", propagation_policy="Orphan")
+    options = json.loads(calls[0][1]["input"])
+    assert options["preconditions"] == {"uid": "old-uid"}
+    assert options["propagationPolicy"] == "Orphan"
+    with pytest.raises(ValueError, match="propagation"):
+        client.delete_job_uid("train", "old-uid", propagation_policy="invalid")
+    assert len(calls) == 1
+
+
 def test_pod_logs_can_resume_from_timestamp_without_changing_default_reads():
     calls = []
 

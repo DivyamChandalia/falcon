@@ -94,6 +94,45 @@ class ClusterSemanticsTests(unittest.TestCase):
         snapshot = build_job_snapshot(job, [pod])
         self.assertEqual(snapshot.allocated.cpu_cores, 20)
 
+    def test_restarted_job_excludes_old_owned_and_orphaned_pods(self) -> None:
+        job = {
+            "metadata": {"name": "train", "namespace": "team-a", "uid": "new-job-uid"},
+            "spec": {},
+        }
+        for orphan in (False, True):
+            with self.subTest(orphan=orphan):
+                pod = {
+                    "metadata": {
+                        "name": "train-old", "namespace": "team-a",
+                        "labels": {"job-name": "train", "controller-uid": "old-job-uid"},
+                        "ownerReferences": [] if orphan else [
+                            {"kind": "Job", "name": "train", "uid": "old-job-uid"},
+                        ],
+                    },
+                    "status": {"phase": "Failed"},
+                }
+                snapshot = build_job_snapshot(job, [pod])
+                self.assertEqual(snapshot.status, "Pending")
+                self.assertEqual(snapshot.attempts.pod_attempts, 0)
+
+    def test_job_accepts_its_own_orphan_controller_uid_only(self) -> None:
+        job = {
+            "metadata": {"name": "train", "namespace": "team-a", "uid": "job-uid"},
+            "spec": {},
+        }
+        pod = {
+            "metadata": {
+                "name": "train-old", "namespace": "team-a",
+                "labels": {
+                    "batch.kubernetes.io/job-name": "train",
+                    "batch.kubernetes.io/controller-uid": "job-uid",
+                },
+            },
+            "status": {"phase": "Failed"},
+        }
+        snapshot = build_job_snapshot(job, [pod])
+        self.assertEqual(snapshot.attempts.failed_attempts, 1)
+
     def test_quantity_parsers_cover_kubernetes_units(self) -> None:
         self.assertEqual(parse_cpu_quantity("500m"), 0.5)
         self.assertEqual(parse_memory_quantity("512Mi"), 512 * 1024**2)

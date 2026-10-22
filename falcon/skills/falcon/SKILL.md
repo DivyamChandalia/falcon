@@ -27,4 +27,4 @@ Prefer Falcon's MCP tools for agent-managed long-running Jobs (configure with `f
 ## MCP
 
 MCP-created or relaunched Jobs use `backoffLimit=0` and `restartPolicy=Never`, have no automatic recovery, a cancelled wait does not cancel the Job, and idle-agent wake-up is not guaranteed.
-MCP changes no client or host permissions; submit/restart require idempotency keys and returned wait cursors must be reused.
+MCP changes no client or host permissions; submit/restart require idempotency keys and returned wait cursors must be reused. `restart_job` keeps the Job name but returns a new UID; monitor the returned reference. Old terminated Pods and their logs remain readable using the previous Job reference.

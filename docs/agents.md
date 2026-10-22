@@ -145,6 +145,14 @@ For a monitored workflow, submit once, wait for events, inspect the reported
 failure if necessary, then explicitly restart or fix and relaunch. Reuse the
 returned Job reference, including its UID. Use a new idempotency key for an
 intentional new run; repeating a previous key does not resurrect a deleted Job.
+Restarting replaces the terminal Job under the **same name**, with a new UID
+and new Pod names. Monitor the returned Job reference, including its new UID.
+Old terminated Pods are orphaned rather than deleted; `job_logs` can read them
+using the previous Job reference while Kubernetes retains them. They are not
+adopted by the replacement. A private, temporary manifest checkpoint allows
+the same idempotency key to recover an interrupted delete/create sequence;
+it is removed once the replacement UID is recorded.
+
 Restart environment overrides patch named variables without removing inherited
 variables or Secret references. `restart_job` requires a retained Job with a
 terminal Kubernetes condition; a failed pod still waiting for automatic retry

@@ -68,6 +68,7 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
             assert tools["wait_for_events"].annotations.readOnlyHint
             assert not tools["submit_job"].annotations.readOnlyHint
             assert tools["cancel_job"].annotations.destructiveHint
+            assert tools["restart_job"].annotations.destructiveHint
             assert tools["submit_job"].annotations.idempotentHint
             schema = tools["submit_job"].inputSchema
             assert "idempotency_key" in schema["required"]

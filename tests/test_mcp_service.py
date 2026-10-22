@@ -18,6 +18,7 @@ from falcon.mcp_service import (
     IdempotencyConflict,
     JobService,
     MCPServiceError,
+    StaleJobReference,
 )
 from falcon.models import NodeResources
 
@@ -50,6 +51,7 @@ class FakeClient:
         self.event_queries: list[list[str]] = []
         self.created_manifests: list[dict] = []
         self.deleted: list[tuple[str, str]] = []
+        self.delete_policies: list[str] = []
         self.closed = False
         self._uid_number = 0
 
@@ -69,6 +71,8 @@ class FakeClient:
         return copy.deepcopy(self.event_items)
 
     def create_job(self, manifest: dict):
+        if manifest["metadata"]["name"] in self.jobs:
+            raise KubernetesError("AlreadyExists")
         self._uid_number += 1
         value = copy.deepcopy(manifest)
         value.setdefault("metadata", {})["uid"] = f"job-uid-{self._uid_number}"
@@ -111,13 +115,24 @@ class FakeClient:
             stdout=self.log_text.get(pod_name, ""),
         )
 
-    def delete_job_uid(self, name: str, uid: str, *, namespace: str | None = None):
+    def delete_job_uid(
+        self, name: str, uid: str, *, namespace: str | None = None,
+        propagation_policy: str = "Background",
+    ):
         del namespace
         current = self.jobs.get(name)
         if current is None or (current.get("metadata") or {}).get("uid") != uid:
             raise KubernetesError("NotFound")
         del self.jobs[name]
         self.deleted.append((name, uid))
+        self.delete_policies.append(propagation_policy)
+        if propagation_policy == "Orphan":
+            for pod in self.pods:
+                metadata = pod["metadata"]
+                metadata["ownerReferences"] = [
+                    owner for owner in metadata.get("ownerReferences", [])
+                    if owner.get("uid") != uid
+                ]
         return SimpleNamespace(returncode=0)
 
     def close(self) -> None:
@@ -165,7 +180,10 @@ def _pod(
             "name": name,
             "uid": uid,
             "creationTimestamp": created,
-            "labels": {"job-name": job["metadata"]["name"]},
+            "labels": {
+                "job-name": job["metadata"]["name"],
+                "batch.kubernetes.io/controller-uid": job["metadata"]["uid"],
+            },
             "ownerReferences": [
                 {
                     "kind": "Job",
@@ -596,6 +614,10 @@ def test_restart_strips_controller_retry_policies_and_links_source(tmp_path: Pat
         overrides={"gpus": 2, "env": {"CHANGE_ME": "new"}},
     )
     restarted = client.jobs[result["name"]]
+    assert result["name"] == "failed-job"
+    assert result["uid"] != "source-uid"
+    assert client.deleted == [("failed-job", "source-uid")]
+    assert client.delete_policies == ["Orphan"]
     spec = restarted["spec"]
     template_spec = spec["template"]["spec"]
     container = template_spec["containers"][0]
@@ -629,16 +651,14 @@ def test_restart_strips_controller_retry_policies_and_links_source(tmp_path: Pat
     )
     assert reused["uid"] == result["uid"]
     assert reused["reused"] is True
-    independent = service.restart_job(
-        {"name": "failed-job", "namespace": "research", "uid": "source-uid"},
-        "restart-key-2",
-        overrides={"gpus": 2, "env": {"CHANGE_ME": "new"}},
-    )
-    assert independent["name"] != result["name"]
+    with pytest.raises(StaleJobReference):
+        service.restart_job(
+            {"name": "failed-job", "namespace": "research", "uid": "source-uid"},
+            "restart-key-2",
+            overrides={"gpus": 2, "env": {"CHANGE_ME": "new"}},
+        )
 
-    # The source Job may be removed by TTL cleanup after the replacement was
-    # accepted.  Replaying the same key must recover from the durable target
-    # operation without looking up the deleted source.
+    # TTL cleanup must not cause a retry to resurrect the replacement.
     del client.jobs["failed-job"]
     replay_after_ttl = service.restart_job(
         {"name": "failed-job", "namespace": "research", "uid": "source-uid"},
@@ -667,6 +687,214 @@ def test_restart_rejects_indexed_or_environment_changes(tmp_path: Path) -> None:
         service.restart_job(ref, "indexed-key")
     with pytest.raises(MCPServiceError, match="environment"):
         service._restart_overrides({"environment": "new"})
+    assert client.deleted == []
+    asyncio.run(service.close())
+
+
+def _terminal_job(service: JobService, client: FakeClient) -> dict:
+    ref = service.submit_job(_request(), "source-submit")["job"]
+    client.jobs[ref["name"]]["status"] = {
+        "conditions": [{"type": "Failed", "status": "True"}],
+    }
+    return ref
+
+
+def test_restart_preserves_old_pod_logs_without_mixing_attempts(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    old_pod = _pod(client.jobs[source["name"]], "train-old", "pod-old", phase="Failed")
+    client.pods.append(old_pod)
+    client.log_text["train-old"] = "2026-01-01T00:00:01Z old failure\n"
+
+    restarted = service.restart_job(source, "restart-logs")["job"]
+    assert old_pod["metadata"]["ownerReferences"] == []
+    client.pods.append(_pod(client.jobs[source["name"]], "train-new", "pod-new"))
+    client.log_text["train-new"] = "2026-01-01T00:00:02Z new attempt\n"
+
+    old_logs = service.job_logs(source, failed_only=True)
+    new_logs = service.job_logs(restarted)
+    assert [entry["pod"] for entry in old_logs["logs"]] == ["train-old"]
+    assert "old failure" in old_logs["logs"][0]["stdout"]
+    assert [entry["pod"] for entry in new_logs["logs"]] == ["train-new"]
+    with pytest.raises(MCPServiceError, match="not an attempt"):
+        service.job_logs(restarted, pods=["train-old"])
+    with pytest.raises(StaleJobReference):
+        service.cancel_job(source)
+    with pytest.raises(StaleJobReference):
+        service.job_logs({**source, "uid": "unrecorded-uid"})
+    # A conflicting owner takes precedence over an orphan's retained labels.
+    old_pod["metadata"]["ownerReferences"] = [
+        {"kind": "Job", "name": source["name"], "uid": "another-job"},
+    ]
+    assert service.job_logs(source, failed_only=True)["logs"] == []
+    asyncio.run(service.close())
+
+
+def test_restart_replay_cannot_delete_a_later_same_name_attempt(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    first = service.restart_job(source, "first-restart")["job"]
+    client.jobs[first["name"]]["status"] = {"conditions": [{"type": "Complete", "status": "True"}]}
+    second = service.restart_job(first, "second-restart")["job"]
+    assert second["name"] == first["name"] == source["name"]
+    assert len({source["uid"], first["uid"], second["uid"]}) == 3
+    replay = service.restart_job(source, "first-restart")
+    assert replay["job"] == first
+    assert replay["reused"] is True
+    assert client.jobs[second["name"]]["metadata"]["uid"] == second["uid"]
+    assert len(client.created_manifests) == 3
+    assert len(client.deleted) == 2
+    assert list(service._state_dir.glob("pending-restart-*.json")) == []
+    asyncio.run(service.close())
+
+
+def test_restart_recovers_after_delete_and_process_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    original_create = client.create_job
+
+    def fail_create(manifest):
+        raise KubernetesError("connection interrupted")
+
+    monkeypatch.setattr(client, "create_job", fail_create)
+    overrides = {"env": {"SECRET_VALUE": "private-restart-value"}, "cpu": "2"}
+    with pytest.raises(KubernetesError, match="interrupted"):
+        service.restart_job(source, "recover-restart", overrides=overrides)
+    assert source["name"] not in client.jobs
+    checkpoint, = service._state_dir.glob("pending-restart-*.json")
+    assert checkpoint.stat().st_mode & 0o777 == 0o600
+    assert "private-restart-value" not in service._db_path.read_bytes().decode("latin1")
+    asyncio.run(service.close())
+
+    monkeypatch.setattr(client, "create_job", original_create)
+    service = _service(tmp_path, client)
+    result = service.restart_job(source, "recover-restart", overrides=overrides)
+    assert result["name"] == source["name"]
+    assert result["uid"] != source["uid"]
+    assert len(client.deleted) == 1
+    env = client.jobs[source["name"]]["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert {"name": "SECRET_VALUE", "value": "private-restart-value"} in env
+    assert not checkpoint.exists()
+    assert not list(service._state_dir.glob(".restart-*"))
+    asyncio.run(service.close())
+
+
+def test_restart_reconciles_create_with_lost_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    original_create = client.create_job
+
+    def lost_response(manifest):
+        original_create(manifest)
+        raise KubernetesError("response lost")
+
+    monkeypatch.setattr(client, "create_job", lost_response)
+    result = service.restart_job(source, "lost-reply")
+    assert result["reused"] is True
+    assert result["name"] == source["name"]
+    assert result["uid"] != source["uid"]
+    assert not list(service._state_dir.glob("pending-restart-*.json"))
+    asyncio.run(service.close())
+
+
+def test_restart_waits_for_deletion_and_retries_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    original_delete = client.delete_job_uid
+
+    def pending_delete(*args, **kwargs):
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(client, "delete_job_uid", pending_delete)
+    monkeypatch.setattr("falcon.mcp_service._RESTART_DELETE_TIMEOUT_SECONDS", 0)
+    with pytest.raises(MCPServiceError, match="same idempotency key"):
+        service.restart_job(source, "pending-delete")
+    assert len(client.created_manifests) == 1
+    monkeypatch.setattr(client, "delete_job_uid", original_delete)
+    result = service.restart_job(source, "pending-delete")
+    assert result["name"] == source["name"]
+    assert result["uid"] != source["uid"]
+    asyncio.run(service.close())
+
+
+def test_restart_refuses_active_pods_even_with_terminal_job(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    client.pods.append(_pod(client.jobs[source["name"]], "terminating", "pod-uid"))
+    with pytest.raises(MCPServiceError, match="Pods to terminate"):
+        service.restart_job(source, "still-terminating")
+    assert client.deleted == []
+    assert len(client.created_manifests) == 1
+    asyncio.run(service.close())
+
+
+@pytest.mark.parametrize("invalid", ["symlink", "malformed", "mismatch"])
+def test_restart_checks_recovery_file_before_deleting_source(
+    tmp_path: Path, invalid: str,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    key = service._idempotency_key("invalid-checkpoint")
+    checkpoint = service._state_dir / f"pending-restart-{key}.json"
+    if invalid == "symlink":
+        checkpoint.symlink_to(tmp_path / "do-not-follow")
+    else:
+        checkpoint.write_text("invalid json" if invalid == "malformed" else "{}")
+        checkpoint.chmod(0o600)
+    with pytest.raises(MCPServiceError, match="recover restart checkpoint"):
+        service.restart_job(source, "invalid-checkpoint")
+    assert client.deleted == []
+    assert client.jobs[source["name"]]["metadata"]["uid"] == source["uid"]
+    asyncio.run(service.close())
+
+
+def test_restart_reconciles_legacy_different_name_operation(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    key = service._idempotency_key("legacy-restart")
+    service._operations.reserve(
+        kind="restart", key=key, request_digest=service._restart_digest(source, {}),
+        planned_name="train-restart-legacy", namespace=source["namespace"],
+        source_uid=source["uid"],
+    )
+    restarted = service.restart_job(source, "legacy-restart")
+    assert restarted["name"] == "train-restart-legacy"
+    assert restarted["uid"] != source["uid"]
+    assert client.deleted == []
+    asyncio.run(service.close())
+
+
+def test_restart_does_not_delete_a_racing_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+
+    def replace_during_delete(*args, **kwargs):
+        client.jobs[source["name"]]["metadata"]["uid"] = "unrelated-replacement"
+        raise KubernetesError("UID precondition failed")
+
+    monkeypatch.setattr(client, "delete_job_uid", replace_during_delete)
+    with pytest.raises(IdempotencyConflict):
+        service.restart_job(source, "racing-restart")
+    assert client.jobs[source["name"]]["metadata"]["uid"] == "unrelated-replacement"
+    assert client.deleted == []
+    assert len(client.created_manifests) == 1
     asyncio.run(service.close())
 
 

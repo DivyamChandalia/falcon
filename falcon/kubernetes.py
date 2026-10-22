@@ -392,6 +392,7 @@ class KubernetesClient:
 
     def delete_job_uid(
         self, name: str, uid: str, *, namespace: Optional[str] = None,
+        propagation_policy: str = "Background",
     ) -> ProcessResult:
         """Delete exactly one Job identity, not a same-name replacement.
 
@@ -400,6 +401,8 @@ class KubernetesClient:
         """
         if not name or not uid:
             raise ValueError("Job name and UID are required")
+        if propagation_policy not in {"Background", "Foreground", "Orphan"}:
+            raise ValueError("invalid Job deletion propagation policy")
         effective = namespace or self.namespace
         path = (
             "/apis/batch/v1/namespaces/"
@@ -410,7 +413,7 @@ class KubernetesClient:
             input_text=json.dumps({
                 "apiVersion": "v1", "kind": "DeleteOptions",
                 "preconditions": {"uid": uid},
-                "propagationPolicy": "Background",
+                "propagationPolicy": propagation_policy,
             }),
         )
 

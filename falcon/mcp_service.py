@@ -29,6 +29,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -50,6 +51,7 @@ from .resources import fetch_nodes
 AGENT_LABEL = "falcon.dev/agent-managed"
 IDEMPOTENCY_LABEL = "falcon.dev/idempotency-hash"
 PREVIOUS_JOB_UID_ANNOTATION = "falcon.dev/previous-job-uid"
+_RESTART_DELETE_TIMEOUT_SECONDS = 15.0
 
 _DEFAULT_LOG_LIMIT = 3
 _DEFAULT_LOG_TAIL = 50
@@ -311,6 +313,18 @@ class _OperationStore:
                 (uid, kind, key),
             )
             self._connection.commit()
+
+    def restarted_source(self, ref: Mapping[str, str]) -> bool:
+        """Authorize historical log reads only for a recorded replacement."""
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT 1 FROM falcon_mcp_operations
+                 WHERE kind = 'restart' AND namespace = ? AND planned_name = ?
+                   AND source_uid = ? AND created_uid != '' LIMIT 1
+                """,
+                (ref["namespace"], ref["name"], ref["uid"]),
+            ).fetchone() is not None
 
     def close(self) -> None:
         with self._lock:
@@ -1250,7 +1264,9 @@ class JobService:
         cursors: Optional[dict[str, str]] = None,
         container: Optional[str] = None,
     ) -> dict:
-        ref, _live = self._validated_live_job(job)
+        ref = self._job_ref(job)
+        if not self._operations.restarted_source(ref):
+            self._validated_live_job(ref)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_LOG_LIMIT:
             raise MCPServiceError(f"limit must be between 1 and {_MAX_LOG_LIMIT}")
         if isinstance(tail, bool) or not isinstance(tail, int) or not 0 <= tail <= _MAX_LOG_TAIL:
@@ -1572,7 +1588,7 @@ class JobService:
         idempotency_key: str,
         overrides: Optional[dict] = None,
     ) -> dict:
-        """Relaunch one terminal ordinary Job with typed field overrides.
+        """Replace one terminal Job under its original name, with a new UID.
 
         ``overrides["env"]`` is a patch by variable name: entries not named
         in the patch, including ``valueFrom`` references such as secrets, are
@@ -1580,8 +1596,8 @@ class JobService:
         Changing the Python environment itself is intentionally unsupported.
         """
         # Validate the reference shape and operation identity before looking
-        # up the source Job.  A successful relaunch must remain replayable if
-        # the original Job is later deleted by TTL cleanup.
+        # up the source Job. A successful restart must remain replayable even
+        # after a subsequent restart has reused the same name again.
         ref = self._job_ref(job)
         normalized_overrides = self._restart_overrides(overrides)
         key = self._idempotency_key(idempotency_key)
@@ -1594,82 +1610,68 @@ class JobService:
         planned_name = (
             operation.planned_name
             if operation is not None
-            else _restart_name(ref["name"], digest, uniqueness=key)
+            else ref["name"]
         )
         tag = self._idempotency_tag(key)
         if operation is not None:
+            if operation.created_uid:
+                return self._completed_restart(ref, operation)
             existing = self._get_job_optional(planned_name, ref["namespace"])
-            if existing is not None:
+            if existing is not None and (
+                planned_name != ref["name"]
+                or str((existing.get("metadata") or {}).get("uid") or "") != ref["uid"]
+            ):
                 self._verify_idempotent_job(existing, tag, operation)
                 identity = _identity_from_job(existing, ref["namespace"])
                 self._operations.mark_created("restart", key, identity["uid"])
+                self._clear_restart_checkpoint(key)
                 return self._restart_response(ref, identity, created=False, reused=True)
-            if operation.created_uid:
-                return self._deleted_replay_response(
-                    {
-                        "name": operation.planned_name,
-                        "namespace": operation.namespace,
-                        "uid": operation.created_uid,
-                    },
-                    None,
-                    previous=ref,
-                )
 
-        ref, live = self._validated_live_job(job)
-        self._reject_coder_job(ref, live)
-        status = self._job_terminal_condition(live)
-        if status is None:
-            raise MCPServiceError(
-                f"Job {ref['name']!r} has no Kubernetes terminal Complete=True or "
-                "Failed=True condition; wait for the Job controller before restarting"
+        live = self._get_job_optional(ref["name"], ref["namespace"])
+        if live is not None:
+            self._validate_restart_source(ref, live)
+            manifest = _restart_manifest(
+                live,
+                namespace=ref["namespace"],
+                name=planned_name,
+                previous_uid=ref["uid"],
+                overrides=normalized_overrides,
+                config=self.config,
             )
-        manifest = _restart_manifest(
-            live,
-            namespace=ref["namespace"],
-            name=planned_name,
-            previous_uid=ref["uid"],
-            overrides=normalized_overrides,
-            config=self.config,
-        )
-        self._force_agent_manifest(
-            manifest,
-            idempotency_tag=tag,
-            previous_uid=ref["uid"],
-        )
-        operation = self._operations.reserve(
-            kind="restart",
-            key=key,
-            request_digest=digest,
-            planned_name=planned_name,
-            namespace=ref["namespace"],
-            source_uid=ref["uid"],
-        )
-        if operation.request_digest != digest:
-            raise IdempotencyConflict(
-                "idempotency key was already used for a different restart"
+            self._force_agent_manifest(
+                manifest, idempotency_tag=tag, previous_uid=ref["uid"],
             )
-        manifest = _rename_manifest(
-            manifest,
-            operation.planned_name,
-            ref["namespace"],
-            add_job_label=False,
-        )
-        existing = self._get_job_optional(operation.planned_name, ref["namespace"])
+            operation = self._operations.reserve(
+                kind="restart", key=key, request_digest=digest,
+                planned_name=planned_name, namespace=ref["namespace"],
+                source_uid=ref["uid"],
+            )
+            if operation.request_digest != digest:
+                raise IdempotencyConflict(
+                    "idempotency key was already used for a different restart"
+                )
+            if operation.created_uid:
+                return self._completed_restart(ref, operation)
+            manifest = self._restart_checkpoint(operation, manifest)
+        elif operation is not None:
+            # The source was deleted but create (or the MCP process) failed.
+            # Recover the exact prepared manifest, not a fresh submission.
+            manifest = self._restart_checkpoint(operation)
+        else:
+            raise StaleJobReference(f"Job {ref['name']!r} no longer exists")
+
+        if operation.planned_name == ref["name"]:
+            existing = self._remove_restart_source(ref)
+        else:
+            # Retain reconciliation for operations recorded by older Falcon
+            # versions which generated a different replacement name.
+            existing = self._get_job_optional(operation.planned_name, ref["namespace"])
         if existing is not None:
             self._verify_idempotent_job(existing, tag, operation)
             identity = _identity_from_job(existing, ref["namespace"])
             self._operations.mark_created("restart", key, identity["uid"])
+            self._clear_restart_checkpoint(key)
             return self._restart_response(ref, identity, created=False, reused=True)
-        if operation.created_uid:
-            return self._deleted_replay_response(
-                {
-                    "name": operation.planned_name,
-                    "namespace": operation.namespace,
-                    "uid": operation.created_uid,
-                },
-                None,
-                previous=ref,
-            )
         try:
             created = self.client.create_job(manifest)
         except Exception:
@@ -1679,11 +1681,13 @@ class JobService:
             self._verify_idempotent_job(existing, tag, operation)
             identity = _identity_from_job(existing, ref["namespace"])
             self._operations.mark_created("restart", key, identity["uid"])
+            self._clear_restart_checkpoint(key)
             return self._restart_response(ref, identity, created=False, reused=True)
         identity = _identity_from_created(created, ref["namespace"], operation.planned_name)
         if not identity["uid"]:
             live_new = self._get_job_optional(operation.planned_name, ref["namespace"])
             if live_new is not None:
+                self._verify_idempotent_job(live_new, tag, operation)
                 identity = _identity_from_job(live_new, ref["namespace"])
         if not identity["uid"]:
             raise MCPServiceError(
@@ -1691,7 +1695,117 @@ class JobService:
                 "persist an unbound idempotency result"
             )
         self._operations.mark_created("restart", key, identity["uid"])
+        self._clear_restart_checkpoint(key)
         return self._restart_response(ref, identity, created=True, reused=False)
+
+    def _completed_restart(self, ref: dict[str, str], operation: _Operation) -> dict:
+        self._clear_restart_checkpoint(operation.key)
+        return self._restart_response(
+            ref,
+            {"name": operation.planned_name, "namespace": operation.namespace,
+             "uid": operation.created_uid},
+            created=False, reused=True,
+        )
+
+    def _validate_restart_source(self, ref: dict[str, str], live: Mapping[str, Any]) -> None:
+        if _identity_from_job(live, ref["namespace"]) != ref:
+            raise StaleJobReference(
+                f"Job {ref['name']!r} UID changed; refresh the Job reference"
+            )
+        self._reject_coder_job(ref, live)
+        if self._job_terminal_condition(live) is None:
+            raise MCPServiceError(
+                f"Job {ref['name']!r} has no Kubernetes terminal Complete=True or "
+                "Failed=True condition; wait for the Job controller before restarting"
+            )
+        if any(
+            _pod_phase(pod) not in {"Failed", "Succeeded"}
+            for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"])
+        ):
+            raise MCPServiceError("wait for all source Job Pods to terminate before restarting")
+
+    def _remove_restart_source(self, ref: dict[str, str]) -> Optional[Mapping[str, Any]]:
+        live = self._get_job_optional(ref["name"], ref["namespace"])
+        if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+            return live
+        self._validate_restart_source(ref, live)
+        try:
+            self.client.delete_job_uid(
+                ref["name"], ref["uid"], namespace=ref["namespace"],
+                propagation_policy="Orphan",
+            )
+        except Exception:
+            # Another retry may have completed the same UID-preconditioned
+            # deletion. Never fall back to a name-only delete.
+            current = self._get_job_optional(ref["name"], ref["namespace"])
+            if current is not None and str((current.get("metadata") or {}).get("uid") or "") == ref["uid"]:
+                raise
+            return current
+        deadline = time.monotonic() + _RESTART_DELETE_TIMEOUT_SECONDS
+        while True:
+            current = self._get_job_optional(ref["name"], ref["namespace"])
+            if current is None or str((current.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+                return current
+            if time.monotonic() >= deadline:
+                raise MCPServiceError(
+                    "source Job deletion is still pending; retry restart_job with "
+                    "the same idempotency key to finish the restart"
+                )
+            time.sleep(0.1)
+
+    def _restart_checkpoint(self, operation: _Operation, manifest: Optional[dict] = None) -> dict:
+        """Durably bridge delete/create without persisting manifests in SQLite.
+
+        A private, temporary checkpoint survives interrupted restarts and is
+        removed once the replacement UID has been durably recorded.
+        """
+        path = self._state_dir / f"pending-restart-{operation.key}.json"
+        if manifest is not None:
+            descriptor, temporary = tempfile.mkstemp(prefix=".restart-", dir=self._state_dir)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump({"digest": operation.request_digest, "manifest": manifest}, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    # Publish once: concurrent retries must share the first
+                    # prepared manifest rather than overwrite each other.
+                    os.link(temporary, path)
+                except FileExistsError:
+                    pass
+                directory = os.open(self._state_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                os.unlink(temporary)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise MCPServiceError("restart checkpoint must be a private regular file")
+                payload = json.load(stream)
+            value = payload["manifest"]
+            metadata = value["metadata"]
+            if (
+                payload["digest"] != operation.request_digest
+                or metadata["name"] != operation.planned_name
+                or metadata["namespace"] != operation.namespace
+                or metadata["annotations"][PREVIOUS_JOB_UID_ANNOTATION] != operation.source_uid
+                or metadata["labels"][IDEMPOTENCY_LABEL] != self._idempotency_tag(operation.key)
+            ):
+                raise MCPServiceError("restart checkpoint does not match the operation")
+            return value
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise MCPServiceError(
+                "cannot recover restart checkpoint; source Job was not modified "
+                "by this attempt"
+            ) from exc
+
+    def _clear_restart_checkpoint(self, key: str) -> None:
+        (self._state_dir / f"pending-restart-{key}.json").unlink(missing_ok=True)
 
     @staticmethod
     def _restart_digest(ref: Mapping[str, str], overrides: Mapping[str, Any]) -> str:
@@ -2085,24 +2199,6 @@ def _identity_from_created(value: Any, namespace: str, fallback_name: str) -> di
     }
 
 
-def _restart_name(
-    source: str,
-    digest: str,
-    *,
-    uniqueness: Optional[str] = None,
-) -> str:
-    if uniqueness:
-        # The restart request digest intentionally excludes the idempotency
-        # key so a reused key still compares the same typed operation.  The
-        # generated name needs the key as a separate discriminator so two
-        # independent relaunches of the same source/overrides do not collide.
-        key_suffix = hashlib.sha256(uniqueness.encode("utf-8")).hexdigest()[:12]
-        suffix = f"-restart-{digest[:8]}-{key_suffix}"
-    else:
-        suffix = f"-restart-{digest[:10]}"
-    return f"{source[: max(1, 63 - len(suffix))].rstrip('-')}{suffix}"[:63].rstrip("-")
-
-
 def _generated_job_name(
     request: Mapping[str, Any],
     command: Sequence[str],
@@ -2445,10 +2541,21 @@ def _pod_matches_job(
         # Once a Job UID is known, a same-name label is not sufficient: a
         # replacement Job can inherit that label while old attempt Pods are
         # still visible for a short time.
-        return any(
-            str(owner.get("name") or "") == name
-            and str(owner.get("uid") or "") == uid
-            for owner in job_owners
+        if job_owners:
+            return any(
+                str(owner.get("name") or "") == name
+                and str(owner.get("uid") or "") == uid
+                for owner in job_owners
+            )
+        # Orphan deletion preserves the old controller UID labels while
+        # removing owner references. Require both identity labels, never
+        # just the Job name, so attempts cannot leak into a replacement.
+        labels = metadata.get("labels") or {}
+        return (
+            labels.get("job-name", labels.get("batch.kubernetes.io/job-name")) == name
+            and labels.get(
+                "controller-uid", labels.get("batch.kubernetes.io/controller-uid")
+            ) == uid
         )
     labels = metadata.get("labels") or {}
     if labels.get("job-name") == name or labels.get("batch.kubernetes.io/job-name") == name:

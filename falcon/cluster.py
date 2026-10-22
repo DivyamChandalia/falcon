@@ -765,13 +765,17 @@ def _pod_belongs_to_job(pod: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
         return False
     job_name = str(job_meta.get("name") or "")
     job_uid = str(job_meta.get("uid") or "")
-    for owner in pod_meta.get("ownerReferences") or []:
-        if owner.get("kind") == "Job" and (
-            (job_uid and str(owner.get("uid") or "") == job_uid)
-            or str(owner.get("name") or "") == job_name
-        ):
-            return True
+    owners = [owner for owner in pod_meta.get("ownerReferences") or [] if owner.get("kind") == "Job"]
+    if owners:
+        return any(
+            str(owner.get("name") or "") == job_name
+            and (not job_uid or not owner.get("uid") or str(owner["uid"]) == job_uid)
+            for owner in owners
+        )
     labels = pod_meta.get("labels") or {}
+    controller_uid = labels.get("batch.kubernetes.io/controller-uid", labels.get("controller-uid"))
+    if job_uid and controller_uid and controller_uid != job_uid:
+        return False
     return labels.get("batch.kubernetes.io/job-name", labels.get("job-name")) == job_name
 
 
