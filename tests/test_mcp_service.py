@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -221,6 +222,9 @@ def test_resource_only_gpu_plan_exposes_recommendations_without_creating_job(tmp
     try:
         result = service.plan_job(request)
         assert result["resource_only"]
+        assert re.fullmatch(
+            r"falcon-[a-z0-9]+-[a-z0-9]+-[0-9]+", result["name"]
+        )
         assert "command" not in result["summary"]
         assert request == {"gpu": "2080ti", "gpus": 1}
         info = result["resource_plan"]["scheduling"]
@@ -336,6 +340,32 @@ def test_submit_idempotency_reconciles_and_does_not_resurrect_deleted_job(
     asyncio.run(service.close())
 
 
+def test_submit_same_name_with_different_key_explains_falcon_collision(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    try:
+        service.submit_job(_request(), "first-key")
+
+        with pytest.raises(IdempotencyConflict) as error:
+            service.submit_job(_request(), "second-key")
+        message = str(error.value)
+        assert "another Falcon submission" in message
+        assert "reuse the original idempotency key" in message
+        assert "first-key" not in message
+        assert "second-key" not in message
+
+        del client.jobs["train"]["metadata"]["labels"][IDEMPOTENCY_LABEL]
+        with pytest.raises(IdempotencyConflict) as missing_marker_error:
+            service.submit_job(_request(), "third-key")
+        assert "without the matching Falcon idempotency marker" in str(
+            missing_marker_error.value
+        )
+    finally:
+        asyncio.run(service.close())
+
+
 def test_generated_submit_names_include_key_but_retries_reuse_one_job(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +377,8 @@ def test_generated_submit_names_include_key_but_retries_reuse_one_job(
     first = service.submit_job(request, "independent-key-a")
     second = service.submit_job(request, "independent-key-b")
     assert first["name"] != second["name"]
+    assert re.fullmatch(r"falcon-[a-z0-9]+-[a-z0-9]+-[0-9]+", first["name"])
+    assert re.fullmatch(r"falcon-[a-z0-9]+-[a-z0-9]+-[0-9]+", second["name"])
     assert len(client.created_manifests) == 2
 
     retry = service.submit_job(request, "independent-key-a")

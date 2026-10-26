@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .cluster import build_cluster_snapshot, build_job_snapshot
+from .coder import generate_workspace_name
 from .config import gpu_preset_max_count
 from .dashboard import UsageCollector
 from .kubernetes import KubernetesClient, KubernetesError, ProcessResult
@@ -952,7 +953,14 @@ class JobService:
     ) -> None:
         metadata = job.get("metadata") or {}
         labels = metadata.get("labels") or {}
-        if str(labels.get(IDEMPOTENCY_LABEL) or "") != tag:
+        existing_tag = str(labels.get(IDEMPOTENCY_LABEL) or "")
+        if existing_tag != tag:
+            if existing_tag:
+                raise IdempotencyConflict(
+                    f"Job {operation.planned_name!r} is already used by another "
+                    "Falcon submission; reuse the original idempotency key if "
+                    "this is a retry, or choose another job name"
+                )
             raise IdempotencyConflict(
                 f"Job {operation.planned_name!r} already exists without the "
                 "matching Falcon idempotency marker"
@@ -2453,33 +2461,15 @@ def _generated_job_name(
     *,
     uniqueness: Optional[str] = None,
 ) -> str:
-    """Create a stable DNS name when the MCP caller omits ``name``."""
+    """Create a readable random DNS name when the MCP caller omits ``name``.
 
-    useful = next(
-        (
-            Path(part).stem
-            for part in command
-            if not part.startswith("-") and part not in {"python", "python3"}
-        ),
-        "job",
-    )
-    useful = re.sub(r"[^a-z0-9]+", "-", useful.lower()).strip("-") or "job"
-    digest = hashlib.sha256(
-        json.dumps(
-            request,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    if uniqueness:
-        # Keep the caller-visible request digest independent of the key, while
-        # making generated names unique for independent idempotency keys.
-        key_suffix = hashlib.sha256(uniqueness.encode("utf-8")).hexdigest()[:12]
-        suffix = f"-{digest[:8]}-{key_suffix}"
-    else:
-        suffix = f"-{digest[:10]}"
-    return f"mcp-{useful[: max(1, 63 - len(suffix) - 4)]}{suffix}"[:63].rstrip("-")
+    ``uniqueness`` is retained in the signature because submit idempotency is
+    persisted by :class:`JobService`; the first generated name is recorded in
+    the operation store and reused on later attempts with the same key.
+    """
+
+    del request, command, uniqueness
+    return f"falcon-{generate_workspace_name()}"
 
 
 def _strip_controller_metadata(value: Any) -> Any:
