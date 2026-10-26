@@ -28,6 +28,10 @@ long-running Jobs.
   configurable MCP execution windows for long-running Jobs. Claude Code setup
   checks whether the installed client can background long MCP calls and warns
   when an upgrade is needed.
+- Hardened the local MCP stdio transport for Python environments where a
+  completed worker-pool file operation can fail to wake the event loop. MCP
+  initialization, tool discovery, and synchronous operations now remain
+  responsive without leaving a shared executor running after the client exits.
 - Agent guidance now recommends task-sized CPU and memory requests, using
   Falcon's node-aware GPU allocation as a baseline instead of requesting
   speculative resources. CPU-only smoke tests default to a small 1 CPU/1Gi

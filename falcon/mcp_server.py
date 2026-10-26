@@ -7,12 +7,18 @@ client configuration continue to work without starting an MCP server.
 from __future__ import annotations
 
 import asyncio
+import os
+import queue
+import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 import anyio
+import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.message import SessionMessage
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -42,6 +48,100 @@ def _agent_response(value: Any) -> Any:
     if isinstance(value, list):
         return [_agent_response(item) for item in value]
     return value
+
+
+async def _run_blocking(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous operation without relying on asyncio's executor.
+
+    Some supported Python/asyncio environments run the worker for
+    ``asyncio.to_thread`` but fail to wake the event loop when its result is
+    posted.  MCP calls would then appear to hang even though the operation
+    completed.  A short-lived daemon thread plus an async queue handoff keeps
+    the transport responsive and does not leave a shared executor behind when
+    a stdio session closes.
+    """
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result_queue.put((True, function(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - deliver worker failures
+            result_queue.put((False, exc))
+
+    threading.Thread(target=worker, name="falcon-mcp-call", daemon=True).start()
+    while True:
+        try:
+            succeeded, value = result_queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if succeeded:
+            return value
+        raise value
+
+
+@asynccontextmanager
+async def _stdio_server_without_file_threads():
+    """Expose MCP stdio streams without AnyIO's blocking file wrapper.
+
+    AnyIO's standard ``wrap_file`` implementation delegates pipe reads and
+    writes to its worker pool.  On some supported Python builds a completed
+    worker does not wake the asyncio loop, which makes even ``initialize``
+    appear to time out.  The MCP protocol already uses memory streams between
+    its transport and server; use an asyncio pipe reader and direct small pipe
+    writes at that boundary instead.
+    """
+    read_send, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_receive = anyio.create_memory_object_stream(0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    read_transport, _ = await loop.connect_read_pipe(
+        lambda: protocol, sys.stdin.buffer,
+    )
+    stdout_fd = sys.stdout.fileno()
+
+    async def read_stdin() -> None:
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    message = mcp_types.JSONRPCMessage.model_validate_json(line)
+                except Exception as exc:  # pragma: no cover - malformed host input
+                    await read_send.send(exc)
+                else:
+                    await read_send.send(SessionMessage(message))
+        finally:
+            await read_send.aclose()
+
+    async def write_stdout() -> None:
+        async with write_receive:
+            async for session_message in write_receive:
+                payload = (
+                    session_message.message.model_dump_json(
+                        by_alias=True, exclude_none=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                # MCP responses are small JSON messages. A blocking write is
+                # preferable to reintroducing the broken worker-pool path;
+                # MCP hosts continuously read this pipe.
+                os.write(stdout_fd, payload)
+
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(read_stdin)
+            task_group.start_soon(write_stdout)
+            try:
+                yield read_stream, write_stream
+            finally:
+                task_group.cancel_scope.cancel()
+    finally:
+        read_transport.close()
+        await read_stream.aclose()
+        await write_stream.aclose()
 
 
 class SubmissionRequest(BaseModel):
@@ -173,7 +273,7 @@ def create_server(
         async with create_lock:
             if service is None:
                 factory = service_factory or JobService
-                creation = asyncio.create_task(asyncio.to_thread(
+                creation = asyncio.create_task(_run_blocking(
                     factory, config, state_dir=Path(state_dir) if state_dir else None,
                 ))
                 try:
@@ -191,7 +291,7 @@ def create_server(
         # Sync collectors/SQLite and idempotent operations share state. A long
         # event wait deliberately does not hold this lock or block other tools.
         async with operation_lock:
-            operation = asyncio.create_task(asyncio.to_thread(
+            operation = asyncio.create_task(_run_blocking(
                 getattr(current, method), *args, **kwargs,
             ))
             try:
@@ -410,4 +510,19 @@ def create_server(
 
 
 def serve(config: Mapping[str, Any], *, state_dir: Optional[str] = None) -> None:
-    create_server(config, state_dir=state_dir).run(transport="stdio")
+    server = create_server(config, state_dir=state_dir)
+
+    async def run_stdio() -> None:
+        async with _stdio_server_without_file_threads() as (read_stream, write_stream):
+            await server._mcp_server.run(  # noqa: SLF001 - custom stdio transport
+                read_stream,
+                write_stream,
+                server._mcp_server.create_initialization_options(),  # noqa: SLF001
+            )
+
+    # MCP is normally launched with Unix pipes. Keep the SDK's native path on
+    # Windows, where asyncio's pipe support differs from the Unix transport.
+    if os.name == "nt":  # pragma: no cover - Falcon's supported hosts are Linux
+        server.run(transport="stdio")
+    else:
+        asyncio.run(run_stdio())
