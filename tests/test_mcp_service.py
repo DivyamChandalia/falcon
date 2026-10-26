@@ -211,6 +211,65 @@ def _pod(
     }
 
 
+def test_resource_only_gpu_plan_exposes_recommendations_without_creating_job(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    monkeypatch.setattr(service, "_planning_nodes", lambda: [
+        NodeResources("node-gpu", 64, 4, 256, 32, 4, 3, "2080ti"),
+    ])
+    request = {"gpu": "2080ti", "gpus": 1}
+    try:
+        result = service.plan_job(request)
+        assert result["resource_only"]
+        assert "command" not in result["summary"]
+        assert request == {"gpu": "2080ti", "gpus": 1}
+        info = result["resource_plan"]["scheduling"]
+        assert info["schedulable_nodes"] == ["node-gpu"]
+        assert info["maximum_allocation"]["cpu_cores"] == 60
+        assert info["maximum_allocation"]["memory_gib"] == 224
+        assert info["recommended_allocation"]["cpu"] == "16"
+        assert info["recommended_allocation"]["memory"] == "63Gi"
+        assert client.created_manifests == []
+        with pytest.raises(MCPServiceError, match="command"):
+            service.submit_job(request, "no-command")
+    finally:
+        asyncio.run(service.close())
+
+
+def test_impossible_gpu_cpu_ram_request_can_be_previewed_but_not_submitted(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    monkeypatch.setattr(service, "_planning_nodes", lambda: [
+        NodeResources("small", 8, 0, 32, 0, 2, 0, "2080ti"),
+    ])
+    request = _request(gpu="2080ti", gpus=1, cpu="16", memory="64Gi")
+    try:
+        result = service.plan_job(request)
+        assert not result["resource_plan"]["scheduling"]["fits_any_node_capacity"]
+        with pytest.raises(MCPServiceError, match="cannot fit any matching node"):
+            service.submit_job(request, "impossible")
+        assert client.created_manifests == []
+    finally:
+        asyncio.run(service.close())
+
+
+def test_busy_gpu_submission_is_allowed_and_planned_from_capacity(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    monkeypatch.setattr(service, "_planning_nodes", lambda: [
+        NodeResources("busy", 64, 63, 256, 255, 4, 4, "2080ti"),
+    ])
+    try:
+        preview = service.plan_job({"gpu": "2080ti", "gpus": 1})
+        info = preview["resource_plan"]["scheduling"]
+        assert info["recommended_allocation"]["basis"] == "node_capacity"
+        result = service.submit_job(_request(gpu="2080ti", gpus=1, cpu="16", memory="63Gi"), "queued")
+        assert result["created"]
+        assert len(client.created_manifests) == 1
+    finally:
+        asyncio.run(service.close())
+
+
 def test_plan_is_deep_copied_and_always_non_retrying(tmp_path: Path) -> None:
     client = FakeClient()
     service = _service(tmp_path, client)
@@ -224,6 +283,26 @@ def test_plan_is_deep_copied_and_always_non_retrying(tmp_path: Path) -> None:
     assert "manifest" not in planned
     assert service.config["job"]["backoff_limit"] == 7
     asyncio.run(service.close())
+
+
+@pytest.mark.parametrize("field", [
+    "backoffLimit", "backoff_limit", "restartPolicy", "restart_policy",
+    "retry", "retries", "retry_policy", "podFailurePolicy", "restartPolicyRules",
+])
+def test_service_rejects_agent_retry_configuration_before_mutation(tmp_path, field):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    try:
+        with pytest.raises(MCPServiceError):
+            service.submit_job(_request(**{field: 5}), "blocked-submit")
+        assert client.created_manifests == []
+        source = _terminal_job(service, client)
+        with pytest.raises(MCPServiceError):
+            service.restart_job(source, overrides={field: 5})
+        assert len(client.created_manifests) == 1
+        assert client.deleted == []
+    finally:
+        asyncio.run(service.close())
 
 
 def test_submit_idempotency_reconciles_and_does_not_resurrect_deleted_job(
@@ -728,7 +807,9 @@ def test_restart_deletes_old_attempts_without_mixing_new_logs(tmp_path: Path) ->
 
     old_logs = service.job_logs(source, failed_only=True)
     new_logs = service.job_logs(restarted)
-    assert old_logs["logs"] == []
+    assert old_logs["archived"]
+    assert [entry["pod"] for entry in old_logs["logs"]] == ["train-old"]
+    assert "old failure" in old_logs["logs"][0]["stdout"]
     assert [entry["pod"] for entry in new_logs["logs"]] == ["train-new"]
     with pytest.raises(MCPServiceError, match="not an attempt"):
         service.job_logs(restarted, pods=["train-old"])
@@ -736,6 +817,202 @@ def test_restart_deletes_old_attempts_without_mixing_new_logs(tmp_path: Path) ->
         service.cancel_job(source)
     with pytest.raises(StaleJobReference):
         service.job_logs({**source, "uid": "unrecorded-uid"})
+    asyncio.run(service.close())
+
+
+def test_name_only_references_follow_latest_run_and_explicit_uid_reads_archive(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    original = _terminal_job(service, client)
+    client.pods.append(_pod(client.jobs["train"], "old", "old-pod", phase="Failed"))
+    client.log_text["old"] = "2026-01-01T00:00:01Z old failure\n"
+    assert service.inspect_job({"name": "train"})["job"] == original
+    replacement = service.restart_job({"name": "train"})["job"]
+    assert replacement["uid"] != original["uid"]
+    assert service.inspect_job({"name": "train"})["job"] == replacement
+    client.pods.append(_pod(client.jobs["train"], "new", "new-pod"))
+    client.log_text["new"] = "2026-01-01T00:00:02Z latest output\n"
+    assert service.job_logs({"name": "train"})["logs"][0]["pod"] == "new"
+    old = service.job_logs({"name": "train", "uid": original["uid"]})
+    assert old["archived"]
+    assert "old failure" in old["logs"][0]["stdout"]
+    with pytest.raises(StaleJobReference):
+        service.cancel_job({"name": "train", "uid": original["uid"]})
+    cancelled = service.cancel_job({"name": "train"})
+    assert cancelled["job"] == replacement
+    assert client.deleted[-1] == ("train", replacement["uid"])
+    asyncio.run(service.close())
+
+
+def test_resolved_name_only_cancellation_rejects_a_racing_replacement(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    service.submit_job(_request(), "source")
+    get = client.get_json
+    calls = []
+
+    def racing_get(resource, name, *, namespace=None):
+        calls.append(namespace)
+        if len(calls) == 2:
+            client.jobs[name]["metadata"]["uid"] = "replacement"
+        return get(resource, name, namespace=namespace)
+
+    monkeypatch.setattr(client, "get_json", racing_get)
+    with pytest.raises(StaleJobReference, match="UID changed"):
+        service.cancel_job({"name": "train"})
+    assert calls == ["research", "research"]
+    assert not client.deleted
+    asyncio.run(service.close())
+
+
+@pytest.mark.asyncio
+async def test_name_only_wait_binds_resolved_uid_and_returns_it(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = service.submit_job(_request(), "source")["job"]
+
+    class Monitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def wait(self, jobs, **kwargs):
+            assert jobs == [source]
+            client.jobs["train"]["metadata"]["uid"] = "replacement"
+            return {"events": [], "cursor": 12, "timed_out": True}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("falcon.mcp_events.Monitor", Monitor)
+    result = await service.wait_for_events([{"name": "train"}], timeout=0)
+    assert result["jobs"] == [source]
+    assert service._job_ref({"name": "train"})["uid"] == "replacement"
+    await service.close()
+
+
+def test_restart_archives_full_logs_summary_and_lineage_across_restarts(tmp_path: Path) -> None:
+    from falcon.restart_history import HISTORY_ANNOTATION
+
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    client.pods.append(_pod(client.jobs[source["name"]], "old", "old-uid", phase="Failed"))
+    raw = "".join(f"2026-01-01T00:00:01Z failure {i}\n" for i in range(300))
+    client.log_text["old"] = raw
+    summary = {"issue": "Host memory exhausted", "fix": "Stream batches instead of caching them"}
+    first = service.restart_job(source, summary=summary)["job"]
+    assert service._restart_history.logs(source["uid"])["logs"][0]["stdout"] == raw
+    assert client.log_calls[0]["tail"] == -1
+    assert service.job_logs(source, tail=2)["summary"] == summary
+    assert service.job_logs(source, tail=2)["logs"][0]["stdout"].splitlines()[-1].endswith("failure 299")
+    assert client.jobs[first["name"]]["metadata"]["annotations"][HISTORY_ANNOTATION] == source["uid"]
+    count = len(client.log_calls)
+    assert service.restart_job(source, summary=summary)["job"] == first
+    assert len(client.log_calls) == count
+    with pytest.raises(IdempotencyConflict):
+        service.restart_job(source, summary={"issue": "different", "fix": "different"})
+
+    client.jobs[first["name"]]["status"] = {"conditions": [{"type": "Failed", "status": "True"}]}
+    client.pods.append(_pod(client.jobs[first["name"]], "second", "second-uid", phase="Failed"))
+    client.log_text["second"] = "2026-01-01T00:00:02Z second failure\n"
+    second = service.restart_job(first)["job"]
+    assert second["uid"] != first["uid"]
+    attempts = service._restart_history.attempts(source["uid"], source["name"])
+    assert [entry["pod"] for entry in attempts] == ["old", "second"]
+    assert [entry["summary"] for entry in attempts] == [summary, None]
+    asyncio.run(service.close())
+    fresh = _service(tmp_path, client)
+    assert fresh.job_logs(source)["summary"] == summary
+    assert "second failure" in fresh.job_logs(first)["logs"][0]["stdout"]
+    asyncio.run(fresh.close())
+
+
+def test_restart_archive_failure_keeps_source_job_and_pods(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    client.pods.append(_pod(client.jobs[source["name"]], "old", "old-uid", phase="Failed"))
+    original = client.pod_logs
+    client.pod_logs = lambda *a, **kw: ProcessResult(("kubectl",), 1, stderr="temporarily unavailable")
+    with pytest.raises(MCPServiceError, match="before deletion"):
+        service.restart_job(source, summary={"issue": "bug", "fix": "patch"})
+    assert client.deleted == []
+    assert client.pods
+    client.pod_logs = original
+    assert service.restart_job(source, summary={"issue": "bug", "fix": "patch"})["created"]
+    asyncio.run(service.close())
+
+
+def test_restart_archive_survives_delete_create_interruption(tmp_path: Path, monkeypatch) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    client.pods.append(_pod(client.jobs[source["name"]], "old", "old-uid", phase="Failed"))
+    client.log_text["old"] = "2026-01-01T00:00:01Z original traceback\n"
+    summary = {"issue": "Crash", "fix": "Fixed input parsing"}
+    create = client.create_job
+
+    def unavailable(manifest):
+        raise KubernetesError("service unavailable")
+
+    monkeypatch.setattr(client, "create_job", unavailable)
+    with pytest.raises(KubernetesError):
+        service.restart_job(source, summary=summary)
+    assert source["name"] not in client.jobs
+    assert not client.pods
+    assert "original traceback" in service.job_logs(source)["logs"][0]["stdout"]
+    monkeypatch.setattr(client, "create_job", create)
+    replacement = service.restart_job(source, summary=summary)["job"]
+    assert replacement["uid"] != source["uid"]
+    assert service.job_logs(source)["summary"] == summary
+    assert len(client.log_calls) == 1
+    asyncio.run(service.close())
+
+
+def test_restart_records_unavailable_evicted_logs_without_blocking_replacement(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    pod = _pod(client.jobs[source["name"]], "evicted", "old-uid", phase="Failed")
+    pod["status"]["reason"] = "Evicted"
+    client.pods.append(pod)
+    client.pod_logs = lambda *a, **kw: ProcessResult(("kubectl",), 1, stderr="container logs no longer available")
+    result = service.restart_job(source)
+    assert result["uid"] != source["uid"]
+    entry = service.job_logs(source)["logs"][0]
+    assert entry["unavailable"]
+    assert "no longer available" in entry["stderr"]
+    asyncio.run(service.close())
+
+
+def test_restart_archives_init_failure_without_fetching_never_started_container(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    pod = _pod(client.jobs[source["name"]], "old", "old-uid", phase="Failed")
+    pod["spec"]["initContainers"] = [{"name": "init"}]
+    pod["status"]["containerStatuses"] = [{"name": "main", "state": {"waiting": {"reason": "PodInitializing"}}}]
+    pod["status"]["initContainerStatuses"] = [{"name": "init", "state": {"terminated": {"exitCode": 1}}}]
+    client.pods.append(pod)
+    client.log_text["old"] = "2026-01-01T00:00:01Z init failure\n"
+    service.restart_job(source)
+    entries = service.job_logs(source, failed_only=True)["logs"]
+    assert [entry["container"] for entry in entries] == ["init", "main"]
+    assert "init failure" in entries[0]["stdout"]
+    assert entries[1]["stdout"] == ""
+    assert "did not start" in entries[1]["stderr"]
+    assert [call["container"] for call in client.log_calls] == ["init"]
+    asyncio.run(service.close())
+
+
+@pytest.mark.parametrize("summary", [{}, {"issue": "failure"}, {"issue": "", "fix": "fixed"}, {"issue": "x" * 1001, "fix": "fixed"}])
+def test_invalid_restart_summary_rejected_before_deletion(tmp_path: Path, summary) -> None:
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = _terminal_job(service, client)
+    with pytest.raises(MCPServiceError, match="summary"):
+        service.restart_job(source, summary=summary)
+    assert not client.deleted
     asyncio.run(service.close())
 
 

@@ -592,7 +592,7 @@ async def test_normal_wait_timeout_does_not_restart_watches_or_report_gap(store:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_last_waiter_records_watch_gap_internally(
+async def test_cancelled_last_waiter_keeps_watch_without_gap(
     store: EventStore,
 ) -> None:
     watcher = FakeWatcher()
@@ -617,13 +617,8 @@ async def test_cancelled_last_waiter_records_watch_gap_internally(
     assert second["events"] == []
     assert second["timed_out"] is True
     diagnostics = store.read(["job-uid"], event_types=["monitor_unavailable"])
-    assert diagnostics[0]["details"] == {
-        "cursor": 0,
-        "gap": True,
-        "last_observed_cursor": 0,
-        "reason": "watch_restarted",
-        "source": "monitor",
-    }
+    assert diagnostics == []
+    assert len(watcher.calls) == 3
     await monitor.close()
 
 

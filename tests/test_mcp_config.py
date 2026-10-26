@@ -1,13 +1,17 @@
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
 from falcon.mcp_config import (
+    CLAUDE_MIN_BACKGROUND_VERSION,
+    CLAUDE_UPGRADE_COMMAND,
     CLIENT_TOOL_TIMEOUT_MILLISECONDS,
     CLIENT_TOOL_TIMEOUT_SECONDS,
+    claude_code_mcp_warning,
     client_config,
     client_config_path,
     config_command,
@@ -19,6 +23,53 @@ from falcon.mcp_config import (
 
 
 class MCPConfigTests(unittest.TestCase):
+    @staticmethod
+    def _claude_runner(output: str, returncode: int = 0):
+        def runner(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args[0], returncode, stdout=output, stderr=""
+            )
+
+        return runner
+
+    def test_claude_version_warning_requires_backgrounding_support(self) -> None:
+        warning = claude_code_mcp_warning(
+            environ={"PATH": "/bin"},
+            which=lambda name, path=None: "/bin/claude",
+            runner=self._claude_runner("2.1.211 (Claude Code)"),
+        )
+
+        self.assertIsNotNone(warning)
+        self.assertIn(str(CLAUDE_MIN_BACKGROUND_VERSION), warning)
+        self.assertIn(CLAUDE_UPGRADE_COMMAND, warning)
+
+    def test_current_claude_version_has_no_mcp_warning(self) -> None:
+        warning = claude_code_mcp_warning(
+            environ={"PATH": "/bin"},
+            which=lambda name, path=None: "/bin/claude",
+            runner=self._claude_runner("2.1.310 (Claude Code)"),
+        )
+
+        self.assertIsNone(warning)
+
+    def test_claude_version_warning_covers_missing_or_unreadable_client(self) -> None:
+        missing = claude_code_mcp_warning(
+            environ={"PATH": ""},
+            which=lambda name, path=None: None,
+        )
+        unreadable = claude_code_mcp_warning(
+            environ={"PATH": "/bin"},
+            which=lambda name, path=None: "/bin/claude",
+            runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(args[0], 3)
+            ),
+        )
+
+        self.assertIn("not found", missing)
+        self.assertIn(CLAUDE_UPGRADE_COMMAND, missing)
+        self.assertIn("could not verify", unreadable)
+        self.assertIn(CLAUDE_UPGRADE_COMMAND, unreadable)
+
     def test_codex_configuration_and_toml(self) -> None:
         expected = {
             "mcp_servers": {

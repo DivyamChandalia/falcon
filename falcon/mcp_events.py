@@ -1129,9 +1129,20 @@ class Monitor:
                     _condition_details(job, terminal),
                 )
 
+    def _background_running(self) -> bool:
+        return (
+            self._started
+            and len(self._watch_tasks) == 3
+            and all(not task.done() for task in self._watch_tasks)
+            and (self.metrics_provider is None
+                 or self._metrics_task is not None and not self._metrics_task.done())
+        )
+
     async def _start_background(self) -> None:
-        if self._started or self._closed or not self._has_observation_targets():
+        if self._closed or not self._has_observation_targets() or self._background_running():
             return
+        if self._started:
+            await self._stop_background()
         self._started = True
         for resource in ("jobs.batch", "pods", "events"):
             task = asyncio.create_task(
@@ -1191,6 +1202,11 @@ class Monitor:
                 # earlier monitor process or an explicitly stopped monitor.
                 self._restart_gap_pending = False
             try:
+                # Streams can naturally exit after a retained Job is deleted,
+                # without an active waiter to clear _started. Reconcile a new
+                # snapshot before replacing any stopped/partially stopped set.
+                if self._started and not self._background_running():
+                    await self._stop_background()
                 # The first waiter (or a waiter adding a new Job) needs a
                 # snapshot to establish ownership and resource versions.  A
                 # second wait for the same active monitor already has the
@@ -1584,12 +1600,15 @@ class Monitor:
             else:
                 await self._handle_kubernetes_event(action, obj)
 
-        await watch_resource(
-            resource, versions=self._resource_versions,
-            load=self._load_for_watch, stream=self._watch_json, handle=handle,
-            unavailable=self._mark_unavailable, recovered=self._mark_recovered,
-            active=lambda: not self._closed and self._has_observation_targets(),
-        )
+        # A replacement may be registered while an idle stream is closing.
+        # Recheck after cleanup so that task cannot exit under the new waiter.
+        while not self._closed and self._has_observation_targets():
+            await watch_resource(
+                resource, versions=self._resource_versions,
+                load=self._load_for_watch, stream=self._watch_json, handle=handle,
+                unavailable=self._mark_unavailable, recovered=self._mark_recovered,
+                active=lambda: not self._closed and self._has_observation_targets(),
+            )
 
     async def _metrics_loop(self) -> None:
         while not self._closed and self._has_observation_targets():
@@ -1874,6 +1893,7 @@ class Monitor:
         presence = None
         heartbeat = None
         normal_return = False
+        interrupted = False
         try:
             waiter, keys, restart_gap = await self._register(
                 normalized_jobs,
@@ -1984,6 +2004,9 @@ class Monitor:
                             "cursor": max(start_cursor, self.store.latest_cursor()),
                             "timed_out": True,
                         }
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -1995,7 +2018,10 @@ class Monitor:
                 with anyio.CancelScope(shield=True):
                     await self._unregister(
                         waiter,
-                        retain=normal_return and not self._closed,
+                        # User messages can cancel just the MCP request. Keep
+                        # observing during the reply so the next cursor-based
+                        # call can replay events; server close still stops all.
+                        retain=(normal_return or interrupted) and not self._closed,
                     )
 
     async def close(self) -> None:

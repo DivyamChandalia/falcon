@@ -159,6 +159,14 @@ Falcon binary.
 
 ### Tools and lifecycle rules
 
+MCP Job references accept `{"name": "train"}` for the latest run, or
+`{"name": "train", "uid": "…"}` for a specific run or its archived logs.
+Namespace is always taken from Falcon's configuration and is absent from both
+tool arguments and responses. Each name-only call resolves the current Job UID;
+an active wait stays bound to those resolved runs. Wait responses include `jobs`
+with the resolved UIDs, and expiry continuations preserve those UIDs. Use a
+returned reference when resuming a wait or retrying an ambiguous restart.
+
 Dashboard animates nonterminal agent-managed Jobs (including Pending and
 eviction-risk Jobs) only while `wait_for_events` is actively connected for that
 Job. Only the symbol changes: existing Pending and eviction-risk colours stay
@@ -181,13 +189,13 @@ The server exposes exactly these nine tools:
 | `inspect_job` | Inspect one Job and its attempts. |
 | `job_logs` | Read Job logs, including `failed_only` pod attempts. |
 | `job_metrics` | Read Job utilization metrics. |
-| `wait_for_events` | Wait up to 7 days for Job events; configure GPU startup grace and reuse its cursor. |
+| `wait_for_events` | Explicitly follow Job events; configure GPU startup grace and reuse its cursor. |
 | `cancel_job` | Cancel an explicitly identified ordinary Job. |
-| `restart_job` | Explicitly relaunch a terminal Job; requires an `idempotency_key`. |
+| `restart_job` | Relaunch a terminal Job, archive its logs, and optionally record an issue/fix summary. |
 
-Use the same idempotency key when retrying an ambiguous `submit_job` or
-`restart_job` response; never create a new key just because the client timed
-out. `wait_for_events` returns a cursor: pass that cursor to the next wait so
+Use the same idempotency key when retrying an ambiguous `submit_job` response.
+Repeat a restart's source reference, overrides and summary to resume it;
+Falcon tracks its identity internally. `wait_for_events` returns a cursor: pass that cursor to the next wait so
 events are not replayed or skipped. For GPU Jobs, omit `startup_time_seconds`
 for Falcon's 120-second minimum grace period, or pass a larger value such as
 `300` on the first wait to cover model loading or compilation. The setting is
@@ -206,21 +214,67 @@ Unrecognized warnings are always reported, and the policy is independent for
 each waiter. Resource-shortage messages alone do not guarantee eventual fit;
 use `plan_job` to check sizing before submission.
 
-Every public `wait_for_events` call uses a fixed seven-day wait; there is no
-agent-selectable `timeout` parameter. Immediately report submitted Jobs and
-explain that Falcon is awaiting events, without claiming queued Jobs are already
-running. Await one synchronous MCP call: do not background it, detach it, or
-end the agent turn while it is pending. Keep the client session open. Falcon
-waits server-side; the agent must not repeatedly poll Jobs, check a background
-task, or do busywork while waiting. Re-arm only after handling a returned event
-or seven-day expiry. No wake daemon or host-specific adapter is required.
-The server's internal async I/O keeps monitoring and other MCP requests
-responsive; it does not make this a detached agent task.
+`submit_job` only submits and returns a Job reference: it does not start an
+event wait or monitoring watcher. Report the submitted reference without
+claiming monitoring is connected. The agent then follows the Job through a
+separate explicit `wait_for_events` call unless the user asks not to watch.
+There is no agent-selectable MCP `timeout` parameter; its duration stays internal.
+Falcon waits server-side without Job polling. The
+packaged skill uses different host workflows:
+
+- **Codex:** start one async `wait_for_events` in `functions.exec`, beginning
+  with `cursor=0` for newly followed Jobs. Retain the yielded cell ID and every
+  returned event cursor. Make `functions.wait(cell_id=..., yield_time_ms=604800000)`
+  the last action of every watching turn unless the user explicitly asks to stop.
+  This requests a seven-day host wait, not a new MCP call. Respect host caps if
+  that duration is rejected; do not use tight short-wait loops. After a user
+  message, respond and reattach to the same surviving cell. Only if the actual
+  MCP call/cell was killed or lost should the agent start one replacement async
+  wait, preserving references, last cursor (0 until the first result), event
+  filter, startup grace and scheduling policy, and save the replacement cell ID.
+  A yielded or completed cell is not a killed call: retrieve its result instead
+  of duplicating a pending wait. Never resubmit a Job to resume monitoring. Report updates before
+  waiting, not as a final response that ends observation. Stopping observation
+  means no more re-arming; it does not mean cancelling the Job.
+- **Claude Code 2.1.212+:** call `wait_for_events` directly in the main
+  conversation and let Claude Code background the long MCP call. Do not create
+  a subagent or poll. Keep Claude Code and the Falcon MCP server open; process
+  the completion notification and re-arm only after the wait ends, expires, or
+  is disconnected. Older Claude Code versions wait synchronously, so `falcon
+  setup` warns and asks you to upgrade.
+- **OpenCode:** use one background report-only subagent with the host's
+  configured subagent model.
+
+Watcher prompts must include exact Job references, cursor, event filter,
+startup grace, and scheduling policy. An OpenCode watcher may only wait,
+silently follow returned continuations, and report bounded actionable events
+with cursor/settings. It must not inspect, edit, restart, or cancel Jobs. Its
+parent can end the foreground turn, handle the completion report under the
+user's existing permissions, then re-arm. No custom subagent definitions are
+installed; use a host subagent that has access to the Falcon MCP tools.
+
+Keep the client/MCP server open. Cancelling an event-wait request clears its
+Dashboard connected-wait indicator but retains the established watcher. Thus
+an event arriving while the agent answers the user is recorded even when no
+wait call is pending. Recalling the tool with the last cursor replays retained
+events, including transient warnings and eviction-risk events. The initial
+`cursor=0` also covers interruption before the first result has returned a cursor.
+The bounded event store is not unlimited archival storage. Server shutdown or a
+Kubernetes watch outage can still leave observation gaps; events that appear and
+clear entirely offline cannot be guaranteed. Reconnection reconciles current
+terminal Job state. Server shutdown stops every retained watch and metrics task.
+Re-arm only after handling an event, receiving a continuation, or actual call
+cancellation; never start duplicate waits while the original is pending.
+
+There is no wake bridge, queued prompt, or automatic restart of an idle model
+turn on this branch. Reattachment keeps an active conversation waiting; it
+does not guarantee delivery after the user closes the CLI, ends the turn, or
+disconnects. Internal async I/O keeps monitoring and other MCP tools responsive.
 `timed_out: true` with no events
-means the seven-day duration elapsed; it is not a workload failure. To follow
+means the internal wait ended; it is not a workload failure. To follow
 longer runs, call the tool named in `continuation.tool` with
 `continuation.arguments`: these preserve the exact Jobs, returned cursor, event
-filter, scheduling policy, and startup grace for another seven-day wait. No new
+filter, scheduling policy, and startup grace for another wait. No new
 Job is submitted. Deleted Jobs disconnect without offering continuation.
 A `watch_restarted`
 health diagnostic indicates an observation interruption or new monitor process;
@@ -233,18 +287,82 @@ requests require `cpu` and `memory`. Environment selection, images, working
 directories, mounts, and resource sizing follow the normal Falcon workflow.
 Planning returns requested scheduler resources, not measured utilization.
 
-For a monitored workflow, submit once and immediately start `wait_for_events`
-with the returned Job reference; this is one logical launch/monitor step even
-though submission and the long-lived wait are separate MCP calls. When a Job fails,
+Size CPU and host memory from the task rather than reserving spare capacity.
+For a GPU Job, first call `plan_job` with GPU model/count only (a command is
+optional for planning but required for submission), omit
+`cpu`/`memory`, and leave `maximize` off. The returned CPU/memory values are the
+recommended baseline for the selected sizing node's GPU share, not a fixed
+per-GPU table or a node pin. Normal auto-sizing caps the proportional CPU/RAM
+share by current free resources when free GPUs exist and leaves a 1Gi memory
+buffer. Request less if the task needs less. Exceed the baseline only when
+absolutely necessary and explain measured CPU pressure, a confirmed host-RAM
+OOM, or a concrete peak working-set calculation; GPU VRAM OOM alone does not
+justify more host RAM. CPU-only Jobs need explicit values: 1 CPU and 1Gi is a
+starting point for trivial checks, not a recommendation for all workloads.
+
+GPU previews expose `resource_plan.scheduling`:
+
+- `gpu_limits.max_per_node` is the largest single-node GPU request; GPUs cannot
+  be combined across nodes. `max_free_per_node` reports current free headroom
+  or null when availability is unknown. Re-plan when changing GPU count.
+- `gpu_available_nodes` and `schedulable_nodes` distinguish free GPUs from a
+  jointly feasible GPU/CPU/RAM request. Each node lists free resources, total
+  allocatable capacity, exact current/capacity shortfalls, and a recommendation.
+- `maximum_allocation` gives CPU and RAM maxima with their source node names.
+  These independent maxima may be on different nodes: use one node's CPU/RAM
+  pair, never combine values from different nodes into an imaginary allocation.
+- Only when no matching GPU is currently available, maxima and recommendations
+  use node capacity rather than current free CPU/RAM. The recommendation is the
+  node-capacity share for the requested GPU count, with the normal memory buffer.
+- `alternatives` are bounded, jointly fitting same-node CPU/RAM proposals with
+  the same requested GPU model/count. They are suggestions, not silent changes.
+  Use a smaller proposal only if sufficient for the task and re-plan it before
+  submitting. An explicit shared-memory allocation must still fit the proposal.
+- If resources are required and no task-suitable alternative exists, submit
+  unchanged and follow with `scheduling_policy="wait_for_capacity"`. If
+  `fits_any_node_capacity` is false, waiting cannot help: choose a different
+  GPU/node type or reduce the task's actual requirements. New MCP submissions
+  that exceed all matching nodes' CPU/RAM capacity are rejected before creation.
+
+These checks use a scheduler-request inventory snapshot, not a reservation or
+a full scheduler simulation (taints, affinity and cluster admission still apply).
+CPU-only planning retains its existing behavior and does not query node inventory.
+
+For a monitored workflow, submit once, report the Job reference, and explicitly
+call `wait_for_events` when following is wanted. Submission never starts that
+call automatically. When a Job fails,
 inspect the reported failure and make an explicit disposition: prefer
 `restart_job` for a repairable terminal Job, or use `cancel_job` when it should
 not continue. Restarting replaces the terminal Job under the **same name**,
 with a new UID and new Pod names. Monitor the returned Job reference, including
 its new UID. Restart retries are identified internally by the source Job UID;
 the model supplies only the Job reference and optional overrides, not an
-idempotency key. Repeat the same arguments to resume an interrupted restart.
-The old Job and its Pods are deleted, including their Kubernetes logs. Read
-failure logs before restarting if needed; Falcon does not archive them.
+idempotency key. Repeat the same arguments, including the summary, to resume an interrupted restart.
+Pass `summary={"issue": "Short failure description", "fix": "What you changed"}`
+when restarting after a fix. Both fields are optional as a pair, limited to
+1,000 characters each. Falcon captures available logs from every old Pod's
+regular and init containers before deleting the old Job/Pods. A capture failure
+for a started Pod stops the restart before deletion; retry the same arguments.
+Evicted Pods may have already lost their output: those capture errors are saved
+in the archive and do not prevent replacement.
+Already rotated or garbage-collected Kubernetes logs cannot be recovered.
+Archives are compressed in private local state under
+`$XDG_STATE_HOME/falcon/mcp/<context-and-namespace>/restart-history.sqlite3`
+(default `~/.local/state`). They survive MCP process and dashboard restarts;
+custom `mcp serve --state-dir` archives live in that directory instead.
+They are local to that state directory, not copied to other computers.
+Use `job_logs` with the old Job UID to read its archived output; normal response
+limits and cursors still apply. In Dashboard's Selected Job inspector, left/right
+navigates archived Pods, current Pods, and terminals. An optional issue/fix box
+appears immediately below the matching archived Pod's logs, grows to four content
+lines, and scrolls when longer. Drag-select text and use Ctrl/Cmd+C to copy it.
+Logs and Issue/Fix have independent selection highlights; click either or use
+Tab/Shift+Tab to select it. Left/right switches attempts from either section.
+It is hidden when no summary was supplied.
+The dashboard retains its usual 200-line output viewport; the full available
+captured log remains in the archive. Each successive restart retains the lineage
+and the summary for its own failed attempt. Summaries describe agent-reported
+changes, not independently verified repairs.
 No orphan Pods or retention Jobs are created. A private, temporary manifest
 checkpoint allows the same source reference and arguments to recover an interrupted
 delete/create sequence; it is removed once the replacement UID is recorded.
@@ -298,7 +416,6 @@ workspace lifecycle for those names.
 Only MCP-created or MCP-relaunched Jobs receive `backoffLimit=0` and
 `restartPolicy=Never`; the normal Falcon CLI is unchanged. Falcon does not
 perform automatic recovery or retry. A cancelled `wait_for_events` request
-cancels the wait, not the Kubernetes Job, and an idle agent is not guaranteed
-to wake up when a Job changes state. Keep the synchronous wait pending in a
-live client session, or ask the agent to
-inspect the Job again when you need a later update.
+cancels the wait, not the Kubernetes Job. Keep it pending using the host workflow
+above. An idle/disconnected agent is not automatically resumed; reconnect and
+resume observation using the original Job references and last cursor/settings.

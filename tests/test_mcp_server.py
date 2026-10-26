@@ -19,7 +19,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from falcon.config import DEFAULT_CONFIG
 from falcon.mcp_server import create_server
 
-REF = {"name": "train", "namespace": "default", "uid": "uid-1"}
+REF = {"name": "train", "uid": "uid-1"}
 
 
 class FakeService:
@@ -35,24 +35,26 @@ class FakeService:
 
     def submit_job(self, request, idempotency_key):
         self.calls.append(("submit", request, idempotency_key))
-        return {"job": REF}
+        return {"job": {**REF, "namespace": "default"}, "namespace": "default"}
 
     def list_jobs(self, **kwargs):
-        return {"jobs": [REF]}
+        return {"jobs": [{**REF, "namespace": "default"}]}
 
     def cancel_job(self, job):
         self.calls.append(("cancel", job))
         return {"job": job, "cancelled": True}
 
-    def restart_job(self, job, overrides=None):
+    def restart_job(self, job, overrides=None, summary=None):
         self.calls.append(("restart", job, overrides))
+        if summary is not None:
+            self.calls.append(("summary", summary))
         return {"job": {**job, "uid": "replacement-uid"}}
 
     async def wait_for_events(self, jobs, **kwargs):
         self.calls.append(("wait", jobs, kwargs))
         self.waiting.set()
         await self.release.wait()
-        return {"events": [{"type": "failed", "job": jobs[0]}], "cursor": 1}
+        return {"events": [{"type": "failed", "job": {**jobs[0], "namespace": "default"}}], "cursor": 1}
 
     async def close(self):
         self.closed = True
@@ -74,11 +76,20 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
             assert tools["cancel_job"].annotations.destructiveHint
             assert tools["restart_job"].annotations.destructiveHint
             assert "idempotency_key" not in tools["restart_job"].inputSchema["properties"]
+            reference = tools["inspect_job"].inputSchema["$defs"]["JobReference"]
+            assert "namespace" not in reference["properties"]
+            assert reference["required"] == ["name"]
             assert tools["submit_job"].annotations.idempotentHint
             schema = tools["submit_job"].inputSchema
             assert "idempotency_key" in schema["required"]
+            planning_schema = tools["plan_job"].inputSchema
+            planning_ref = planning_schema["properties"]["request"]["$ref"].rsplit("/", 1)[-1]
+            assert "command" not in planning_schema["$defs"][planning_ref].get("required", [])
             policy = tools["wait_for_events"].inputSchema["properties"]["scheduling_policy"]
             assert "timeout" not in tools["wait_for_events"].inputSchema["properties"]
+            assert "seven" not in tools["wait_for_events"].description.lower()
+            assert "7d" not in tools["wait_for_events"].description.lower()
+            assert "functions.wait" in tools["wait_for_events"].description
             assert policy["default"] == "report_blocked"
             assert policy["enum"] == ["report_blocked", "wait_for_capacity"]
             event_filter = tools["wait_for_events"].inputSchema["properties"]["event_types"]
@@ -87,6 +98,22 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
                 "succeeded", "failed", "pod_failed", "evicted", "eviction_risk", "warning",
             }
             service.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_protocol_resource_only_preview_does_not_relax_submission_command():
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        planned = await session.call_tool("plan_job", {"request": {"gpu": "2080ti", "gpus": 1}})
+        assert not planned.isError
+        assert service.calls[0][0] == "plan"
+        assert "command" not in service.calls[0][1]
+        submitted = await session.call_tool("submit_job", {
+            "request": {"gpu": "2080ti", "gpus": 1}, "idempotency_key": "needs-command",
+        })
+        assert submitted.isError
+        assert len(service.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -100,14 +127,80 @@ async def test_protocol_submission_and_schema_validation():
         })
         assert not result.isError
         assert result.structuredContent["job"] == REF
+        assert "namespace" not in result.structuredContent
         invalid = await session.call_tool("submit_job", {
             "request": {"command": ["true"], "backoffLimit": 6}, "idempotency_key": "bad",
         })
         assert invalid.isError
-        wrong_namespace = await session.call_tool("cancel_job", {"job": {"name": "train"}})
+        wrong_namespace = await session.call_tool("cancel_job", {"job": {"name": "train", "namespace": "default"}})
         assert wrong_namespace.isError
         assert len(service.calls) == 1
+        assert not service.waiting.is_set(), "submission must not start an event wait"
     assert service.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["inspect_job", "job_logs", "job_metrics", "cancel_job", "restart_job"])
+async def test_protocol_accepts_name_only_and_hides_namespace_recursively(method):
+    service = FakeService(DEFAULT_CONFIG)
+    seen = []
+
+    def operation(job, **kwargs):
+        seen.append(job)
+        return {"namespace": "default", "job": {**REF, "namespace": "default"},
+                "nested": [{"namespace": "default", "previous_job": {**REF, "namespace": "default"}}],
+                "stdout": '{"namespace": "workload output"}'}
+
+    setattr(service, method, operation)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool(method, {"job": {"name": "train"}})
+        assert not result.isError
+        assert seen == [{"name": "train"}]
+        assert result.structuredContent == {
+            "job": REF, "nested": [{"previous_job": REF}],
+            "stdout": '{"namespace": "workload output"}',
+        }
+        invalid = await session.call_tool(method, {"job": {"name": "train", "namespace": "default"}})
+        assert invalid.isError
+        assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_name_only_wait_continuation_uses_resolved_uid_without_namespace():
+    service = FakeService(DEFAULT_CONFIG)
+
+    async def wait(jobs, **kwargs):
+        return {"events": [], "jobs": [{**REF, "namespace": "default"}],
+                "cursor": 12, "timed_out": True}
+
+    service.wait_for_events = wait
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("wait_for_events", {"jobs": [{"name": "train"}]})
+        assert not result.isError
+        assert result.structuredContent["jobs"] == [REF]
+        assert result.structuredContent["continuation"]["arguments"]["jobs"] == [REF]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", [
+    "backoffLimit", "backoff_limit", "restartPolicy", "restart_policy",
+    "retry", "retries", "retry_policy", "podFailurePolicy", "restartPolicyRules",
+])
+async def test_agent_cannot_supply_retry_settings_to_submit_or_restart(field):
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        submitted = await session.call_tool("submit_job", {
+            "request": {"command": ["true"], field: 5}, "idempotency_key": "blocked-retry",
+        })
+        restarted = await session.call_tool("restart_job", {
+            "job": REF, "overrides": {field: 5},
+        })
+        assert submitted.isError
+        assert restarted.isError
+        assert service.calls == [], "retry settings must be rejected before any mutation"
 
 
 @pytest.mark.asyncio
@@ -138,6 +231,72 @@ async def test_protocol_restart_manages_identity_without_agent_supplied_key():
         assert not result.isError
         assert result.structuredContent["job"] == {**REF, "uid": "replacement-uid"}
         assert service.calls == [("restart", REF, {"command": ["true"]})]
+
+
+@pytest.mark.asyncio
+async def test_protocol_restart_summary_is_optional_bounded_and_passed_to_service():
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    summary = {"issue": "Missing module", "fix": "Installed the dependency"}
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("restart_job", {"job": REF, "summary": summary})
+        assert not result.isError
+        assert ("summary", summary) in service.calls
+        count = len(service.calls)
+        for bad in [{"issue": "x"}, {"issue": "x", "fix": "x" * 1001}, {"issue": "x", "fix": "y", "extra": "z"}]:
+            invalid = await session.call_tool("restart_job", {"job": REF, "summary": bad})
+            assert invalid.isError
+        assert len(service.calls) == count
+
+
+@pytest.mark.asyncio
+async def test_host_can_detach_and_reattach_to_the_same_pending_mcp_wait():
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        pending = asyncio.create_task(session.call_tool("wait_for_events", {
+            "jobs": [REF], "cursor": 0, "startup_time_seconds": 600,
+            "scheduling_policy": "wait_for_capacity",
+        }))
+        await asyncio.wait_for(service.waiting.wait(), 2)
+        # A yielding/reattaching host must retain the request task, rather
+        # than cancelling the MCP call or making another wait_for_events call.
+        for _ in range(2):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(pending), 0.01)
+            assert not pending.done()
+            question = await session.call_tool("plan_job", {"request": {"command": ["true"], "cpu": "1"}})
+            assert not question.isError
+        assert len([call for call in service.calls if call[0] == "wait"]) == 1
+        service.release.set()
+        result = await asyncio.wait_for(pending, 2)
+        assert result.structuredContent["events"][0]["job"] == REF
+        assert result.structuredContent["cursor"] == 1
+        wait = next(call for call in service.calls if call[0] == "wait")
+        assert wait[2]["startup_time_seconds"] == 600
+        assert wait[2]["scheduling_policy"] == "wait_for_capacity"
+
+
+@pytest.mark.asyncio
+async def test_event_result_survives_while_parent_handles_another_request():
+    service = FakeService(DEFAULT_CONFIG)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        pending = asyncio.create_task(session.call_tool("wait_for_events", {"jobs": [REF]}))
+        finished = asyncio.Event()
+        pending.add_done_callback(lambda _: finished.set())
+        await asyncio.wait_for(service.waiting.wait(), 2)
+        service.release.set()
+        # The event arrives before the parent retrieves the result. Finishing
+        # another request must not cancel, consume, or require a second wait.
+        await asyncio.wait_for(finished.wait(), 2)
+        question = await session.call_tool("plan_job", {"request": {"command": ["true"], "cpu": "1"}})
+        assert not question.isError
+        assert pending.done()
+        result = await pending
+        assert result.structuredContent["events"][0]["job"] == REF
+        assert result.structuredContent["cursor"] == 1
+        assert len([call for call in service.calls if call[0] == "wait"]) == 1
 
 
 @pytest.mark.asyncio

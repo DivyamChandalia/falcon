@@ -2085,6 +2085,41 @@ def _setup_kubectl_for_coder(*, non_interactive: bool) -> None:
     )
 
 
+def _confirm_claude_mcp_compatibility(
+    agents: Optional[list[str]],
+    *,
+    all_agents: bool,
+    non_interactive: bool,
+) -> bool:
+    """Warn before configuring Claude Code without direct background waits."""
+
+    from .mcp_config import claude_code_mcp_warning
+
+    selected = all_agents or (
+        agents is not None
+        and any(str(agent).strip().lower() == "claude" for agent in agents)
+    )
+    if not selected:
+        return True
+    warning = claude_code_mcp_warning()
+    if warning is None:
+        return True
+
+    print(f"Warning: {warning}", file=sys.stderr)
+    if non_interactive:
+        return True
+    answer = input(
+        "Continue configuring Falcon MCP without upgrading Claude Code? [y/N]: "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        return True
+    print(
+        "MCP configuration skipped. Upgrade Claude Code and rerun falcon setup.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _setup_mcp_clients(args: argparse.Namespace, config_path: Optional[str]) -> int:
     """Offer or perform the one-time MCP client configuration from setup."""
 
@@ -2137,6 +2172,12 @@ def _setup_mcp_clients(args: argparse.Namespace, config_path: Optional[str]) -> 
     # the explicit ``all`` path uses all supported clients.
     if requested is None:
         all_agents = False
+    if not _confirm_claude_mcp_compatibility(
+        agents,
+        all_agents=all_agents,
+        non_interactive=args.non_interactive,
+    ):
+        return 0
     try:
         results = setup_configs(
             agents,
@@ -2266,7 +2307,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _maybe_auto_update(args.command_name, args)
         if args.command_name == "mcp":
             if args.mcp_command == "config":
-                from .mcp_config import render_config
+                from .mcp_config import claude_code_mcp_warning, render_config
+
+                if args.agent == "claude":
+                    warning = claude_code_mcp_warning()
+                    if warning is not None:
+                        print(f"Warning: {warning}", file=sys.stderr)
 
                 print(render_config(args.agent, config_path=config_arg))
                 return 0

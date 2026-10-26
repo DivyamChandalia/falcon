@@ -1102,6 +1102,38 @@ class SelectedJobScroll(RichLog):
         self._notify_scroll_position()
 
 
+class RestartSummaryScroll(SelectedJobScroll):
+    """Scrollable, selectable issue/fix excerpt below its archived logs."""
+
+    def set_summary(self, summary: str) -> None:
+        self.display = bool(summary)
+        self.replace_content(summary, tuple(summary.splitlines()), follow=False)
+        self._fit_summary()
+
+    def _fit_summary(self) -> None:
+        width = max(1, self.size.width - 5)
+        lines = sum(max(1, len(Text(line).wrap(self.app.console, width))) for line in self._source_lines)
+        self.styles.height = min(4, max(1, lines)) + 2
+
+    def on_resize(self, event: events.Resize) -> None:
+        super().on_resize(event)
+        self._fit_summary()
+
+    def on_key(self, event: events.Key) -> None:
+        movement = {"up": -1, "down": 1, "pageup": -3, "pagedown": 3}
+        if event.key in movement:
+            self.scroll_relative(y=movement[event.key], animate=False)
+            event.stop()
+            event.prevent_default()
+        elif event.key in {"home", "end"}:
+            if event.key == "home":
+                self.scroll_home(animate=False)
+            else:
+                self.scroll_end(animate=False)
+            event.stop()
+            event.prevent_default()
+
+
 class SelectedCommandRow(Horizontal):
     """A non-selectable command label with a value-column copy button."""
 
@@ -1151,9 +1183,11 @@ class SelectedJobInspector(Container):
             yield Input(placeholder="Find output · Enter next · Shift+Enter previous · Esc close", id="output-search-input")
             yield Static("0 matches", id="output-search-count")
         yield SelectedJobScroll(id="selected-logs-scroll")
+        yield RestartSummaryScroll(id="selected-restart-summary")
         yield DashboardTerminal(id="selected-terminal")
 
     def clear(self, message: str = "No Job selected") -> None:
+        self.query_one("#selected-restart-summary", RestartSummaryScroll).set_summary("")
         self.query_one("#selected-details-left", Static).update(
             Text(message, style=MUTED)
         )
@@ -1173,8 +1207,12 @@ class SelectedJobInspector(Container):
         *,
         logs_collapsed: bool,
         attempt_label: str,
+        restart_summary: str = "",
     ) -> None:
         left_details, right_details = detail_columns
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        summary.border_title = " ISSUE / FIX "
+        summary.set_summary(restart_summary)
         self.query_one("#selected-details-left", Static).update(left_details)
         self.query_one("#selected-details-right", Static).update(right_details)
         self.update_logs(
@@ -1637,6 +1675,8 @@ SelectedJobScroll:focus {{ border: solid {CYAN}; }}
 SelectedJobScroll.selected {{ border: solid {CYAN}; }}
 #selected-logs-scroll {{ width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
 #selected-logs-scroll.collapsed {{ height: 4; min-height: 4; max-height: 4; }}
+#selected-restart-summary {{ display: none; width: 1fr; height: 4; min-height: 3; max-height: 6; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
+#selected-logs-scroll:focus, #selected-logs-scroll.selected, #selected-restart-summary:focus, #selected-restart-summary.selected {{ border: solid {CYAN}; }}
 #selected-terminal {{ display: none; width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; overflow-x: hidden; overflow-y: auto; scrollbar-size-vertical: 1; background: {BACKGROUND}; color: {WHITE}; }}
 #selected-terminal:focus {{ border: solid {CYAN}; }}
 #selected-terminal-screen {{ width: 1fr; height: auto; }}
@@ -2311,6 +2351,7 @@ class FalconDashboard(App):
                 "resources": "RESOURCE USAGE", "events": "EVENTS",
             }[pane]
             widget.border_title = f" {base}{' · focused' if focused else ''} "
+        self._set_selected_subtitle()
 
     def _render_header(self) -> None:
         target = self.query_one("#falcon-header", Static)
@@ -2552,10 +2593,21 @@ class FalconDashboard(App):
 
     def _selected_attempts(self, row: JobUsage) -> List[PodAttempt]:
         attempts = list(row.attempt_details)
+        archived = []
+        if self.log_manager is not None:
+            reader = getattr(self.log_manager, "archived_attempts", None)
+            for entry in reader(row) if callable(reader) else []:
+                summary = entry.get("summary")
+                archived.append(PodAttempt(
+                    name=entry["pod"], uid=entry["pod_uid"], phase=entry["phase"],
+                    created_at=entry.get("created_at", ""), container=entry["container"],
+                    archived_job_uid=entry["source_uid"],
+                    restart_summary=f"Issue: {summary['issue']}\nFix: {summary['fix']}" if summary else "",
+                ))
         if attempts:
-            return attempts
+            return archived + attempts
         if row.active_pod:
-            return [
+            return archived + [
                 PodAttempt(
                     name=row.active_pod,
                     uid=row.active_pod_uid or row.active_pod,
@@ -2566,7 +2618,7 @@ class FalconDashboard(App):
                     ),
                 )
             ]
-        return []
+        return archived
 
     def _selected_attempt(self, row: JobUsage) -> Optional[PodAttempt]:
         attempts = self._selected_attempts(row)
@@ -2677,6 +2729,8 @@ class FalconDashboard(App):
         self.state.focused_pane = "selected"
         if section_id in {"selected-logs-scroll", "selected-terminal"}:
             self.state.selected_section = "logs"
+        elif section_id == "selected-restart-summary":
+            self.state.selected_section = "summary"
         self._set_titles()
         self._set_selected_subtitle()
         self._render_footer()
@@ -2699,7 +2753,7 @@ class FalconDashboard(App):
             return "No Pod attempt"
         index = attempts.index(attempt) if attempt in attempts else -1
         return (
-            f"Pod {index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+            f"{'Archived ' if attempt.archived_job_uid else ''}Pod {index + 1}/{len(attempts)} · {attempt.name}{' / ' + attempt.container if attempt.archived_job_uid else ''} · {attempt.phase}"
             if index >= 0
             else f"Pod · {attempt.name} · {attempt.phase}"
         )
@@ -2724,27 +2778,32 @@ class FalconDashboard(App):
         # Keep the selected section visibly marked even when the terminal
         # itself is unfocused (Textual may clear its :focus pseudo-class while
         # a tmux pane is being reattached).
-        for section, selector in (("logs", "#selected-logs-scroll"),):
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        if self.state.selected_section == "summary" and not summary.display:
+            self.state.selected_section = "logs"
+        for section, selector in (("logs", "#selected-logs-scroll"), ("summary", "#selected-restart-summary")):
             try:
                 widget = self.query_one(selector)
                 widget.set_class(
-                    self.state.selected_section == section, "selected"
+                    selected_active and widget.display and self.state.selected_section == section, "selected"
                 )
             except NoMatches:
                 pass
         row = self._selected_row()
-        section = self.state.selected_section.upper()
+        section = "ISSUE / FIX" if self.state.selected_section == "summary" else self.state.selected_section.upper()
         terminal = self._active_terminal()
         target.border_subtitle = f" TERMINAL · {terminal.label} " if terminal else f" {section} · {self._selected_attempt_label(row)} "
 
     def _focus_selected_section(self) -> None:
-        """Give the active Logs viewport the real keyboard focus."""
+        """Give the selected output or issue/fix viewport keyboard focus."""
 
         row = self._selected_row()
         if not self._selected_inspector_visible() or (self.log_manager is None and not (row and self._terminals.get(row.uid))):
             return
         self.state.focused_pane = "selected"
         target_id = "#selected-terminal" if self._active_terminal() else "#selected-logs-scroll"
+        if self.state.selected_section == "summary" and self.query_one("#selected-restart-summary").display:
+            target_id = "#selected-restart-summary"
         try:
             target = self.query_one(target_id)
         except NoMatches:
@@ -2838,10 +2897,13 @@ class FalconDashboard(App):
         self.call_after_refresh(self._focus_selected_section)
 
     def _copy_text_selection(self) -> bool:
-        """Copy a native text selection from the selected-job log viewport."""
+        """Copy the selected text from Logs or the focused issue/fix box."""
 
         try:
-            logs = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+            logs = (
+                self.focused if isinstance(self.focused, RestartSummaryScroll)
+                else self.query_one("#selected-logs-scroll", SelectedJobScroll)
+            )
         except NoMatches:
             return False
         value = logs.selection_for_copy()
@@ -2877,6 +2939,10 @@ class FalconDashboard(App):
             self._copy_terminal_selection()
             return
         if self._copy_text_selection():
+            return
+        if isinstance(self.focused, RestartSummaryScroll):
+            # This box copies only an explicit selection; do not accidentally
+            # copy the Pod's logs when no issue/fix text is selected.
             return
         if self._selected_inspector_active():
             self._copy_selected_content()
@@ -2955,7 +3021,7 @@ class FalconDashboard(App):
                 return
 
     def _scroll_selected_section(self, amount: int) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -2972,7 +3038,7 @@ class FalconDashboard(App):
             )
 
     def _page_selected_section(self, direction: int) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -2980,7 +3046,7 @@ class FalconDashboard(App):
         self._scroll_selected_section(max(1, target.size.height - 1) * direction)
 
     def _jump_selected_section(self, end: bool) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -3095,6 +3161,10 @@ class FalconDashboard(App):
             # Modal screens and teardown may temporarily hide the inspector.
             return
         session = self._active_terminal()
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        summary_visible = session is None and bool(summary._source_lines)
+        if summary.display != summary_visible:
+            summary.display = summary_visible
         tooltip = "Copy terminal output" if session is not None else "Ctrl/Cmd+C"
         if copy_button.tooltip != tooltip:
             copy_button.tooltip = tooltip
@@ -3147,30 +3217,6 @@ class FalconDashboard(App):
         self._render_selected()
         self._sync_terminal_view()
         self.call_after_refresh(self._focus_selected_section)
-
-    def _move_selected_attempt(self, amount: int) -> None:
-        row = self._selected_row()
-        if row is None:
-            return
-        attempts = self._selected_attempts(row)
-        if not attempts:
-            return
-        current = self._selected_attempt(row)
-        index = attempts.index(current) if current in attempts else len(attempts) - 1
-        next_index = max(0, min(len(attempts) - 1, index + amount))
-        if next_index == index:
-            return
-        self.state.selected_attempt_index = next_index
-        self.state.logs_auto_follow = True
-        self._ensure_selected_terminal_logs(row)
-        try:
-            self.query_one("#selected-logs-scroll", SelectedJobScroll).scroll_home(
-                animate=False, force=True, immediate=True
-            )
-        except NoMatches:
-            pass
-        self._set_selected_subtitle()
-        self._render_selected()
 
     def _selected_detail_table(
         self,
@@ -3398,7 +3444,7 @@ class FalconDashboard(App):
                 )
                 self._selected_log_view_key = None
             attempt_label = (
-                f"Pod {attempt_index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+                f"{'Archived ' if attempt.archived_job_uid else ''}Pod {attempt_index + 1}/{len(attempts)} · {attempt.name}{' / ' + attempt.container if attempt.archived_job_uid else ''} · {attempt.phase}"
                 if attempt is not None
                 else "No Pod attempt"
             )
@@ -3407,6 +3453,7 @@ class FalconDashboard(App):
                 logs,
                 logs_collapsed=self.state.logs_collapsed,
                 attempt_label=attempt_label,
+                restart_summary=attempt.restart_summary if attempt else "",
             )
             self._set_selected_subtitle()
             return
@@ -4171,6 +4218,16 @@ class FalconDashboard(App):
         self._cycle_pane(-1)
 
     def _cycle_pane(self, amount: int, panes: Optional[List[str]] = None) -> None:
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        if self.state.focused_pane == "selected" and self._selected_inspector_visible() and summary.display:
+            if amount > 0 and self.state.selected_section == "logs":
+                self.state.selected_section = "summary"
+                self._focus_selected_section()
+                return
+            if amount < 0 and self.state.selected_section == "summary":
+                self.state.selected_section = "logs"
+                self._focus_selected_section()
+                return
         panes = panes or self._visible_panes()
         if self.state.focused_pane not in panes:
             self.state.focused_pane = "jobs"
@@ -4183,6 +4240,9 @@ class FalconDashboard(App):
             self._render_all()
         else:
             self._focus(pane)
+        if pane == "selected" and self._selected_inspector_visible() and summary.display:
+            self.state.selected_section = "logs" if amount > 0 else "summary"
+            self._focus_selected_section()
 
     def action_focus_jobs(self) -> None: self._focus("jobs")
     def action_focus_selected(self) -> None: self._focus("selected")
@@ -4366,34 +4426,14 @@ class FalconDashboard(App):
         return True
 
     def action_left(self) -> None:
-        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+        if self.state.focused_pane == "selected":
             self._move_selected_window(-1)
-            return
-        if (
-            self.log_manager is not None
-            and self.state.focused_pane == "selected"
-            and (
-                self.state.expanded_pane == "selected"
-                or (self._selected_inspector_active() and self._selected_logs_focused())
-            )
-        ):
-            self._move_selected_attempt(-1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(1)
 
     def action_right(self) -> None:
-        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+        if self.state.focused_pane == "selected":
             self._move_selected_window(1)
-            return
-        if (
-            self.log_manager is not None
-            and self.state.focused_pane == "selected"
-            and (
-                self.state.expanded_pane == "selected"
-                or (self._selected_inspector_active() and self._selected_logs_focused())
-            )
-        ):
-            self._move_selected_attempt(1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(-1)
 

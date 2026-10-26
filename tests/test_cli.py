@@ -15,6 +15,7 @@ from unittest.mock import patch
 from falcon.cli import (
     EXIT_KUBERNETES,
     EXIT_USAGE,
+    _confirm_claude_mcp_compatibility,
     _parser,
     _resources_command,
     _rewrite_shorthand,
@@ -1293,6 +1294,36 @@ class InspectionCliTests(CliHarness):
 
 
 class SetupTests(unittest.TestCase):
+    def test_mcp_setup_asks_before_continuing_with_old_claude(self) -> None:
+        stderr = io.StringIO()
+        with patch(
+            "falcon.mcp_config.claude_code_mcp_warning",
+            return_value="Claude Code is too old; upgrade it",
+        ), patch("builtins.input", return_value="n") as prompt, contextlib.redirect_stderr(
+            stderr
+        ):
+            allowed = _confirm_claude_mcp_compatibility(
+                ["claude"], all_agents=False, non_interactive=False
+            )
+
+        self.assertFalse(allowed)
+        self.assertIn("Claude Code is too old", stderr.getvalue())
+        self.assertIn("rerun falcon setup", stderr.getvalue())
+        self.assertIn("without upgrading Claude Code", prompt.call_args.args[0])
+
+    def test_noninteractive_mcp_setup_warns_but_can_continue(self) -> None:
+        stderr = io.StringIO()
+        with patch(
+            "falcon.mcp_config.claude_code_mcp_warning",
+            return_value="Claude Code is too old; upgrade it",
+        ), contextlib.redirect_stderr(stderr):
+            allowed = _confirm_claude_mcp_compatibility(
+                None, all_agents=True, non_interactive=True
+            )
+
+        self.assertTrue(allowed)
+        self.assertIn("Claude Code is too old", stderr.getvalue())
+
     def test_interactive_skill_offer_warns_about_increased_usage(self) -> None:
         args = SimpleNamespace(
             uninstall_skills=None,

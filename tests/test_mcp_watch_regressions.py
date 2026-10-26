@@ -43,6 +43,130 @@ class Streams:
                 return version
 
 
+async def _until(predicate):
+    async def check():
+        while not predicate():
+            await asyncio.sleep(0)
+    await asyncio.wait_for(check(), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("completed_before_recall", [False, True])
+async def test_replacement_wait_recovers_exited_retained_watchers(
+    tmp_path, monkeypatch, partial, completed_before_recall,
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    store = EventStore(tmp_path / "events.db")
+    streams = Streams()
+    old = job(completed=True)
+    current = [old]
+    lists = []
+
+    async def inventory(resource, namespace):
+        lists.append(resource)
+        return {"metadata": {"resourceVersion": "1"},
+                "items": current if resource == "jobs.batch" else []}
+
+    monitor = Monitor(SimpleNamespace(executable="kubectl"), "mine", store,
+                      watcher=streams, list_provider=inventory)
+    waiting = None
+    try:
+        initial = await monitor.wait([old], cursor=0, timeout=3)
+        assert initial["events"][0]["type"] == "succeeded"
+        for _ in range(3):
+            await asyncio.wait_for(streams.calls.get(), 2)
+        await streams.queues["jobs.batch"].put({"type": "DELETED", "object": old})
+        await _until(lambda: not monitor._has_observation_targets())
+        resources = ["jobs.batch"] if partial else list(streams.queues)
+        for resource in resources:
+            await streams.queues[resource].put({"type": "BOOKMARK", "object": {"metadata": {"resourceVersion": "2"}}})
+        await _until(lambda: sum(task.done() for task in monitor._watch_tasks) == len(resources))
+        assert monitor._started, "reproduce the stale started flag"
+        replacement = job(completed=completed_before_recall)
+        replacement["metadata"]["uid"] = "replacement-uid"
+        current[:] = [replacement]
+        ref = {"name": "train", "namespace": "mine", "uid": "replacement-uid"}
+        waiting = asyncio.create_task(monitor.wait([ref], cursor=initial["cursor"], timeout=3))
+        await _until(lambda: len(lists) == 6 and monitor._background_running())
+        if not completed_before_recall:
+            completed = job(completed=True)
+            completed["metadata"]["uid"] = "replacement-uid"
+            await streams.queues["jobs.batch"].put({"type": "MODIFIED", "object": completed})
+        result = await asyncio.wait_for(waiting, 2)
+        assert not result["timed_out"]
+        assert result["events"][0]["type"] == "succeeded"
+        assert result["events"][0]["job"]["uid"] == "replacement-uid"
+        assert len(monitor._watch_tasks) == 3
+    finally:
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_registered_while_old_watch_is_closing(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    store = EventStore(tmp_path / "events.db")
+    streams = Streams()
+    closing = asyncio.Event()
+    release = asyncio.Event()
+    old = job(completed=True)
+    current = [old]
+    lists = []
+
+    async def inventory(resource, namespace):
+        lists.append(resource)
+        return {"metadata": {"resourceVersion": "1"},
+                "items": current if resource == "jobs.batch" else []}
+
+    async def watcher(resource, namespace, resource_version):
+        source = streams(resource, namespace, resource_version)
+        try:
+            async for event in source:
+                yield event
+        finally:
+            await source.aclose()
+            if resource == "jobs.batch" and not closing.is_set():
+                closing.set()
+                await release.wait()
+
+    monitor = Monitor(SimpleNamespace(executable="kubectl"), "mine", store,
+                      watcher=watcher, list_provider=inventory)
+    waiting = None
+    try:
+        initial = await monitor.wait([old], cursor=0, timeout=3)
+        for _ in range(3):
+            await asyncio.wait_for(streams.calls.get(), 2)
+        await streams.queues["jobs.batch"].put({"type": "DELETED", "object": old})
+        await _until(lambda: not monitor._has_observation_targets())
+        await streams.queues["jobs.batch"].put({"type": "BOOKMARK", "object": {"metadata": {"resourceVersion": "2"}}})
+        await asyncio.wait_for(closing.wait(), 2)
+        replacement = job()
+        replacement["metadata"]["uid"] = "replacement-uid"
+        current[:] = [replacement]
+        ref = {"name": "train", "namespace": "mine", "uid": "replacement-uid"}
+        waiting = asyncio.create_task(monitor.wait([ref], cursor=initial["cursor"], timeout=3))
+        await _until(lambda: len(lists) == 6)
+        release.set()
+        await streams.started()
+        completed = job(completed=True)
+        completed["metadata"]["uid"] = "replacement-uid"
+        await streams.queues["jobs.batch"].put({"type": "MODIFIED", "object": completed})
+        result = await asyncio.wait_for(waiting, 2)
+        assert result["events"][0]["type"] == "succeeded"
+        assert result["events"][0]["job"]["uid"] == "replacement-uid"
+    finally:
+        release.set()
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_expired_resource_version_relists_and_recovers_without_model_polling(tmp_path):
     store = EventStore(tmp_path / "events.db")
@@ -234,8 +358,40 @@ async def test_mcp_level_cancellation_finishes_wait_cleanup(tmp_path):
             scopes[0].cancel()
             await asyncio.wait_for(done.wait(), 2)
         assert not monitor._active_waiters
-        assert not monitor._watch_tasks
-        assert monitor._metrics_task is None
+        assert len(monitor._watch_tasks) == 3
+        assert all(not task.done() for task in monitor._watch_tasks)
     finally:
         await monitor.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["succeeded", "warning", "eviction_risk"])
+async def test_cancelled_wait_replays_event_recorded_before_recall(tmp_path, event_type):
+    store = EventStore(tmp_path / "events.db")
+    streams = Streams()
+    monitor = Monitor(SimpleNamespace(executable="kubectl"), "mine", store, watcher=streams)
+    waiting = asyncio.create_task(monitor.wait([job()], cursor=0, timeout=30))
+    try:
+        await streams.started()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert not monitor._active_waiters
+        assert len(monitor._watch_tasks) == 3
+        # The parent is answering a user: no MCP request is waiting. The
+        # retained watcher must still record even transient, nonterminal events.
+        key = next(iter(monitor._tracked))
+        await monitor._emit(event_type, {"arrived_during_reply": True}, key=key)
+        recorded = store.read(["job-uid"], event_types=[event_type])
+        assert len(recorded) == 1
+        result = await asyncio.wait_for(monitor.wait([job()], cursor=0, timeout=30), 2)
+        assert result["events"][0]["cursor"] == recorded[0]["cursor"]
+        assert result["events"][0]["type"] == event_type
+        assert result["cursor"] == recorded[0]["cursor"]
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await monitor.close()
+        assert not monitor._watch_tasks
         store.close()

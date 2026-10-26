@@ -83,6 +83,8 @@ class PodAttempt:
     phase: str = "Unknown"
     created_at: str = ""
     container: str = "main"
+    archived_job_uid: str = ""
+    restart_summary: str = ""
 
     @property
     def running(self) -> bool:
@@ -153,6 +155,7 @@ class JobUsage:
     attempt_pods: List[str] = field(default_factory=list)
     attempt_details: Tuple[PodAttempt, ...] = ()
     image: str = ""
+    restart_history: str = ""
 
     @property
     def gpu_memory_percent(self) -> Optional[float]:
@@ -1530,6 +1533,7 @@ class UsageCollector:
                 at_risk=at_risk,
                 agent_managed=agent_managed,
                 agent_state=agent_state,
+                restart_history=str((job_metadata.get("annotations") or {}).get("falcon.dev/restart-history") or ""),
                 uid=uid,
                 active_pod=str(relevant_metadata.get("name") or ""),
                 active_pod_uid=str(relevant_metadata.get("uid") or ""),

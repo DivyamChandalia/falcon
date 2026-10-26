@@ -296,6 +296,7 @@ class ResourcePlan:
     immediately_schedulable: bool = True
     warning: Optional[str] = None
     sizing_node: Optional[str] = None
+    scheduling: Optional[Dict[str, Any]] = None
 
     @property
     def gpu_type(self) -> str:

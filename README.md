@@ -118,6 +118,15 @@ Press `Ctrl+F` while Logs or a terminal is focused to search retained output.
 Matches are highlighted; `Enter`/`Shift+Enter` moves next/previous and `Esc`
 closes search. Searches are literal and case-insensitive.
 
+For Jobs restarted through Falcon's MCP tools, `←`/`→` also browses archived
+Pod logs from earlier runs. When the agent supplies an issue/fix summary, a
+small scrollable box appears below that failed Pod's logs. Drag-select the
+issue/fix text and press Ctrl/Cmd+C to copy it. Archives stay in
+Falcon's local state, so review them on the same machine and state directory.
+Click Logs or Issue/Fix to select and highlight that pane; Tab/Shift+Tab also
+moves between them when a summary is present. Left/right switches attempts
+throughout the Selected Job pane.
+
 With Selected Job focused, `Ctrl+T` opens an interactive shell in its running
 Pod, inside the Logs area. Press it again for another terminal; `←`/`→` switches
 between logs and terminals. `Ctrl+D` (or `Ctrl+W`) closes the current terminal.
@@ -232,7 +241,8 @@ file. The server is started as `falcon mcp serve`, uses the user's existing
 kubeconfig and Falcon namespace, and exposes planning,
 submission, inspection, logs, metrics, event waiting, cancellation, and
 restart tools. It does not change client permissions or grant host
-permissions. MCP submit/restart requests require idempotency keys, and event
+permissions. MCP submissions use idempotency keys; restarts track their source
+Job UID automatically. Event
 waits return a cursor for reuse on the next wait. See [Coder and agent
 workflows](docs/agents.md) for the tool list, legacy-job compatibility,
 long-wait behavior, and job safety rules.

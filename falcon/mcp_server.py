@@ -25,12 +25,23 @@ from .mcp_service import JobService
 
 
 class JobReference(BaseModel):
-    """Identity returned by list/submit; UID guards against name reuse."""
+    """Job name in Falcon's configured namespace; omitted UID selects the latest run."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str = Field(min_length=1, max_length=63)
-    namespace: str = Field(min_length=1, max_length=63)
-    uid: str = Field(min_length=1, max_length=128)
+    uid: Optional[str] = Field(
+        default=None, min_length=1, max_length=128,
+        description="Optional run ID. Omit to resolve the latest Job with this name; supply a returned UID to address a specific run or its archived logs.",
+    )
+
+
+def _agent_response(value: Any) -> Any:
+    """Keep the configured namespace internal, including nested event references."""
+    if isinstance(value, dict):
+        return {key: _agent_response(item) for key, item in value.items() if key != "namespace"}
+    if isinstance(value, list):
+        return [_agent_response(item) for item in value]
+    return value
 
 
 class SubmissionRequest(BaseModel):
@@ -53,6 +64,18 @@ class SubmissionRequest(BaseModel):
     shared_memory_percent: Optional[float] = Field(default=None, ge=0, le=100)
 
 
+class PlanningRequest(SubmissionRequest):
+    """Resource-only previews need no workload command; submission still does."""
+
+    command: Optional[List[str]] = Field(default=None, min_length=1, max_length=512)
+
+
+class RestartSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    issue: str = Field(min_length=1, max_length=1000)
+    fix: str = Field(min_length=1, max_length=1000)
+
+
 class RestartOverrides(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     command: Optional[List[str]] = Field(default=None, min_length=1, max_length=512)
@@ -68,21 +91,46 @@ class RestartOverrides(BaseModel):
 
 INSTRUCTIONS = (
     "Manage Kubernetes batch jobs in the configured namespace using structured tools. "
+    "Job references contain name and optional uid; omit uid to target the latest run. "
+    "The configured namespace is implicit in every request and response. "
     "Use plan_job before submission when sizing is uncertain. Reuse the same unique "
     "idempotency_key when retrying a submit request; restart retries are managed "
     "internally from the source Job UID. Never submit a duplicate "
     "because a wait or transport timed out. Agent-managed jobs never automatically "
     "retry failures. Failure events include the exact failed pod and bounded logs. "
-    "Inspect them, then make an explicit disposition: prefer restart_job for a "
-    "repairable terminal Job; use cancel_job when it should not continue. Use "
-    "submit_job for a new independent run or only when restart overrides are "
-    "insufficient. When monitoring is requested, call wait_for_events for all relevant "
-    "jobs together, then pass its cursor to the next wait. After submit_job returns, "
-    "immediately report the scheduled Jobs and say you are awaiting events, then "
-    "start this wait for the returned Job references. "
-    "Await one synchronous MCP call: it waits server-side for up to seven days. "
-    "Do not background or detach the wait, end the turn while it is pending, "
-    "or do busywork merely to wait. Keep the client session open. "
+    "Inspect them, then use restart_job to relaunch a failed Job, or cancel_job "
+    "when it should not continue. submit_job is for new independent work, not "
+    "retrying a failed Job. When monitoring is requested, call wait_for_events for all relevant "
+    "jobs together, then pass its cursor to the next wait. submit_job only submits; "
+    "report the returned Job references, then start monitoring as a separate "
+    "explicit call unless the user asks not to watch. Submission itself never "
+    "starts a wait. Start with cursor=0 for newly "
+    "followed Jobs and save returned cursors. Claude Code 2.1.212 or newer: "
+    "call wait_for_events directly in the main conversation and let Claude Code "
+    "background the long call; do not create a subagent or poll. Keep the Claude "
+    "and MCP sessions open, process the completion notification, and re-arm only "
+    "after the wait ends, expires, or is disconnected. Older Claude Code versions "
+    "wait synchronously. OpenCode: delegate a synchronous wait to one background "
+    "report-only subagent using its configured subagent model. Pass exact references, "
+    "cursor, filters, startup grace and scheduling policy. The watcher may only "
+    "wait, silently renew expiry continuations and report bounded events with "
+    "cursor/settings; no inspection, writes, restarts, cancellation or polling. "
+    "The OpenCode parent may finish the foreground turn, handle its report and re-arm. "
+    "Codex: start one asynchronous wait_for_events in functions.exec and save "
+    "its yielded cell ID. Make functions.wait(cell_id=..., yield_time_ms=604800000) "
+    "the last action of every watching turn unless the user explicitly asks to "
+    "stop watching; this requests a seven-day host wait, subject to host caps. Report updates before "
+    "waiting, not a final response that ends observation. Stop watching means do "
+    "not re-arm; leave the Job running unless cancellation is separately requested. "
+    "After a user interruption, answer the user, then reattach to the same cell "
+    "using functions.wait. Only if the MCP call/cell was actually killed or lost, "
+    "start one replacement async wait with the same references, last cursor "
+    "(0 until the first result), filters, startup grace and scheduling policy; "
+    "save the new cell ID. A yielded or completed cell is not a killed call: "
+    "retrieve its result, never duplicate a pending wait. The watcher continues recording "
+    "events between calls while this MCP server remains open. There is no queued "
+    "wake-up on this path. Never resubmit a Job to resume observation. Keep the MCP session "
+    "open; never poll background-task status or do busywork merely to wait. "
     "Re-arm only after handling an event or wait expiry, not on a timer. "
     "timed_out means the wait elapsed, not that the Job failed; "
     "use the returned continuation to keep following the same Jobs. Do not "
@@ -97,7 +145,7 @@ INSTRUCTIONS = (
     "A deleted Job silently disconnects "
     "observation. Monitor health diagnostics stay internal; outages do not wake "
     "the agent. Monitoring retries until recovery without an outage deadline, "
-    "subject to the seven-day wait limit or cancellation. "
+    "until the call returns or is cancelled. "
     "GPU eviction monitoring gives each Job a 120-second minimum "
     "startup grace; pass a larger startup_time_seconds to wait_for_events for "
     "model loading or compilation. Each GPU is qualified over a 30-second "
@@ -147,7 +195,7 @@ def create_server(
                 getattr(current, method), *args, **kwargs,
             ))
             try:
-                return await asyncio.shield(operation)
+                return _agent_response(await asyncio.shield(operation))
             except asyncio.CancelledError:
                 # Cancelling a request cannot interrupt an already accepted
                 # Kubernetes write. Finish reconciliation before releasing the
@@ -172,18 +220,28 @@ def create_server(
     destructive = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
 
     @server.tool(annotations=read, structured_output=True)
-    async def plan_job(request: SubmissionRequest) -> dict[str, Any]:
-        """Preview Falcon resource sizing and warnings without creating a job."""
+    async def plan_job(request: PlanningRequest) -> dict[str, Any]:
+        """Preview node availability and allocation recommendations without creating a Job.
+
+        For GPU sizing, provide gpu/gpus; command, cpu and memory are optional.
+        The scheduling breakdown gives per-node free/total CPU, RAM and GPUs,
+        exact shortfalls, jointly feasible alternatives and recommendations.
+        When no matching GPU is free, maximum/recommended allocations use node
+        capacity, not free CPU/RAM. If the required allocation fits but no suitable
+        alternative exists, submit unchanged and follow with wait_for_capacity.
+        A request exceeding every matching node's capacity must be revised;
+        waiting alone cannot make it fit. Choose task-sufficient resources and
+        supply the real command in submit_job. This preview reserves nothing.
+        """
         return await invoke("plan_job", request.model_dump(exclude_none=True))
 
     @server.tool(annotations=write, structured_output=True)
     async def submit_job(request: SubmissionRequest, idempotency_key: str) -> dict[str, Any]:
         """Submit one non-retrying Job and return its durable reference.
 
-        After submission, immediately call ``wait_for_events`` with the returned
-        reference; that keeps long-lived monitoring separate from the write and
-        lets an agent submit or manage other Jobs while this one runs.
-        Reuse the key after an ambiguous response.
+        Submission does not start monitoring. Report the returned reference;
+        call ``wait_for_events`` separately when monitoring is wanted.
+        Reuse the key after an ambiguous response; do not create duplicates.
         """
         return await invoke("submit_job", request.model_dump(exclude_none=True), idempotency_key)
 
@@ -195,33 +253,43 @@ def create_server(
     @server.tool(annotations=read, structured_output=True)
     async def inspect_job(job: JobReference) -> dict[str, Any]:
         """Inspect job state, retry policy, attempts, and scheduling/failure reasons."""
-        return await invoke("inspect_job", job.model_dump())
+        return await invoke("inspect_job", job.model_dump(exclude_none=True))
 
     @server.tool(annotations=read, structured_output=True)
     async def job_logs(
         job: JobReference,
         pods: Optional[List[str]] = Field(default=None, max_length=10),
         failed_only: bool = False,
-        limit: int = Field(default=3, ge=1, le=10),
-        tail: int = Field(default=50, ge=1, le=200),
+        limit: int = Field(
+            default=3, ge=1, le=10,
+            description="Maximum number of pod/container log entries to return (1–10). This is not a line count; use tail for lines.",
+        ),
+        tail: int = Field(
+            default=50, ge=1, le=200,
+            description="Number of recent log lines per returned pod/container entry (1–200). For 80 lines from one pod, use tail=80, limit=1.",
+        ),
         cursors: Optional[Dict[str, str]] = None,
         container: Optional[str] = None,
     ) -> dict[str, Any]:
         """Read separate bounded pod-attempt logs; default to the current/latest pod.
 
+        limit counts pod/container entries (maximum 10); tail counts recent
+        lines per entry (maximum 200). To request 40 lines from one pod, use
+        tail=40 and limit=1, not limit=40.
         Select exact pod names from failure events, or failed_only for failed
         attempts. Per-pod/container cursors retrieve only new retained text.
-        Deleted pods may no longer have logs; this is not durable log archival.
+        For a restarted Job's old UID, read its locally archived logs and summary.
+        Other deleted or rotated Pod output may no longer be available.
         """
         return await invoke(
-            "job_logs", job.model_dump(), pods=pods, failed_only=failed_only,
+            "job_logs", job.model_dump(exclude_none=True), pods=pods, failed_only=failed_only,
             limit=limit, tail=tail, cursors=cursors, container=container,
         )
 
     @server.tool(annotations=read, structured_output=True)
     async def job_metrics(job: JobReference) -> dict[str, Any]:
         """Get requested resources and available measured usage; missing is unknown."""
-        return await invoke("job_metrics", job.model_dump())
+        return await invoke("job_metrics", job.model_dump(exclude_none=True))
 
     @server.tool(annotations=read, structured_output=True)
     async def wait_for_events(
@@ -251,12 +319,23 @@ def create_server(
             ),
         ),
     ) -> dict[str, Any]:
-        """Wait up to 7d for meaningful changes, not periodic running updates.
+        """Wait for meaningful changes, not periodic running updates.
 
-        Batch jobs into one call and reuse the returned cursor. Await the call
-        synchronously; do not background, detach, or end the turn while it is
-        pending. Keep the session open without polling or busywork. Re-arm
-        after an event or expiry only.
+        Monitoring is separate from submission. Batch Jobs into one call; use
+        cursor=0 when first following them, then reuse the returned cursor.
+        Codex starts one async MCP call in functions.exec, saves its cell ID,
+        then uses functions.wait as the last action of every watching turn.
+        After a user message, respond then reattach to that same cell. If the
+        MCP call/cell was actually killed or lost, start one replacement with
+        the same references, last cursor and observation settings. A yielded
+        or completed cell is not killed: retrieve its result without duplicates.
+        While this MCP server stays open, its watcher retains intervening
+        events for replay. Do not resubmit Jobs to reconnect observation.
+        Claude Code 2.1.212+ should call this directly and let Claude Code
+        background the long main-conversation call; older Claude versions wait
+        synchronously. OpenCode may delegate a synchronous wait to a report-only
+        watcher. Keep MCP open, without timer polling or busywork. Re-arm after handling
+        an event, expiry, or an actually cancelled/lost call only.
         Cancellation stops this wait only. Pending/running state is intentionally silent;
         a deleted Job disconnects observation without producing an event. No
         automatic model wake-up occurs after disconnection. For GPU jobs,
@@ -265,23 +344,23 @@ def create_server(
         default, or pass a larger value on the first wait and reuse it.
         Monitor health changes stay internal. Outages are retried without an
         outage deadline; the wait remains open until an actionable event,
-        cancellation, deletion, or the fixed seven-day wait limit.
+        cancellation, deletion, or a continuation response.
         Use ``wait_for_capacity`` when the user accepts queueing for resources;
         reuse that policy on subsequent waits. Other warnings remain visible.
-        ``timed_out`` only means the seven-day wait expired and does not imply
+        ``timed_out`` only means the wait ended and does not imply
         a Job or monitor failure. Use the returned continuation to wait again
         with the same Jobs, cursor, and observation settings.
         """
         current = await get_service()
         result = await current.wait_for_events(
-            [job.model_dump() for job in jobs], cursor=cursor,
+            [job.model_dump(exclude_none=True) for job in jobs], cursor=cursor,
             event_types=event_types, timeout=DEFAULT_WAIT_TIMEOUT_SECONDS,
             startup_time_seconds=startup_time_seconds,
             scheduling_policy=scheduling_policy,
         )
         if result.get("timed_out") and not result.get("disconnected"):
             arguments = {
-                "jobs": [job.model_dump() for job in jobs],
+                "jobs": result.get("jobs", [job.model_dump(exclude_none=True) for job in jobs]),
                 "cursor": result["cursor"],
                 "scheduling_policy": scheduling_policy,
             }
@@ -297,31 +376,34 @@ def create_server(
                     "reason": "Wait expired, not a Job failure. Call again to continue following.",
                 },
             }
-        return result
+        return _agent_response(result)
 
     @server.tool(annotations=destructive, structured_output=True)
     async def cancel_job(job: JobReference) -> dict[str, Any]:
-        """Cancel this exact job UID, leaving unrelated or replacement jobs untouched."""
-        return await invoke("cancel_job", job.model_dump())
+        """Cancel the latest run by name, or a specific run when uid is supplied."""
+        return await invoke("cancel_job", job.model_dump(exclude_none=True))
 
     @server.tool(annotations=destructive, structured_output=True)
     async def restart_job(
         job: JobReference, overrides: Optional[RestartOverrides] = None,
+        summary: Optional[RestartSummary] = None,
     ) -> dict[str, Any]:
         """Restart a terminal job under the same name, with optional fixes and no retries.
 
         Requires a retained Job with a terminal Kubernetes condition. For an
         active job, cancel it and use submit_job for a new run instead.
         The old Job and its Pods are deleted, then recreated under the same
-        Job name with a new UID and new Pod names. Old logs are not archived;
-        inspect failure logs before restarting if needed.
+        Job name with a new UID and new Pod names. Available logs are archived
+        locally before deletion. Supply a concise summary with issue and fix;
+        the dashboard shows it below the archived failed Pod's logs when present.
         Monitor the returned new Job reference, never the old UID.
-        Retry the same source reference and overrides to resume an interrupted
+        Retry the same source reference, overrides and summary to resume an interrupted
         restart; Falcon manages operation identity internally.
         """
         return await invoke(
-            "restart_job", job.model_dump(),
+            "restart_job", job.model_dump(exclude_none=True),
             overrides=overrides.model_dump(exclude_none=True) if overrides else None,
+            **({"summary": summary.model_dump()} if summary else {}),
         )
 
     return server

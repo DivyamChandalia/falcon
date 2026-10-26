@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import codecs
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 from .commands import capture_logs
 from .kubernetes import KubernetesClient
+from .restart_history import RestartHistory, history_path
 
 MAX_LOG_LINES = 200
 LOG_RETENTION_SECONDS = 24 * 60 * 60
@@ -169,6 +171,9 @@ class DashboardLogManager:
         self.retry_seconds = max(0.1, float(retry_seconds))
         self._clock = clock
         self._client = client or KubernetesClient(namespace)
+        self._restart_history = RestartHistory(history_path(getattr(self._client, "context", None), namespace))
+        self._archive_attempt_cache = {}
+        self._archive_snapshot_cache = {}
         self._on_change = on_change
         self._lock = threading.RLock()
         self._states: Dict[Tuple[str, str], _PodLogState] = {}
@@ -493,6 +498,9 @@ class DashboardLogManager:
 
         if self._closed:
             return
+        if getattr(attempt, "archived_job_uid", ""):
+            self._ensure_archived_logs(attempt)
+            return
         key = self._key(row, attempt)
         with self._lock:
             state = self._states.get(key) or self._new_state(row, attempt)
@@ -602,6 +610,9 @@ class DashboardLogManager:
         self._notify()
 
     def snapshot(self, row: object, attempt: object) -> LogSnapshot:
+        if getattr(attempt, "archived_job_uid", ""):
+            with self._lock:
+                return self._archive_snapshot_cache.get(self._archive_key(attempt), LogSnapshot(pod_name=attempt.name))
         key = self._key(row, attempt)
         with self._lock:
             self._prune_locked()
@@ -622,11 +633,63 @@ class DashboardLogManager:
     def snapshot_revision(self, row: object, attempt: object) -> int:
         """Return a selected Pod revision without copying its retained lines."""
 
+        if getattr(attempt, "archived_job_uid", ""):
+            return self.snapshot(row, attempt).revision
         key = self._key(row, attempt)
         with self._lock:
             self._prune_locked()
             state = self._states.get(key)
             return state.revision if state is not None else 0
+
+    def archived_attempts(self, row):
+        root = getattr(row, "restart_history", "")
+        if not root:
+            return []
+        key = (self._job_key(row), root)
+        if key not in self._archive_attempt_cache:
+            try:
+                self._archive_attempt_cache = {key: self._restart_history.attempts(root, row.job)}
+            except (OSError, sqlite3.Error, ValueError):
+                return []
+        return self._archive_attempt_cache[key]
+
+    @staticmethod
+    def _archive_key(attempt):
+        return attempt.archived_job_uid, attempt.uid, attempt.container
+
+    def _ensure_archived_logs(self, attempt):
+        key = self._archive_key(attempt)
+        with self._lock:
+            if key in self._archive_snapshot_cache:
+                return
+            if len(self._archive_snapshot_cache) >= 16:
+                self._archive_snapshot_cache.pop(next(iter(self._archive_snapshot_cache)))
+            self._archive_snapshot_cache[key] = LogSnapshot(pod_name=attempt.name, status="loading")
+        threading.Thread(target=self._load_archived_logs, args=(attempt,),
+                         name="falcon-dashboard-archived-logs", daemon=True).start()
+
+    def _load_archived_logs(self, attempt):
+        key = self._archive_key(attempt)
+        try:
+            archive = self._restart_history.logs(attempt.archived_job_uid)
+            entry = next(entry for entry in (archive or {}).get("logs", [])
+                         if entry["pod_uid"] == attempt.uid and entry["container"] == attempt.container)
+            parser = _TerminalLineParser()
+            state = _PodLogState(job_uid=attempt.archived_job_uid, job_name="", pod_uid=attempt.uid,
+                                 pod_name=attempt.name, phase=attempt.phase, container=attempt.container)
+            state.lines = deque(maxlen=self.max_lines)
+            for offset in range(0, len(entry["stdout"]), 65536):
+                self._apply_terminal_events(state, parser.feed(entry["stdout"][offset:offset + 65536]))
+            self._apply_terminal_events(state, parser.finish())
+            snapshot = LogSnapshot(pod_name=attempt.name, status="archived", lines=tuple(line.value for line in state.lines),
+                                   error=entry["stderr"], revision=1)
+        except Exception:
+            snapshot = LogSnapshot(pod_name=attempt.name, error="Archived logs unavailable", revision=1)
+        with self._lock:
+            if self._closed or key not in self._archive_snapshot_cache:
+                return
+            self._archive_snapshot_cache[key] = snapshot
+        self._notify()
 
     def prune(self) -> None:
         """Discard expired output even while the selected pane is collapsed."""
@@ -643,5 +706,6 @@ class DashboardLogManager:
             self._closed = True
             states = list(self._states.values())
             self._states.clear()
+            self._archive_snapshot_cache.clear()
         for state in states:
             self._terminate(state.process)

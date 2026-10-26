@@ -54,6 +54,7 @@ from .models import GPURequest, JobRequest, ResourcePlan
 from .planning import canonical_gpu, plan_cpu_resources, plan_resources
 from .resource_service import ResourceServiceClient, snapshot_nodes
 from .resources import fetch_nodes
+from .restart_history import HISTORY_ANNOTATION, RestartHistory, history_path
 
 AGENT_LABEL = "falcon.dev/agent-managed"
 IDEMPOTENCY_LABEL = "falcon.dev/idempotency-hash"
@@ -382,6 +383,7 @@ class JobService:
             namespace=self.namespace,
         )
         self._operations = _OperationStore(self._db_path)
+        self._restart_history = RestartHistory(history_path(self.context, self.namespace, self._state_dir))
         self._metrics_lock = threading.RLock()
         self._metrics_collectors: dict[tuple[str, str, str], Any] = {}
         self._metrics_snapshots: dict[tuple[str, str, str], tuple[float, Any]] = {}
@@ -463,8 +465,18 @@ class JobService:
     # ------------------------------------------------------------------
 
     def plan_job(self, request: dict) -> dict:
-        job_request, plan, manifest = self._prepare_request(request, force_agent=True)
-        return self._plan_response(job_request, plan, manifest)
+        if not isinstance(request, Mapping):
+            raise MCPServiceError("job request must be an object")
+        resource_only = "command" not in request
+        preview = {**request, **({"command": ["true"]} if resource_only else {})}
+        job_request, plan, manifest = self._prepare_request(preview, force_agent=True)
+        result = self._plan_response(job_request, plan, manifest)
+        if resource_only:
+            # Never imply the internal preview placeholder is the workload to
+            # submit. No command is executed and submit_job still requires one.
+            result["summary"].pop("command", None)
+            result["resource_only"] = True
+        return result
 
     def _prepare_request(
         self,
@@ -807,6 +819,7 @@ class JobService:
                 "sizing_node": plan.sizing_node,
                 "immediately_schedulable": plan.immediately_schedulable,
                 "warning": plan.warning,
+                **({"scheduling": plan.scheduling} if plan.scheduling is not None else {}),
             },
         }
         # The manifest is deliberately not returned.  MCP callers receive a
@@ -861,6 +874,12 @@ class JobService:
                     "uid": operation.created_uid,
                 },
                 plan,
+            )
+        if plan.scheduling is not None and not plan.scheduling["fits_any_node_capacity"]:
+            raise MCPServiceError(
+                f"GPU request cannot fit any matching node. {plan.warning}. "
+                "Use plan_job's per-node maximum/recommended allocations to revise it; "
+                "waiting for availability cannot solve a capacity mismatch."
             )
         try:
             created = self.client.create_job(manifest)
@@ -1231,19 +1250,26 @@ class JobService:
             if isinstance(metadata, Mapping):
                 source = metadata
         name = source.get("name")
-        namespace = source.get("namespace")
+        namespace = source.get("namespace", self.namespace)
         uid = source.get("uid")
         if not isinstance(name, str) or not name.strip():
             raise MCPServiceError("job reference name must not be empty")
         if not isinstance(namespace, str) or not namespace.strip():
             raise MCPServiceError("job reference namespace must not be empty")
-        if not isinstance(uid, str) or not uid.strip():
-            raise MCPServiceError("job reference UID must not be empty")
         if namespace != self.namespace:
             raise MCPServiceError(
                 f"job reference namespace {namespace!r} does not match configured "
                 f"namespace {self.namespace!r}"
             )
+        if uid is None:
+            live = self._get_job(name.strip(), self.namespace)
+            metadata = live.get("metadata") or {}
+            if (metadata.get("name") != name.strip()
+                    or str(metadata.get("namespace") or self.namespace) != self.namespace):
+                raise StaleJobReference("Kubernetes returned a different Job identity")
+            uid = metadata.get("uid")
+        if not isinstance(uid, str) or not uid.strip():
+            raise MCPServiceError("job reference UID must not be empty")
         return {"name": name.strip(), "namespace": namespace.strip(), "uid": uid.strip()}
 
     def _get_job(self, name: str, namespace: str) -> Mapping[str, Any]:
@@ -1289,7 +1315,10 @@ class JobService:
         container: Optional[str] = None,
     ) -> dict:
         ref = self._job_ref(job)
-        if not self._operations.restarted_source(ref):
+        archived = self._restart_history.logs(ref["uid"])
+        if archived is not None and archived["name"] != ref["name"]:
+            raise StaleJobReference("Archived Job UID does not match its name")
+        if archived is None and not self._operations.restarted_source(ref):
             self._validated_live_job(ref)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_LOG_LIMIT:
             raise MCPServiceError(f"limit must be between 1 and {_MAX_LOG_LIMIT}")
@@ -1298,6 +1327,41 @@ class JobService:
         if container is not None and (not isinstance(container, str) or not container.strip()):
             raise MCPServiceError("container must be a non-empty string or null")
         cursor_map = self._validate_cursors(cursors)
+        if archived is not None:
+            entries = archived["logs"]
+            if pods is not None:
+                if not isinstance(pods, list) or any(not isinstance(p, str) or not p.strip() for p in pods):
+                    raise MCPServiceError("pods must be an array of non-empty Pod names")
+                if set(pods) - {entry["pod"] for entry in entries}:
+                    raise MCPServiceError("Pod is not an archived attempt of this Job")
+                entries = [entry for entry in entries if entry["pod"] in pods]
+            if failed_only:
+                entries = [entry for entry in entries if entry["phase"] == "Failed"]
+            if container:
+                entries = [entry for entry in entries if entry["container"] == container]
+            result = []
+            next_cursors = {}
+            for entry in entries[-limit:]:
+                key = f"{entry['pod_uid']}/{entry['container']}"
+                raw = cursor_map.get(key)
+                decoded = _decode_log_cursor(raw) if raw else None
+                if decoded is not None and (decoded["pod_uid"] != entry["pod_uid"] or decoded["container"] != entry["container"]):
+                    raise MCPServiceError("cursor belongs to a different Pod or container")
+                stdout, next_cursor, state = _incremental_log_text(
+                    entry["stdout"], pod_uid=entry["pod_uid"], container=entry["container"],
+                    cursor=decoded, max_chars=_MAX_LOG_CHARS_PER_POD,
+                    max_bytes=_MAX_LOG_BYTES_PER_POD, tail=tail,
+                )
+                if next_cursor or raw:
+                    next_cursors[key] = next_cursor or raw
+                stderr, stderr_truncated = _bound_text(entry["stderr"], 4096)
+                result.append({**entry, "stdout": stdout, "stderr": stderr,
+                               "stderr_truncated": stderr_truncated, "stdout_truncated": bool(state.get("truncated")),
+                               "cursor_key": key, "cursor": raw, "next_cursor": next_cursor or raw, **state})
+            return _bound_job_logs_response({"job": ref, "logs": result, "cursors": next_cursors,
+                                            "count": len(result), "failed_only": failed_only,
+                                            "archived": True, "summary": archived["summary"],
+                                            "truncated": False}, _MAX_LOG_RESPONSE_BYTES)
         all_pods = self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"])
         by_name = {
             str((value.get("metadata") or {}).get("name") or ""): value
@@ -1665,6 +1729,7 @@ class JobService:
         job: dict,
         idempotency_key: Optional[str] = None,
         overrides: Optional[dict] = None,
+        summary: Optional[dict] = None,
     ) -> dict:
         """Replace one terminal Job under its original name, with a new UID.
 
@@ -1677,6 +1742,12 @@ class JobService:
         # up the source Job. A successful restart must remain replayable even
         # after a subsequent restart has reused the same name again.
         ref = self._job_ref(job)
+        if summary is not None:
+            if (not isinstance(summary, dict) or set(summary) != {"issue", "fix"}
+                    or any(not isinstance(v, str) or not v.strip() or len(v) > 1000
+                           for v in summary.values())):
+                raise MCPServiceError("summary requires non-empty issue and fix strings, each at most 1000 characters")
+            summary = {k: v.strip() for k, v in summary.items()}
         normalized_overrides = self._restart_overrides(overrides)
         if idempotency_key is None:
             # One source UID can be replaced only once. Repeated requests
@@ -1688,12 +1759,12 @@ class JobService:
             )
         else:
             key = self._idempotency_key(idempotency_key)
-        digest = self._restart_digest(ref, normalized_overrides)
+        digest = self._restart_digest(ref, normalized_overrides, summary)
         operation = self._operations.get("restart", key)
         if operation is not None and operation.request_digest != digest:
             raise IdempotencyConflict(
                 "a different restart is already recorded; retry with the "
-                "original Job reference and overrides"
+                "original Job reference, overrides and summary"
             )
         planned_name = (
             operation.planned_name
@@ -1729,6 +1800,8 @@ class JobService:
             self._force_agent_manifest(
                 manifest, idempotency_tag=tag, previous_uid=ref["uid"],
             )
+            root_uid = str((live.get("metadata", {}).get("annotations") or {}).get(HISTORY_ANNOTATION) or ref["uid"])
+            manifest["metadata"].setdefault("annotations", {})[HISTORY_ANNOTATION] = root_uid
             operation = self._operations.reserve(
                 kind="restart", key=key, request_digest=digest,
                 planned_name=planned_name, namespace=ref["namespace"],
@@ -1742,6 +1815,7 @@ class JobService:
             if operation.created_uid:
                 return self._completed_restart(ref, operation)
             manifest = self._restart_checkpoint(operation, manifest)
+            self._archive_restart(ref, root_uid, summary)
         elif operation is not None:
             # The source was deleted but create (or the MCP process) failed.
             # Recover the exact prepared manifest, not a fresh submission.
@@ -1786,6 +1860,36 @@ class JobService:
         self._operations.mark_created("restart", key, identity["uid"])
         self._clear_restart_checkpoint(key)
         return self._restart_response(ref, identity, created=True, reused=False)
+
+    def _archive_restart(self, ref, root_uid, summary):
+        if self._restart_history.contains(ref["uid"]):
+            return
+        entries = []
+        for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"]):
+            metadata = pod.get("metadata") or {}
+            spec = pod.get("spec") or {}
+            for container in (spec.get("initContainers") or []) + (spec.get("containers") or []):
+                name = str(container.get("name") or "main")
+                statuses = (pod.get("status", {}).get("initContainerStatuses") or []) + (pod.get("status", {}).get("containerStatuses") or [])
+                waiting = next((status.get("state", {}).get("waiting") for status in statuses
+                                if status.get("name") == name and not status.get("restartCount")), None)
+                if waiting is not None:
+                    stdout, stderr, code = "", f"Container did not start: {waiting.get('reason', 'waiting')}", 0
+                else:
+                    result = self._pod_logs(metadata["name"], ref["namespace"], tail=-1,
+                                            container=name, timestamps=True, since_time=None)
+                    stdout, stderr, code = _process_output(result)
+                evicted = (pod.get("status") or {}).get("reason") == "Evicted"
+                if code and not evicted and _pod_phase(pod) in {"Failed", "Succeeded", "Running"}:
+                    raise MCPServiceError(f"Could not archive {metadata['name']}/{name}; restart stopped before deletion: {stderr}")
+                entries.append({
+                    "pod": metadata["name"], "pod_uid": metadata.get("uid") or metadata["name"],
+                    "container": name, "phase": _pod_phase(pod),
+                    "created_at": metadata.get("creationTimestamp") or "",
+                    "stdout": stdout, "stderr": stderr, "returncode": code,
+                    "archived": True, "unavailable": bool(code),
+                })
+        self._restart_history.save(ref, root_uid, summary, entries)
 
     def _completed_restart(self, ref: dict[str, str], operation: _Operation) -> dict:
         self._clear_restart_checkpoint(operation.key)
@@ -1923,9 +2027,9 @@ class JobService:
         (self._state_dir / f"pending-restart-{key}.json").unlink(missing_ok=True)
 
     @staticmethod
-    def _restart_digest(ref: Mapping[str, str], overrides: Mapping[str, Any]) -> str:
+    def _restart_digest(ref: Mapping[str, str], overrides: Mapping[str, Any], summary=None) -> str:
         payload = json.dumps(
-            {"source_uid": ref["uid"], "overrides": overrides},
+            {"source_uid": ref["uid"], "overrides": overrides, **({"summary": summary} if summary is not None else {})},
             sort_keys=True,
             separators=(",", ":"),
             default=str,
@@ -2077,7 +2181,9 @@ class JobService:
             raise MCPServiceError("jobs must be an array of Job references")
         if scheduling_policy not in ("report_blocked", "wait_for_capacity"):
             raise MCPServiceError("scheduling_policy must be report_blocked or wait_for_capacity")
-        refs = [self._job_ref(value) for value in jobs]
+        # Resolving name-only references performs Kubernetes reads. Keep them
+        # off the event loop, then bind this wait to the resolved UIDs.
+        refs = await asyncio.to_thread(lambda: [self._job_ref(value) for value in jobs])
         if cursor is not None and (
             isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0
         ):
@@ -2140,7 +2246,9 @@ class JobService:
             timeout=float(timeout),
             scheduling_policy=scheduling_policy,
         )
-        return await self._enrich_failure_events(result, refs)
+        output = await self._enrich_failure_events(result, refs)
+        output["jobs"] = refs
+        return output
 
     async def _enrich_failure_events(
         self,

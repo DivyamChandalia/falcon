@@ -52,3 +52,23 @@ cluster publishes the `nvidia.com/gpu.memory` label; `null` means unavailable.
 
 Agents should select on `schema_version` and `kind`, then read `data`.
 Human-readable tables are intentionally not a compatibility surface.
+
+The MCP transport uses compact Job references: `{"name": "train"}` resolves
+the latest run, while an optional `uid` selects a specific run. Namespace is
+implicit in Falcon's configuration and omitted from MCP arguments and responses,
+including nested events and continuations. Wait responses return the resolved
+`jobs` references; a continuation preserves those UIDs. CLI JSON retains its
+existing namespace fields.
+
+GPU resource plans can include an additive `scheduling` object. MCP `plan_job`
+returns it under `resource_plan.scheduling`, with requested resources, per-node
+`available`/`capacity`, `shortfall_now`/`shortfall_capacity`, jointly fitting
+alternatives, maximum and recommended allocations, and a `next_action`.
+CPU is expressed in cores, memory in GiB, and GPUs in device counts; allocation
+suggestions use Kubernetes quantity strings. `gpu_limits.max_per_node` and
+`max_free_per_node` are single-node limits, not cluster sums. With no free
+matching GPUs, recommendation/maxima basis is `node_capacity`; otherwise it is
+`currently_available`. Unknown availability is null. These are request-headroom
+snapshots, not measured utilization or reservations. Per-node details are
+limited to 20 and alternatives to 3; `matching_node_count` and `nodes_truncated`
+identify omitted details. Separate CPU/RAM maxima may come from different nodes.

@@ -2,9 +2,40 @@
 
 ## Unreleased
 
+- Fixed MCP waits remaining connected after restart while their Kubernetes
+  watchers had already exited. New waits reconcile current state and restart
+  stopped watchers, including streams closing as a replacement is registered.
+
+- MCP Job references now accept a name alone for the latest run, with an optional
+  UID for a specific run. Namespace comes from Falcon's configuration and is
+  omitted from tool arguments and responses, including events and continuations.
+
+- MCP restarts archive the old Pod logs locally and accept a short issue/fix
+  summary. Dashboard can browse archived attempts beside current logs and shows
+  each supplied summary in a compact scrollable, selectable box below its failed
+  Pod logs. Left/right switches log attempts whenever Selected Job is active.
+  Logs and Issue/Fix have independent cyan selection borders and Tab navigation;
+  drag-select issue/fix text and use Ctrl/Cmd+C to copy it.
+
+- GPU planning now accepts resource-only requests and reports node-specific
+  CPU/RAM/GPU availability, capacity, exact shortfalls, maximum GPU counts,
+  recommendations and same-node alternatives. When GPUs are busy, recommended
+  CPU/RAM uses node capacity rather than current free resources. Impossible
+  CPU/RAM submissions are rejected instead of queueing forever.
+
+- Agent skill now recommends task-sized CPU/RAM requests, using Falcon's
+  node-aware GPU auto-allocation as the baseline and exceeding it only for
+  concrete necessity; lightweight CPU-only checks start at 1 CPU and 1Gi.
+
+- Codex monitoring uses one async MCP call and reattaches to its saved host
+  cell after interruptions; only killed/lost calls are relaunched with the same
+  cursor and settings. Established watches keep recording while the agent
+  answers users; submission remains separate and never auto-starts monitoring.
+  The host wait requests seven days; the MCP wait duration remains internal.
+
 - Fixed same-name MCP restarts hanging on orphan garbage collection. Restart
   deletes the old Job and Pods, then recreates the same name with a new UID.
-  Old logs are not archived. Stuck legacy orphan deletion can be resumed with
+  Stuck legacy orphan deletion can be resumed with
   UID/version guards without removing unrelated finalizers.
 - Fixed stale warnings from a previous Job UID being attributed to a same-name
   replacement after restart.
@@ -16,8 +47,9 @@
   new Pods. Interrupted restarts can be safely resumed with the same source
   reference and arguments.
 
-- Simplified agent monitoring to one synchronous, long-lived MCP wait; removed
-  advice to background the call and end the turn before an event arrives.
+- Codex monitoring can retain one async MCP wait across questions by reattaching
+  with `functions.wait`, without a wake bridge. Claude Code/OpenCode keep
+  report-only background subagents that await events synchronously.
 
 - Fixed MCP GPU/VRAM risk remaining stuck in qualification when real sampling
   intervals do not align exactly with the minimum rolling window.

@@ -46,7 +46,11 @@ class AgentSkillTests(unittest.TestCase):
         self.assertIn("description:", frontmatter)
         self.assertNotIn("allowed-tools:", frontmatter)
         self.assertLessEqual(len(skill.splitlines()), 45)
-        self.assertIn("falcon setup --non-interactive --configure-mcp all", skill)
+        for redundant in (
+            "falcon setup", "CLI is fallback", "interactive shell", "conda activate",
+            "backoffLimit", "restartPolicy", "Coder Jobs", "permissions change", "exact reference/UID",
+        ):
+            self.assertNotIn(redundant, skill)
         for tool in (
             "plan_job", "submit_job", "wait_for_events", "job_logs",
             "job_metrics", "restart_job", "cancel_job",
@@ -54,7 +58,7 @@ class AgentSkillTests(unittest.TestCase):
             self.assertIn(f"`{tool}`", skill)
         self.assertIn("H100/PRO6000 use 75%", skill)
         self.assertIn("A6000/2080Ti use 10%", skill)
-        self.assertIn("seven days", skill)
+        self.assertIn("yield_time_ms=604800000", skill)
         for removed in (
             "falcon h100x2",
             "falcon logs JOB",
@@ -77,6 +81,60 @@ class AgentSkillTests(unittest.TestCase):
         self.assertIn("falcon logs JOB", skill)
         self.assertIn("falcon metrics JOB", skill)
         self.assertNotIn("plan_job", skill)
+
+    def test_skill_explains_job_name_rules_without_renaming_arguments(self):
+        skill = resources.files("falcon.skills").joinpath("falcon/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Job `name`", skill)
+        self.assertIn("1–63 lowercase letters/digits/hyphens", skill)
+        self.assertIn("starting and ending alphanumeric", skill)
+        self.assertIn("replace underscores in the name only, not model arguments or paths", skill)
+
+    def test_skill_sizes_resources_from_task_and_node_aware_baseline(self):
+        skill = resources.files("falcon.skills").joinpath("falcon/SKILL.md").read_text(encoding="utf-8")
+        for guidance in (
+            "Request only CPU and host memory the task needs",
+            "start `plan_job` with GPU model/count only",
+            "node-aware recommended allocation as baseline",
+            "less when sufficient",
+            "Do not hard-code per-GPU CPU/RAM values",
+            "scheduling.gpu_limits.max_per_node",
+            "max_free_per_node",
+            "never sum across nodes",
+            "maxima/recommendations use node capacity",
+            "Only exceed auto-allocation when absolutely necessary",
+            "measured CPU bottlenecks",
+            "GPU VRAM OOM is not evidence for more host RAM",
+            "1 CPU and 1Gi suit trivial checks/smoke tests",
+        ):
+            self.assertIn(guidance, skill)
+
+    def test_skill_keeps_host_specific_monitoring_without_a_wake_bridge(self):
+        skill = resources.files("falcon.skills").joinpath("falcon/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("background report-only subagent", skill)
+        self.assertIn("Claude Code 2.1.212+", skill)
+        self.assertIn("call `wait_for_events` directly in the main conversation", skill)
+        self.assertIn("let Claude Code background the long call", skill)
+        self.assertNotIn("`haiku`", skill)
+        self.assertIn("configured subagent model", skill)
+        self.assertIn("async `wait_for_events` in `functions.exec`", skill)
+        self.assertIn("cursor=0", skill)
+        self.assertIn("monitoring as a separate explicit call", skill)
+        self.assertIn("start one replacement async wait", skill)
+        self.assertIn("same surviving cell", skill)
+        self.assertIn("cursor-based replay", skill)
+        self.assertIn("functions.wait", skill)
+        self.assertIn("yield_time_ms=604800000", skill)
+        self.assertIn("actually killed or lost", skill)
+        self.assertIn("never start duplicate pending waits", skill)
+        self.assertIn("last action of every turn", skill)
+        self.assertIn("unless the user explicitly asks to stop watching", skill)
+        self.assertIn("If asked to stop watching, do not re-arm", skill)
+        self.assertIn("leave the Job running unless separately asked to cancel it", skill)
+        self.assertNotIn("codex queue", skill)
+        self.assertNotIn("finish the foreground turn", skill)
+        with tempfile.TemporaryDirectory() as directory:
+            result = install_skill("claude", home=directory)
+            self.assertEqual({p.name for p in result.path.iterdir()}, {"SKILL.md", METADATA_FILE})
 
     def test_skill_mode_can_switch_between_legacy_and_mcp(self):
         with tempfile.TemporaryDirectory() as directory:

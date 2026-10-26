@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Union
+
+from packaging.version import InvalidVersion, Version
 
 MCP_SERVER_NAME = "falcon"
 MCP_SERVER_COMMAND = ("mcp", "serve")
@@ -20,6 +24,13 @@ _AGENT_EXECUTABLES = {
     "claude": "claude",
     "opencode": "opencode",
 }
+
+# Claude Code automatically backgrounds a long-running main-conversation MCP
+# call starting with this release.  Falcon's direct Claude workflow relies on
+# that client behavior; it does not need the newer server-side task API.
+CLAUDE_MIN_BACKGROUND_VERSION = Version("2.1.212")
+CLAUDE_UPGRADE_COMMAND = "npm install -g @anthropic-ai/claude-code@latest"
+_CLAUDE_VERSION_PATTERN = re.compile(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)")
 
 # wait_for_events defaults to 7 days.  Clients get one extra hour so a
 # normal client-side timeout does not cut off the server's default wait.
@@ -52,6 +63,73 @@ class MCPSetupResult:
 
 class MCPConfigError(ValueError):
     """Raised when a client configuration cannot be safely updated."""
+
+
+def claude_code_mcp_warning(
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    which: Optional[Callable[..., Optional[str]]] = None,
+    runner: Optional[Callable[..., subprocess.CompletedProcess[str]]] = None,
+) -> Optional[str]:
+    """Return a setup warning when Claude cannot background Falcon waits.
+
+    ``None`` means the installed Claude Code version supports Falcon's direct
+    background-wait workflow.  The injectable command helpers keep this
+    diagnostic deterministic in tests and usable by alternate installers.
+    """
+
+    env = os.environ if environ is None else environ
+    find_executable = shutil.which if which is None else which
+    executable = find_executable("claude", path=env.get("PATH", os.defpath))
+    if executable is None:
+        return (
+            "Claude Code was not found on PATH. Install or upgrade it before "
+            "using Falcon's direct background wait workflow: "
+            f"{CLAUDE_UPGRADE_COMMAND}"
+        )
+
+    run = subprocess.run if runner is None else runner
+    try:
+        result = run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return (
+            f"Falcon could not verify the installed Claude Code version ({exc}). "
+            f"Please upgrade Claude Code with: {CLAUDE_UPGRADE_COMMAND}"
+        )
+
+    output = "\n".join(
+        value.strip()
+        for value in (result.stdout or "", result.stderr or "")
+        if value and value.strip()
+    )
+    match = _CLAUDE_VERSION_PATTERN.search(output)
+    if match is None:
+        return (
+            "Falcon could not determine the installed Claude Code version. "
+            f"Please upgrade Claude Code with: {CLAUDE_UPGRADE_COMMAND}"
+        )
+    try:
+        version = Version(match.group(1))
+    except InvalidVersion:
+        return (
+            f"Falcon could not parse the installed Claude Code version ({match.group(1)}). "
+            f"Please upgrade Claude Code with: {CLAUDE_UPGRADE_COMMAND}"
+        )
+
+    if version >= CLAUDE_MIN_BACKGROUND_VERSION:
+        return None
+    return (
+        f"Claude Code {version} is older than {CLAUDE_MIN_BACKGROUND_VERSION}. "
+        "Falcon's direct background wait workflow requires Claude Code "
+        f"{CLAUDE_MIN_BACKGROUND_VERSION} or newer. Upgrade with: "
+        f"{CLAUDE_UPGRADE_COMMAND}."
+    )
 
 
 def _normalize_agent(agent: str) -> str:
@@ -457,6 +535,8 @@ def config_command(
 __all__ = [
     "CLIENT_TOOL_TIMEOUT_MILLISECONDS",
     "CLIENT_TOOL_TIMEOUT_SECONDS",
+    "CLAUDE_MIN_BACKGROUND_VERSION",
+    "CLAUDE_UPGRADE_COMMAND",
     "DEFAULT_EVICTION_STARTUP_SECONDS",
     "DEFAULT_WAIT_TIMEOUT_SECONDS",
     "MAX_EVICTION_STARTUP_SECONDS",
@@ -471,6 +551,7 @@ __all__ = [
     "SUPPORTED_AGENTS",
     "client_config",
     "client_config_path",
+    "claude_code_mcp_warning",
     "config_command",
     "configuration",
     "detected_agents",
