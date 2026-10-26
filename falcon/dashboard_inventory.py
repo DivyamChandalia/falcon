@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -45,6 +47,10 @@ class DashboardInventory:
         self._stop = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._resync_task = None
+        self._list_executor = ThreadPoolExecutor(
+            max_workers=len(RESOURCES),
+            thread_name_prefix="falcon-inventory-list",
+        )
         self._thread = threading.Thread(target=self._run, name="falcon-inventory", daemon=True)
         self._thread.start()
 
@@ -111,8 +117,11 @@ class DashboardInventory:
         if hasattr(self.transport, "list_json"):
             payload = await self.transport.list_json(resource)
         else:
-            payload = await asyncio.to_thread(
-                self.client.list_json, resource, namespace=self.namespace
+            payload = await asyncio.get_running_loop().run_in_executor(
+                self._list_executor,
+                functools.partial(
+                    self.client.list_json, resource, namespace=self.namespace
+                ),
             )
         values = payload.get("items")
         version = (payload.get("metadata") or {}).get("resourceVersion")
@@ -210,6 +219,7 @@ class DashboardInventory:
                 task.cancel()
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
             await self.transport.close()
+            self._list_executor.shutdown(wait=True, cancel_futures=True)
 
     def resync(self):
         async def restart():

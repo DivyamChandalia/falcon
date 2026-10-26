@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import sqlite3
 import stat
@@ -1280,6 +1281,33 @@ class JobService:
             raise MCPServiceError("job reference UID must not be empty")
         return {"name": name.strip(), "namespace": namespace.strip(), "uid": uid.strip()}
 
+    async def _run_blocking(self, function, /, *args, **kwargs):
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        with self._event_lock:
+            if self._closed:
+                raise MCPServiceError("JobService is closed")
+
+            def worker():
+                try:
+                    result_queue.put((True, function(*args, **kwargs)))
+                except BaseException as exc:  # noqa: BLE001 - deliver worker failures
+                    result_queue.put((False, exc))
+
+            threading.Thread(
+                target=worker,
+                name="falcon-mcp-call",
+                daemon=True,
+            ).start()
+        while True:
+            try:
+                succeeded, value = result_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+            if succeeded:
+                return value
+            raise value
+
     def _get_job(self, name: str, namespace: str) -> Mapping[str, Any]:
         value = self.client.get_json("job.batch", name, namespace=namespace)
         if not isinstance(value, Mapping):
@@ -2191,7 +2219,9 @@ class JobService:
             raise MCPServiceError("scheduling_policy must be report_blocked or wait_for_capacity")
         # Resolving name-only references performs Kubernetes reads. Keep them
         # off the event loop, then bind this wait to the resolved UIDs.
-        refs = await asyncio.to_thread(lambda: [self._job_ref(value) for value in jobs])
+        refs = await self._run_blocking(
+            lambda: [self._job_ref(value) for value in jobs]
+        )
         if cursor is not None and (
             isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0
         ):
@@ -2289,7 +2319,7 @@ class JobService:
                 # owned by this exact Job UID; a same-name replacement cannot
                 # pass _job_pods' owner UID filter.
                 try:
-                    owned_pods = await asyncio.to_thread(
+                    owned_pods = await self._run_blocking(
                         self._job_pods,
                         ref["name"],
                         ref["namespace"],
@@ -2318,7 +2348,7 @@ class JobService:
             if delivered_bytes >= 16 * 1024:
                 break
             try:
-                logs = await asyncio.to_thread(
+                logs = await self._run_blocking(
                     self.job_logs,
                     ref,
                     pods=[pod_name.strip()],

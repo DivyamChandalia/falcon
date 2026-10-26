@@ -9,8 +9,9 @@ Falcon chooses eligible GPU nodes, sizes CPU and memory from live capacity,
 carries your working directory and Python environment into the container, and
 provides interactive dashboards for jobs and cluster resources.
 
-New in 0.4.7: Dashboard output search (`Ctrl+F`), wildcard Job deletion with
-`--dry-run`, and compact Resources Job ages.
+New in 0.5.0: agent-managed Jobs through the built-in Falcon MCP server,
+event-driven monitoring, restart history, and live Dashboard monitoring
+indicators.
 See the [changelog](CHANGELOG.md) for details.
 
 ## Quick start
