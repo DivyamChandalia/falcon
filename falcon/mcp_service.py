@@ -3037,12 +3037,29 @@ _LOG_TIMESTAMP = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))(?P<separator>\s+)(?P<message>.*)$"
 )
+_LOG_TIMESTAMP_FRACTION = re.compile(
+    r"\.(?P<fraction>\d+)(?P<zone>Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def _parse_log_timestamp(value: str) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    # Python 3.10 only accepts up to six fractional digits in
+    # datetime.fromisoformat(), while Kubernetes may emit RFC3339Nano with
+    # nine. The cursor key keeps the original nanosecond fraction separately;
+    # this normalization is only for the datetime value used for ordering.
+    normalized = value
+    fraction_match = _LOG_TIMESTAMP_FRACTION.search(normalized)
+    if fraction_match and len(fraction_match.group("fraction")) > 6:
+        normalized = (
+            normalized[:fraction_match.start("fraction")]
+            + fraction_match.group("fraction")[:6]
+            + normalized[fraction_match.end("fraction"):]
+        )
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
