@@ -105,6 +105,7 @@ class AgentSkillTests(unittest.TestCase):
             "measured CPU bottlenecks",
             "GPU VRAM OOM is not evidence for more host RAM",
             "1 CPU and 1Gi suit trivial checks/smoke tests",
+            "maximize GPU compute and VRAM utilization whenever the workload allows",
         ):
             self.assertIn(guidance, skill)
 

@@ -69,6 +69,15 @@ succeeded or failed attempts Falcon loads the equivalent of
 with the newest active Pod selected initially. Captured output is bounded to
 200 lines per Pod and expires from memory after 24 hours.
 
+Logs preserve carriage-return progress updates such as `tqdm` in place. Jobs
+restarted through Falcon's MCP tools also expose archived Pod logs from earlier
+runs through `←`/`→`. These archives live in Falcon's local state; review them
+on the same machine and state directory. When an agent supplies an issue/fix
+summary, a compact scrollable box appears below that failed Pod's logs.
+Click Logs or Issue/Fix to focus and highlight it, or use `Tab`/`Shift+Tab`
+to move between them. Drag-select summary text and press `Ctrl/Cmd+C` to copy
+it. Left/right switches attempts throughout the Selected Job pane.
+
 With the Logs or terminal viewport focused, `Ctrl+F` opens an inline search bar
 for its retained output. Search is literal and case-insensitive, highlights all
 matches, and scrolls to the active match. `Enter` moves to the next match and

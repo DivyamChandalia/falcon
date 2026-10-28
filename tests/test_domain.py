@@ -174,6 +174,28 @@ class PlanningTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_beegfs_new_default_mount_can_be_overridden(self) -> None:
+        for override in (None, [], ["/shared"]):
+            with self.subTest(volumes=override):
+                config = copy.deepcopy(DEFAULT_CONFIG)
+                if override is not None:
+                    config["runtime"]["volumes"] = override
+                manifest = build_job_manifest(
+                    self._request(), plan_cpu_resources("1", "1Gi"), config
+                )
+                pod = manifest["spec"]["template"]["spec"]
+                volumes = {item["name"]: item for item in pod.get("volumes", [])}
+                mounts = pod["containers"][0].get("volumeMounts", [])
+                beegfs = [m for m in mounts if m["mountPath"] == "/media/beegfs-new"]
+                if override is None:
+                    self.assertEqual(len(beegfs), 1)
+                    self.assertEqual(
+                        volumes[beegfs[0]["name"]]["hostPath"]["path"],
+                        "/media/beegfs-new",
+                    )
+                else:
+                    self.assertEqual(beegfs, [])
+
     def _request(self, gpu: GPURequest | None = None) -> JobRequest:
         return JobRequest(
             name="experiment",

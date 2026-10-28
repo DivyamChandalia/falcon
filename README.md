@@ -3,168 +3,127 @@
   <img src="./assets/falcon-logo.png" alt="Falcon spacecraft logo" width="72" height="72" align="right">
 </h1>
 
-Launch and monitor GPU workloads on Kubernetes without writing Job YAML.
+Launch and monitor GPU and CPU workloads on Kubernetes without writing Job YAML.
 
 Falcon chooses eligible GPU nodes, sizes CPU and memory from live capacity,
 carries your working directory and Python environment into the container, and
-provides interactive dashboards for jobs and cluster resources.
+provides interactive dashboards for Jobs and cluster resources. Coding agents
+can plan, launch, and manage Jobs through the built-in MCP server.
 
-New in 0.5.0: agent-managed Jobs through the built-in Falcon MCP server,
-event-driven monitoring, restart history, and live Dashboard monitoring
-indicators.
-See the [changelog](CHANGELOG.md) for details.
+[Quick start](#quick-start) · [Dashboard](#dashboard) · [Resources](#resources) ·
+[Coding agents](#coding-agents) · [Documentation](#documentation)
 
 ## Quick start
 
 You need Python 3.10+, `kubectl`, a working Kubernetes context, and permission
 to inspect cluster resources and create Jobs.
 
-Install Falcon with pip and run the guided setup:
+Install with pip:
 
 ```console
 pip install --user git+https://github.com/DivyamChandalia/falcon.git@main
-falcon setup
 ```
 
-Or, if you use [uv](https://docs.astral.sh/uv/), install Falcon as an isolated
-tool so it does not depend on your project's Python environment:
+Or install as an isolated [uv](https://docs.astral.sh/uv/) tool:
 
 ```console
 uv tool install git+https://github.com/DivyamChandalia/falcon.git@main
-falcon setup
 ```
 
-If uv's tool executables are not on `PATH`, run `uv tool update-shell`, then
-open a new terminal. Update with `falcon update` or
-`uv tool upgrade falcon-k8s`.
-
-Start a named GPU workload, then monitor or stop it:
+Run guided setup, launch a workload, then monitor or stop it:
 
 ```console
+falcon setup
 falcon h100x2 -j experiment -- python train.py
 falcon dashboard
 falcon logs experiment
 falcon kill experiment
 ```
 
-Run `falcon setup` again to review or change the namespace, image, mounts, GPU
-presets, and scheduler. Setup also checks `kubectl`; if it is outside your home
-directory, it asks whether to copy it to `$HOME/.local/bin/kubectl`. This lets
-Coder sessions use `kubectl` and Falcon to schedule Jobs, provided the session
-has a valid kubeconfig and the required Kubernetes permissions. The default
-answer is **Yes**; `--non-interactive` accepts the copy automatically.
-
-If the command is not found after installation, open a new shell or run:
-
-```console
-export PATH="$HOME/.local/bin:$PATH"
-```
+Setup configures your namespace, image, mounts, GPU presets, and scheduler. It
+also offers MCP integration for coding agents. Rerun `falcon setup` whenever
+you want to review or change these settings.
 
 ## Run workloads
 
-Request a GPU preset with an optional count:
+Choose a GPU preset with an optional count, or request CPU and memory explicitly
+for CPU-only work:
 
 ```console
 falcon h100 -- python train.py
 falcon pro6000x2 -j research -- python train.py
+falcon -c 8 -m 32Gi -- python preprocess.py
 ```
 
-Falcon also supports CPU-only workloads and interactive shells:
+Omit the command to open an interactive shell:
 
 ```console
-falcon -c 8 -m 32Gi -- python preprocess.py
 falcon 2080ti
 ```
 
-Useful launch options:
-
-| Option | Use it to |
+| Option | Purpose |
 | --- | --- |
-| `-j NAME` | give the Job a stable name |
-| `-f` | follow logs after submitting |
-| `-c VALUE` | override CPU requests/limits |
-| `-m VALUE` | override memory requests/limits |
-| `--dry-run --output json` | inspect the generated manifest without creating a Job |
-| `--image IMAGE` | choose the runtime image |
+| `-j NAME` | Give the Job a stable name |
+| `-f` | Follow logs after submitting |
+| `-c VALUE` | Override CPU requests/limits |
+| `-m VALUE` | Override memory requests/limits |
+| `--image IMAGE` | Choose the runtime image |
+| `--dry-run --output json` | Preview the manifest without creating a Job |
 
-Bare memory values are interpreted as GiB: `-m 5` means `5Gi`. Request/limit
-pairs are supported, for example `-m 5:8`.
+Bare memory values mean GiB (`-m 5` means `5Gi`). Request/limit pairs such as
+`-m 5:8` are supported. Default GPU presets are `h100` (up to 8), `2080ti`
+(up to 4), `a6000` (up to 2), and `pro6000` (up to 2); configure them through
+setup for your cluster.
 
-The default GPU presets are configurable with `falcon setup`:
+See the [CLI reference](docs/cli.md) for scheduling, Services, and all launch options.
 
-| Preset | Maximum GPUs |
-| --- | ---: |
-| `h100` | 8 |
-| `2080ti` | 4 |
-| `a6000` | 2 |
-| `pro6000` | 2 |
-
-See [CLI reference](docs/cli.md) for all launch options and scheduling
-behavior.
-
-## Monitor jobs
-
-Open the interactive dashboard:
+## Dashboard
 
 ```console
 falcon dashboard
 ```
 
-The Selected Job pane includes live Logs for the selected workload. It follows
-new output, supports scrolling through retained lines, and keeps carriage-return
-progress updates such as `tqdm` on the current line. Use `falcon logs JOB` when
-you want a terminal-only log stream.
+![Falcon Dashboard: full large layout with the selected pcvit Job, live logs, and resources](./assets/falcon-dashboard.svg)
 
-Press `Ctrl+F` while Logs or a terminal is focused to search retained output.
-Matches are highlighted; `Enter`/`Shift+Enter` moves next/previous and `Esc`
-closes search. Searches are literal and case-insensitive.
+Browse Jobs, Kubernetes events, live logs, and resource usage together. The layout
+adapts to your terminal; expand a pane with `Enter` and restore it with `Esc`.
 
-For Jobs restarted through Falcon's MCP tools, `←`/`→` also browses archived
-Pod logs from earlier runs. When the agent supplies an issue/fix summary, a
-small scrollable box appears below that failed Pod's logs. Drag-select the
-issue/fix text and press Ctrl/Cmd+C to copy it. Archives stay in
-Falcon's local state, so review them on the same machine and state directory.
-Click Logs or Issue/Fix to select and highlight that pane; Tab/Shift+Tab also
-moves between them when a summary is present. Left/right switches attempts
-throughout the Selected Job pane.
+- **Logs:** follow output, scroll, drag-select and copy text, or search with
+  `Ctrl+F`. Progress bars such as `tqdm` update in place.
+- **Terminals:** press `Ctrl+T` with Selected Job focused to open a shell in its
+  running Pod. Open multiple terminals, switch with `←`/`→`, and close one with
+  `Ctrl+D`.
+- **Restart history:** browse archived attempts with `←`/`→`. Agent-provided
+  issue/fix summaries appear below the failed attempt's logs when available.
+- **Agent monitoring:** an animated `◴◷◶◵` status symbol identifies Jobs with
+  an active MCP event wait, preserving Pending and eviction-risk colors.
 
-With Selected Job focused, `Ctrl+T` opens an interactive shell in its running
-Pod, inside the Logs area. Press it again for another terminal; `←`/`→` switches
-between logs and terminals. `Ctrl+D` (or `Ctrl+W`) closes the current terminal.
-`Ctrl+C` copies selected text; without a selection it interrupts the shell
-command, not the Job. Use `Alt+←`/`Alt+→` to move the shell cursor.
-The terminal owns typing and Tab completion while focused, shows a cursor, and
-retains up to 200 lines for mouse-wheel scrolling. It uses the same shell startup
-as debug Jobs, loading your rc file when accessible inside the Pod, with a short
-directory-name prompt. Click outside the terminal to restore Dashboard keyboard
-controls. The Copy button copies the active terminal's retained output.
+See [TUI controls](docs/tui.md) for navigation, log copying, terminal controls,
+and restart-history storage.
 
-![Falcon Jobs dashboard: full large view with the selected pcvit Job and live Logs](./assets/falcon-dashboard.svg)
+For inspection from the command line:
 
-For focused inspection, use:
-
-| Command | What it shows |
+| Command | Purpose |
 | --- | --- |
-| `falcon jobs` | current Jobs |
-| `falcon get JOB` | Job details and attempts |
-| `falcon logs JOB` | Job logs |
-| `falcon events JOB` | Kubernetes events |
-| `falcon metrics JOB` | CPU, RAM, GPU, and VRAM metrics |
-| `falcon kill JOB` | remove a Job |
+| `falcon jobs` | List current Jobs |
+| `falcon get JOB` | Inspect details and attempts |
+| `falcon logs JOB` | Read or follow logs |
+| `falcon events JOB` | Inspect Kubernetes events |
+| `falcon metrics JOB` | Inspect CPU, RAM, GPU, and VRAM metrics |
+| `falcon kill JOB` | Remove a Job |
 
-Remove multiple matching Jobs in your configured namespace using quoted patterns:
+Preview and remove multiple Jobs using quoted patterns:
 
 ```console
 falcon kill 'benchmark-*' '*-ascformer-*' --dry-run
 falcon kill 'benchmark-*' '*-ascformer-*'
 ```
 
-`--dry-run` previews targets without deleting anything. Patterns support `*`,
-`?`, and character classes; overlapping matches are deleted once. If any pattern
-matches nothing, the entire command stops without deleting anything. Quote
-patterns to prevent your shell expanding them into local filenames.
+Quote patterns so your shell does not expand them into local filenames. If any
+pattern matches nothing, Falcon stops without deleting anything. See the
+[CLI reference](docs/cli.md) for matching and deletion details.
 
-## Inspect cluster resources
+## Resources
 
 ```console
 falcon resources
@@ -172,106 +131,78 @@ falcon resources
 
 ![Falcon Resources: full combined Nodes and Allocations view](./assets/falcon-resources-allocations.svg)
 
-Resources has two sides on terminals at least `160×30`: **Nodes** on the left
-and **Allocations** on the right. Smaller terminals keep the two views as
-separate pages. In the large layout, click or Tab between individual panes;
-only one is focused at a time. The Nodes/Allocations header selector appears
-only on compact pages, not in combined or individually expanded views.
+Inspect node capacity and consumers alongside allocation history, namespace pies,
+and the Namespace / Workload Allocation table. Terminals at least `160×30` show
+Nodes on the left and Allocations on the right; smaller terminals use separate
+pages. Individual panes can be selected and expanded.
 
-Allocations combines Allocation History, namespace pies, and a hierarchical
-Namespace / Workload Allocation table. The table contains requested GPU,
-memory, and CPU totals for each namespace and its workloads. These are
-Kubernetes scheduler requests, not measured utilization. The chart keeps an
-aspect-correct footprint and the history/allocation areas share the available
-height.
+Allocation values describe Kubernetes scheduler requests. Use Dashboard metrics
+for measured workload utilization.
 
-| Key | Action |
-| --- | --- |
-| `↑` / `↓` | move through the active node, workload, or allocation rows |
-| `←` / `→` | switch Nodes and Allocations below `160×30` |
-| `Tab` / `Shift+Tab` | move between visible panes |
-| `s` | cycle shared sorting: GPU, memory, CPU, namespace |
-| `f` | filter workloads by minimum GPUs, CPU, memory, or namespace |
-| `m` | cycle allocation charts: GPU, memory, CPU |
-| `v` | switch GPU count and VRAM while GPU mode is active |
-| `l` | switch Allocation History between linear and log scale |
-| `Enter` / `Esc` | expand a pane / restore the layout |
+Press `m` to switch GPU, memory, and CPU charts; `v` switches GPU count and VRAM;
+`l` toggles history's log scale. In the allocation table, use `s` to sort and `f`
+to filter by resource requests or namespace.
 
-The `m`, `v`, and `l` controls also work while Selected Node is expanded, so
-the allocation view is ready when you return to it. See [TUI controls](docs/tui.md)
-for responsive layouts, sorting, history, and chart details.
+See [TUI controls](docs/tui.md) for layouts and shortcuts, and
+[resource semantics](docs/resource-semantics.md) for how values are calculated.
 
-## Optional: Coder workspaces
+## Coding agents
 
-Coder integration requires access to a Coder deployment and a compatible
-workspace template. Create a workspace with CPU and memory:
+Falcon includes an MCP server and managed skills for Codex, Claude Code, and
+OpenCode. Run setup and accept the agent integration prompts:
+
+```console
+falcon setup
+```
+
+Agents can plan resource requests, submit Jobs, inspect logs and metrics, and
+wait for meaningful events without repeatedly polling. Failed Jobs can be
+restarted with archived logs and a short issue/fix summary for Dashboard review.
+The MCP client starts the local server using your existing Kubernetes access and
+configured namespace.
+
+For automated setup:
+
+```console
+falcon setup --non-interactive --install-skills codex,claude,opencode --configure-mcp all
+```
+
+The previous CLI-based skill remains available through `--skill-mode legacy`.
+See [coding-agent integration](docs/agents.md) for client configuration,
+monitoring behavior, tool details, and legacy mode.
+
+## Optional Coder workspaces
+
+With access to a Coder deployment and compatible workspace template:
 
 ```console
 falcon coder -c 4:4 -m 8Gi:8Gi
-```
-
-Or use a GPU preset and name it:
-
-```console
 falcon coder pro6000 -j research
 falcon coder research
 ```
 
-Falcon waits for the workspace and prints links for VS Code, Antigravity,
-Cursor, JupyterLab, and the web terminal. See [Coder and agent workflows](docs/agents.md)
-for authentication and workspace requirements.
+Falcon creates or reconnects to the workspace and prints editor, JupyterLab, and
+terminal links. See [Coder workspaces](docs/cli.md#coder-workspaces) for
+authentication and workspace requirements.
 
-## Agent-managed Jobs via MCP
+## Configuration and maintenance
 
-Falcon can expose a local stdio [Model Context Protocol](https://modelcontextprotocol.io/)
-server for coding agents. The MCP support is included in the normal Falcon
-installation; then print the client snippet you need:
+### Settings
 
-```console
-pip install falcon-k8s
-falcon mcp config --agent codex
-falcon mcp config --agent claude
-falcon mcp config --agent opencode
-```
-
-Add the printed snippet to the selected client, or let guided setup configure
-all supported clients automatically by accepting its MCP prompt. For scripts,
-use `falcon setup --non-interactive --configure-mcp all`. Setup only merges
-Falcon's entry and creates a timestamped backup before changing an existing
-file. The server is started as `falcon mcp serve`, uses the user's existing
-kubeconfig and Falcon namespace, and exposes planning,
-submission, inspection, logs, metrics, event waiting, cancellation, and
-restart tools. It does not change client permissions or grant host
-permissions. MCP submissions use idempotency keys; restarts track their source
-Job UID automatically. Event
-waits return a cursor for reuse on the next wait. See [Coder and agent
-workflows](docs/agents.md) for the tool list, legacy-job compatibility,
-long-wait behavior, and job safety rules.
-
-If an agent should keep using Falcon's previous direct-CLI skill instead of
-MCP, install that mode explicitly:
-
-```console
-falcon setup --install-skills codex,claude,opencode --skill-mode legacy
-```
-
-## Configuration
-
-Falcon stores configuration in `~/.falconrc`. The guided setup is the easiest
-way to create or edit it:
+Falcon stores configuration in `~/.falconrc`. Use guided setup to edit it or
+inspect it with `falcon config`:
 
 ```console
 falcon setup
 falcon config
 ```
 
-Common settings include the Kubernetes namespace, runtime image, GPU label,
-resource history, presets, and Coder template. For the full list, see
-[Configuration](docs/configuration.md).
+See [Configuration](docs/configuration.md) for mounts, environments, presets,
+and other settings.
 
-## Shell completion
+### Shell completion
 
-Enable completion for the current shell:
+Enable completion in your shell configuration:
 
 ```console
 eval "$(falcon completion zsh)"  # use bash for Bash
@@ -279,60 +210,60 @@ eval "$(falcon completion zsh)"  # use bash for Bash
 
 Completion includes GPU presets, valid counts, Jobs, and Coder workspaces.
 
-## Update or remove Falcon
+### Updates and removal
 
 ```console
-falcon update
 falcon update --check
-pip uninstall falcon-k8s
+falcon update
 ```
 
-For `uv tool` installations, `falcon update` uses `uv tool upgrade` and
-preserves your installed source, version constraints, and extra dependencies.
-Other installations use pip in Falcon's Python environment. uv must be on
-`PATH` to update a uv-managed installation; Falcon never falls back to pip
-inside a uv tool environment. To remove a uv installation, use
-`uv tool uninstall falcon-k8s` instead of pip.
+Updates print a short What's New summary and refresh existing managed agent
+skills, preserving MCP or legacy mode. See the [changelog](CHANGELOG.md) for full
+release notes.
 
-After a successful update, Falcon prints a short “What’s new” summary from
-the latest changelog entries. If the notes cannot be fetched, the update still
-completes normally.
+For uv installations, `falcon update` uses `uv tool upgrade` and preserves the
+installed source, version constraints, and extras. uv must be on `PATH`. Other
+installations update through pip in Falcon's Python environment.
 
-The updater checks for releases silently on non-interactive commands. Set
-`FALCON_NO_UPDATE_CHECK=1` to disable the interactive update prompt.
+To uninstall, use the command matching your installation:
+
+```console
+pip uninstall falcon-k8s
+# Or, for uv tools:
+uv tool uninstall falcon-k8s
+```
 
 ## Troubleshooting
 
-- **`falcon: command not found`** — open a new shell or add
-  `$HOME/.local/bin` to `PATH`.
-- **Kubernetes access errors** — check
-  `kubectl config current-context` and verify that the context can create Jobs
-  in the configured namespace.
-- **No matching GPU nodes** — compare the configured GPU label and preset with
-  your cluster's node labels and available capacity.
-- **Coder authentication expired** — run `falcon coder WORKSPACE` again to
-  reopen the sign-in flow.
+- **`falcon: command not found`:** open a new shell or add
+  `$HOME/.local/bin` to `PATH`. For uv, run `uv tool update-shell` and reopen
+  your terminal.
+- **Kubernetes access errors:** check `kubectl config current-context` and
+  permissions in your configured namespace.
+- **Falcon cannot schedule from a Coder session:** rerun `falcon setup` and
+  accept its offer to copy `kubectl` into `$HOME/.local/bin` (default Yes).
+  The shared home makes the executable available in Coder; a valid kubeconfig
+  and Kubernetes permissions are still required.
+- **No matching GPU nodes:** check your configured GPU label, presets, and
+  cluster capacity.
+- **Coder authentication expired:** run `falcon coder WORKSPACE` to reopen
+  sign-in.
 
-## More documentation
+## Documentation
 
-- [CLI reference](docs/cli.md)
-- [TUI controls](docs/tui.md)
-- [Configuration](docs/configuration.md)
-- [Resource semantics](docs/resource-semantics.md)
-- [Coder and agent workflows](docs/agents.md)
-- [JSON schema](docs/json-schema.md)
-- [Development](docs/development.md)
-- [Changelog](CHANGELOG.md)
+- **Usage:** [CLI reference](docs/cli.md) · [TUI controls](docs/tui.md)
+- **Setup:** [Configuration](docs/configuration.md) · [Coding agents](docs/agents.md)
+- **Resources:** [Resource semantics](docs/resource-semantics.md) ·
+  [Resource service](docs/resource-service.md)
+- **Project:** [Development](docs/development.md) · [JSON schema](docs/json-schema.md) ·
+  [Changelog](CHANGELOG.md)
 
 ## TODO
 
-- [ ] Show workload age in the Allocations view.
-- [ ] Add a Falcon command for launching bounded agent goal loops as Kubernetes
-  Jobs, with explicit read-only data mounts, a working directory, a selectable
-  Codex/Claude Code/OpenCode CLI, and a user prompt.
-- [ ] Add local-model support through shared vLLM instances so multiple users and
-  agent Jobs can discover and consume hosted models.
-- [ ] Make resource requests aware of Kubernetes Pod eviction policy.
-- [ ] Make it possible to launch workloads as long-running Kubernetes Services.
+- [ ] **Falcon Sandbox:** `falcon sandbox` environments for Codex, Claude Code,
+  and OpenCode to run agent goal loops, with an editable working directory and
+  explicit read-only data mounts.
+- [ ] **Shared vLLM:** discover and use shared model servers across users and
+  agent Jobs.
 
 Falcon is licensed under Apache-2.0. See [NOTICE](NOTICE) for attribution.
