@@ -3431,9 +3431,12 @@ def _bound_failure_log_result(value: Any, budget: int) -> None:
                 entry["stderr_truncated"] = True
             truncated = truncated or stdout_truncated or stderr_truncated
 
-    # In normal use a failure enrichment contains one log entry and is already
-    # below the budget.  The shrink loop handles unusual adapters that return
-    # several entries or oversized diagnostic fields.
+    if truncated or _log_result_size(value) > budget:
+        # Include the marker in the budget rather than adding it afterwards.
+        value["failure_logs_truncated"] = True
+
+    # Every iteration must shrink the payload. Even an ordinary entry's
+    # metadata may exceed the remaining shared budget after earlier failures.
     while _log_result_size(value) > budget:
         candidates = [
             entry
@@ -3457,18 +3460,19 @@ def _bound_failure_log_result(value: Any, budget: int) -> None:
             truncated = True
             continue
         if candidates:
-            value["logs"] = candidates[:1]
-            truncated = True
+            value["logs"] = candidates[:1] if len(candidates) > 1 else []
+            if "count" in value:
+                value["count"] = len(value["logs"])
             continue
-        for field in ("cursors", "count", "failed_only", "job"):
-            if field in value:
-                value.pop(field, None)
-                truncated = True
-                break
+        # Drop oversized metadata/errors too. Keep the truncation marker for
+        # as long as it fits; an empty object is the minimum JSON payload.
+        removable = [key for key in value if key != "failure_logs_truncated"]
+        if removable:
+            value.pop(max(removable, key=lambda key: _log_result_size({key: value[key]})))
+        elif value:
+            value.clear()
         else:
             break
-    if truncated:
-        value["failure_logs_truncated"] = True
 
 
 def _select_metric_row(rows: Any, name: str) -> Any:

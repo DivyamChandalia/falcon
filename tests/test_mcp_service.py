@@ -5,6 +5,8 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +24,43 @@ from falcon.mcp_service import (
     StaleJobReference,
 )
 from falcon.models import NodeResources
+
+
+@pytest.mark.parametrize("payload,budget", [
+    ({"logs": [{"stdout": "", "stderr": "", "reason": "x" * 20000}]}, 16384),
+    ({"logs": [{"pod": "training-pod", "container": "main", "stdout": "", "stderr": ""}]}, 32),
+    ({"logs": [{"stdout": "output" * 1000}, {"stdout": "more" * 1000}],
+      "count": 2, "error": "x" * 2000}, 64),
+    ({"logs": [{"stdout": "output"}], "extra": "x" * 20000}, 2),
+    ({"logs": [{"stdout": "output"}]}, 0),
+])
+def test_failure_log_budget_always_terminates(payload, budget):
+    # A timeout on the asyncio loop cannot interrupt a synchronous spin. Run
+    # the actual shrinker in a child so a regression cannot hang the suite.
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "import json, sys\n"
+            "from falcon.mcp_service import _bound_failure_log_result\n"
+            "value, budget = json.load(sys.stdin)\n"
+            "_bound_failure_log_result(value, budget)\n"
+            "print(json.dumps(value))\n"
+        )],
+        input=json.dumps([payload, budget]), text=True, capture_output=True,
+        timeout=10, check=True,
+    )
+    bounded = json.loads(result.stdout)
+    size = len(json.dumps(bounded, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode())
+    assert size <= max(2, budget)
+    assert bounded.get("failure_logs_truncated") or bounded == {}
+
+
+def test_failure_log_budget_preserves_small_payload():
+    from falcon.mcp_service import _bound_failure_log_result
+
+    payload = {"logs": [{"pod": "failed", "stdout": "failure details", "stderr": ""}], "count": 1}
+    original = copy.deepcopy(payload)
+    _bound_failure_log_result(payload, 16384)
+    assert payload == original
 
 
 def _config() -> dict:

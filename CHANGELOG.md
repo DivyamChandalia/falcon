@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.1 — 2026-10-29
+
+- Fixed an MCP event-loop freeze while preparing failure logs: when log metadata
+  exceeded the remaining response budget, trimming could loop forever, consume
+  a CPU core, and prevent all later tools, cancellations, and watches from
+  progressing. Trimming now drops entries and oversized metadata when necessary
+  and includes its truncation marker in the response budget. Restart your MCP
+  connection after upgrading so the running server uses the fix.
+- Updated MCP and legacy agent skills to encourage maximizing GPU compute and
+  VRAM utilization through workload tuning while keeping CPU and host-memory
+  requests appropriate to the task. The MCP skill explicitly recommends one
+  `wait_for_events` call for multiple Jobs sharing filters and scheduling policy,
+  with a shared cursor for continuation.
+- `falcon update` automatically refreshes existing Falcon-managed skills with
+  this guidance, preserving MCP or legacy mode. User-edited and unmanaged skills
+  remain protected. Run `falcon setup` to install agent integration if you have
+  not configured it yet.
+- Fixed parsing of Kubernetes log timestamps with nanosecond precision on
+  Python 3.10 while retaining precise incremental log cursors.
+- Fresh configurations now include `/media/beegfs-new` as a default mount at the
+  same container path. Existing explicit mount lists remain unchanged; add the
+  path through `falcon setup` if needed.
+- Reorganized the README around installation, workloads, Dashboard, Resources,
+  and coding agents, with detailed controls in the documentation and an updated
+  TODO checklist for Falcon Sandbox and shared vLLM.
+
 ## 0.5.0 — 2026-10-26
 
 This release consolidates the agent-managed Job lifecycle, event-driven
