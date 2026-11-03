@@ -29,6 +29,7 @@ runtime:
   mount_home: false
   home: /home/alice
   volumes:
+    - /media/beegfs-new
     - /shared:/shared
   environment: {}
   python_environment: auto
@@ -78,6 +79,10 @@ coder:
 Volume strings are `HOST_PATH[:MOUNT_PATH]`; paths must be absolute. Dict
 entries can also specify `name`, `host_path`, `mount_path`, `type`, and
 `read_only`.
+
+Fresh configurations include `/media/beegfs-new` at the same container path.
+An explicit `runtime.volumes` list replaces this default; add the path to that
+list to enable it in an existing configuration, or remove it for other clusters.
 
 Normal execution never depends on shell initialization. Completion adds a
 small managed block to bash or zsh startup files, but the executable remains

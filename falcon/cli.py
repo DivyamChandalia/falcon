@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import difflib
+import fnmatch
 import getpass
 import os
 import re
@@ -20,6 +22,7 @@ from . import __version__
 from .agent_skills import (
     detect_agents,
     install_skills,
+    refresh_installed_skills,
     uninstall_skills,
 )
 from .cluster import (
@@ -46,7 +49,7 @@ from .coder import (
     workspace_job_name,
 )
 from .commands import attach, capture_logs, kill, remember_job, target_job, top
-from .completion import COMMAND_ALIASES, shell_script
+from .completion import BASE_COMMANDS, resolve_command, shell_script
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
     DEFAULT_CONFIG,
@@ -258,6 +261,13 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
         if action.dest == "command":
             action.help = "Agent argv after --, or status|resume|stop NAME"
 
+    mcp = sub.add_parser("mcp", help="Structured job tools for coding agents")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    serve = mcp_sub.add_parser("serve", help="Serve MCP tools over stdio")
+    serve.add_argument("--state-dir", help="Private local MCP state directory")
+    mcp_config = mcp_sub.add_parser("config", help="Print client configuration without editing it")
+    mcp_config.add_argument("--agent", required=True, choices=("codex", "claude", "opencode"))
+
     jobs = sub.add_parser("jobs", help="List a bounded set of Jobs")
     jobs.add_argument("--limit", type=int, default=50)
     jobs.add_argument("--status")
@@ -342,7 +352,8 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     killer = sub.add_parser(
         "kill", help="Kill Jobs or remove Coder-owned workspaces"
     )
-    killer.add_argument("jobs", nargs="*")
+    killer.add_argument("jobs", nargs="*", help="Job names or quoted wildcard patterns (*, ?, [abc])")
+    killer.add_argument("--dry-run", action="store_true", help="Preview resolved targets without deleting anything")
     _namespace(killer)
     _output(killer)
 
@@ -444,6 +455,33 @@ def _parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     setup.add_argument("--force", action="store_true")
     setup.add_argument("--non-interactive", action="store_true")
     setup.add_argument("--no-shell", action="store_true")
+    mcp_setup = setup.add_mutually_exclusive_group()
+    mcp_setup.add_argument(
+        "--configure-mcp",
+        nargs="?",
+        const="all",
+        metavar="AGENTS",
+        help=(
+            "Configure Falcon MCP for Codex, Claude Code, and OpenCode; "
+            "optionally pass a comma-separated subset"
+        ),
+    )
+    mcp_setup.add_argument(
+        "--skip-mcp",
+        action="store_true",
+        help="Skip the interactive MCP configuration offer",
+    )
+    setup.add_argument(
+        "--mcp-dry-run",
+        action="store_true",
+        help="Show MCP configuration changes without writing client files",
+    )
+    setup.add_argument(
+        "--skill-mode",
+        choices=("mcp", "legacy"),
+        default="mcp",
+        help="Skill installed for coding agents (default: mcp)",
+    )
     skills = setup.add_mutually_exclusive_group()
     skills.add_argument(
         "--install-skills",
@@ -514,7 +552,7 @@ def _rewrite_shorthand(
     public_commands = {
         "jobs", "get", "events", "logs", "attach", "top", "metrics",
         "kill", "clean", "dashboard", "resources", "coder", "setup",
-        "completion", "config", "update", "shell-init", "sandbox",
+        "completion", "config", "update", "shell-init", "sandbox", "mcp",
     }
     # Falcon 0.1 installed this command in shell startup files. Keep a hidden,
     # output-compatible migration alias so upgrading the executable cannot
@@ -528,12 +566,6 @@ def _rewrite_shorthand(
         )
     if remaining[0] == "delete":
         raise CliError("'falcon delete' was removed; use 'falcon kill JOB'")
-    if remaining[0] in COMMAND_ALIASES:
-        return [
-            *prefix,
-            COMMAND_ALIASES[remaining[0]],
-            *remaining[1:],
-        ]
     if remaining[0] in public_commands or remaining[0] in {"-h", "--help", "--version"}:
         return argv
     resolved = resolve_preset(remaining[0], config)
@@ -548,6 +580,12 @@ def _rewrite_shorthand(
             str(count),
             *remaining[1:],
         ]
+    try:
+        command = resolve_command(remaining[0])
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    if command is not None:
+        return [*prefix, command, *remaining[1:]]
     before_command = (
         remaining[: remaining.index("--")] if "--" in remaining else remaining
     )
@@ -570,6 +608,10 @@ def _rewrite_shorthand(
             else:
                 rewritten.append(token)
         return [*prefix, *rewritten]
+    if not remaining[0].startswith("-"):
+        suggestions = difflib.get_close_matches(remaining[0], BASE_COMMANDS, n=3, cutoff=0.65)
+        if suggestions:
+            raise CliError(f"Unknown command {remaining[0]!r}. Did you mean {', '.join(suggestions)}? Press Tab to complete.")
     return argv
 
 
@@ -1437,10 +1479,32 @@ def _kill_command(
 ) -> int:
     """Delete Coder Jobs through Coder and ordinary Jobs through Kubernetes."""
 
-    targets = list(args.jobs) or [target_job(None)]
+    namespace = _namespace_value(args, config)
+    supplied = list(args.jobs) or [target_job(None)]
+    targets: List[str] = []
+    if any(any(char in name for char in "*?[") for name in supplied):
+        available = sorted({str(job.get("metadata", {}).get("name") or "")
+                            for job in KubernetesClient(namespace).list_jobs().get("items", [])} - {""})
+        for pattern in supplied:
+            matched = [name for name in available if fnmatch.fnmatchcase(name, pattern)]
+            if not matched:
+                raise CliError(f"no Jobs match {pattern!r} in namespace {namespace}; nothing deleted", EXIT_NOT_FOUND)
+            targets.extend(matched)
+    else:
+        targets = supplied
+    targets = list(dict.fromkeys(targets))
+    if getattr(args, "dry_run", False):
+        if args.output == "json":
+            print(dumps("KillResult", {"jobs": targets, "killed": False, "dry_run": True}))
+        else:
+            print(f"Dry run: {len(targets)} target(s) in namespace {namespace}; nothing deleted")
+            for target in targets:
+                owner = "Coder workspace deletion" if target.startswith("coder-") else "Kubernetes Job deletion"
+                print(f"  {target} ({owner})")
+        return 0
     deleted_workspaces, ordinary_jobs = _delete_job_targets(
         targets,
-        _namespace_value(args, config),
+        namespace,
         config,
     )
 
@@ -1913,17 +1977,21 @@ def _resources_command(
 
 
 def _skills_setup(args: argparse.Namespace) -> int:
+    skill_mode = getattr(args, "skill_mode", "mcp")
     operations = []
     if args.uninstall_skills:
         operations = uninstall_skills(args.uninstall_skills)
     elif args.install_skills:
-        operations = install_skills(args.install_skills, force=True)
+        operations = install_skills(
+            args.install_skills, force=True, mode=skill_mode
+        )
     elif not args.skip_skills and not args.non_interactive:
         detected = detect_agents()
         if detected:
             default = ",".join(detected)
+            skill_label = "MCP-first" if skill_mode == "mcp" else "legacy CLI"
             print(
-                "WARNING: Installing the Falcon skill may increase coding-agent "
+                f"WARNING: Installing the {skill_label} Falcon skill may increase coding-agent "
                 "and tool usage, and allows agents to launch CPU/GPU workloads "
                 "on your Kubernetes cluster."
             )
@@ -1932,7 +2000,9 @@ def _skills_setup(args: argparse.Namespace) -> int:
                 f"[{default}] (comma-separated, 'none' to skip): "
             ).strip()
             if response.lower() not in {"none", "no", "skip"}:
-                operations = install_skills(response or detected, force=True)
+                operations = install_skills(
+                    response or detected, force=True, mode=skill_mode
+                )
     conflict = False
     for operation in operations:
         print(f"Skill {operation.agent}: {operation.status} ({operation.path})")
@@ -2033,6 +2103,119 @@ def _setup_kubectl_for_coder(*, non_interactive: bool) -> None:
     )
 
 
+def _confirm_claude_mcp_compatibility(
+    agents: Optional[list[str]],
+    *,
+    all_agents: bool,
+    non_interactive: bool,
+) -> bool:
+    """Warn before configuring Claude Code without direct background waits."""
+
+    from .mcp_config import claude_code_mcp_warning
+
+    selected = all_agents or (
+        agents is not None
+        and any(str(agent).strip().lower() == "claude" for agent in agents)
+    )
+    if not selected:
+        return True
+    warning = claude_code_mcp_warning()
+    if warning is None:
+        return True
+
+    print(f"Warning: {warning}", file=sys.stderr)
+    if non_interactive:
+        return True
+    answer = input(
+        "Continue configuring Falcon MCP without upgrading Claude Code? [y/N]: "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        return True
+    print(
+        "MCP configuration skipped. Upgrade Claude Code and rerun falcon setup.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _setup_mcp_clients(args: argparse.Namespace, config_path: Optional[str]) -> int:
+    """Offer or perform the one-time MCP client configuration from setup."""
+
+    if args.skip_mcp:
+        return 0
+
+    from .mcp_config import MCPConfigError, detected_agents, setup_configs
+
+    requested = args.configure_mcp
+    if requested is None:
+        if getattr(args, "skill_mode", "mcp") == "legacy":
+            print(
+                "Legacy CLI skill selected; MCP configuration was skipped. "
+                "Use --configure-mcp explicitly if both are wanted."
+            )
+            return 0
+        # Non-interactive setup must remain safe for scripts and CI: explicit
+        # --configure-mcp is required before editing agent-owned files.
+        if args.non_interactive:
+            return 0
+        agents = detected_agents()
+        if not agents:
+            print(
+                "No supported coding-agent installation was detected; MCP "
+                "configuration was skipped. Use --configure-mcp all to force it."
+            )
+            return 0
+        labels = ", ".join(
+            {"codex": "Codex", "claude": "Claude Code", "opencode": "OpenCode"}[agent]
+            for agent in agents
+        )
+        print(
+            "Falcon can configure its MCP server for "
+            f"{labels}. The server will be started automatically by the agent."
+        )
+        answer = input(
+            "Configure Falcon MCP in the detected agent settings? [Y/n]: "
+        ).strip().lower()
+        if answer in {"n", "no"}:
+            print("Skipped MCP configuration.")
+            return 0
+    elif requested.strip().lower() == "all":
+        agents = None
+        all_agents = True
+    else:
+        agents = [item.strip() for item in requested.split(",") if item.strip()]
+        all_agents = False
+
+    # The interactive detected-client path reaches here with ``agents`` set;
+    # the explicit ``all`` path uses all supported clients.
+    if requested is None:
+        all_agents = False
+    if not _confirm_claude_mcp_compatibility(
+        agents,
+        all_agents=all_agents,
+        non_interactive=args.non_interactive,
+    ):
+        return 0
+    try:
+        results = setup_configs(
+            agents,
+            all_agents=all_agents,
+            config_path=config_path,
+            dry_run=args.mcp_dry_run,
+        )
+    except (MCPConfigError, ValueError, OSError) as exc:
+        print(f"Warning: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if not results:
+        print("No MCP client configuration was changed.")
+        return 0
+    for result in results:
+        suffix = f" (backup: {result.backup})" if result.backup else ""
+        print(f"MCP {result.agent}: {result.status} ({result.path}){suffix}")
+    return 0
+
+
 def _update_command(args: argparse.Namespace) -> int:
     """Check for or install the latest Falcon release."""
 
@@ -2062,6 +2245,17 @@ def _update_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_UPDATE
+    try:
+        skill_operations = refresh_installed_skills()
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A skill refresh must never turn a successful package upgrade into a
+        # failed Falcon update; the user can retry it with ``falcon setup``.
+        print(f"Warning: could not refresh agent skills: {exc}", file=sys.stderr)
+        skill_operations = []
+    for operation in skill_operations:
+        print(f"Skill {operation.agent}: {operation.status} ({operation.path})")
+        if operation.detail:
+            print(f"  {operation.detail}", file=sys.stderr)
     print("Falcon updated. Start a new shell or rerun the command.")
     try:
         changelog_version, entries = latest_changelog()
@@ -2080,7 +2274,7 @@ def _update_command(args: argparse.Namespace) -> int:
 def _maybe_auto_update(command_name: str, args: argparse.Namespace) -> None:
     """Offer a daily update only for interactive, human-facing commands."""
 
-    if command_name in {"completion", "config", "setup", "update"}:
+    if command_name in {"completion", "config", "setup", "update", "mcp"}:
         return
     if getattr(args, "output", None) == "json":
         return
@@ -2137,6 +2331,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     raise CliError("usage: falcon sandbox status|resume|stop NAME")
                 return manage_session(*args.command, output=args.output)
             return launch_session(args, config)
+        if args.command_name == "mcp":
+            if args.mcp_command == "config":
+                from .mcp_config import claude_code_mcp_warning, render_config
+
+                if args.agent == "claude":
+                    warning = claude_code_mcp_warning()
+                    if warning is not None:
+                        print(f"Warning: {warning}", file=sys.stderr)
+
+                print(render_config(args.agent, config_path=config_arg))
+                return 0
+            try:
+                from .mcp_server import serve as serve_mcp
+            except ImportError as exc:
+                raise CliError(
+                    "MCP dependencies are unavailable; reinstall Falcon with "
+                    "'pip install --force-reinstall falcon-k8s' "
+                    "(uv tool users: uv tool install --force falcon-k8s)"
+                ) from exc
+            serve_mcp(config, state_dir=args.state_dir)
+            return 0
         if args.command_name == "jobs":
             return _jobs_command(args, config)
         if args.command_name == "get":
@@ -2191,9 +2406,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if rc:
                 print(f"Completion: {rc}")
             _setup_kubectl_for_coder(non_interactive=args.non_interactive)
+            mcp_code = _setup_mcp_clients(args, config_arg)
             skills_code = _skills_setup(args)
             _print_setup_welcome()
-            return skills_code
+            return mcp_code or skills_code
         if args.command_name == "completion":
             shell = args.shell or detect_shell()[0]
             print(shell_script(shell, config=config), end="")

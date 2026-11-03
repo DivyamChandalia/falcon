@@ -216,9 +216,10 @@ class UpdateTests(unittest.TestCase):
         with patch("falcon.cli.install_update", return_value=0), patch(
             "falcon.cli.latest_changelog",
             return_value=("0.4.4", ("Added a concise update summary.",)),
-        ), redirect_stdout(output):
+        ), patch("falcon.cli.refresh_installed_skills", return_value=[]) as refresh, redirect_stdout(output):
             code = main(["update"])
         self.assertEqual(code, 0)
+        refresh.assert_called_once_with()
         self.assertIn("What's new in Falcon 0.4.4:", output.getvalue())
         self.assertIn("Added a concise update summary.", output.getvalue())
 

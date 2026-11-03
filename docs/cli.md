@@ -72,8 +72,18 @@ last successful launch or inspected target when available.
 
 ```text
 falcon kill JOB [JOB...]
+falcon kill 'benchmark-*' '*-ascformer-*' --dry-run
 falcon clean
 ```
+
+`kill` accepts exact names and shell-style wildcard patterns (`*`, `?`, `[abc]`),
+resolved against Jobs in the selected namespace. Quote patterns; shells may
+expand unquoted globs locally or reject unmatched globs before Falcon runs.
+All patterns resolve before deletion; an unmatched argument aborts a wildcard
+command without deleting anything. Overlapping targets are deduplicated.
+`--dry-run` prints the resolved targets and their deletion route without mutation
+or Coder authentication; `--output json` includes `dry_run: true` and `killed: false`.
+Without arguments, the existing last-Job behavior is retained, including in dry-run.
 
 `falcon kill` recognizes Coder-owned Job names in the form
 `coder-<current-user>-<workspace>`. It submits Coder's native workspace delete
@@ -144,12 +154,25 @@ than attempting to scrape either dashboard.
 ## Setup
 
 ```text
-falcon setup [--non-interactive] [--no-shell]
+falcon setup [--non-interactive] [--no-shell] [--configure-mcp [AGENTS]]
+             [--skill-mode mcp|legacy]
 falcon setup --install-skills codex,claude,opencode
 falcon setup --uninstall-skills codex
 falcon completion [bash|zsh]
 falcon config
 ```
+
+Interactive setup offers to configure Falcon's MCP server for detected Codex,
+Claude Code, and OpenCode installations. Use
+`falcon setup --non-interactive --configure-mcp all` to configure all three
+without prompting, `--mcp-dry-run` to preview changes, or `--skip-mcp` to
+skip the offer. Existing client files are merged safely and backed up before
+they are changed.
+
+The MCP-first skill is the default. Use
+`falcon setup --install-skills codex,claude,opencode --skill-mode legacy` to
+retain the previous direct-CLI skill; legacy mode skips MCP configuration
+unless `--configure-mcp` is explicitly supplied.
 
 `falcon setup` detects the active `kubectl`. When the executable is installed
 outside the user's home directory, setup copies it to
@@ -172,7 +195,9 @@ falcon update --check
 the official `DivyamChandalia/falcon` GitHub repository. A virtualenv or Conda
 environment is updated in place; a system interpreter uses the user site and
 does not request administrator access. After a successful update, Falcon
-prints up to three short entries from the latest `CHANGELOG.md` section. If
+refreshes existing Falcon-managed agent skills in their recorded mode (MCP or
+legacy) without installing new skills or overwriting edited copies, and prints
+up to three short entries from the latest `CHANGELOG.md` section. If
 the changelog cannot be fetched, the update still succeeds. `--check` only
 compares the installed semantic version with the version declared on the
 repository's `main` branch.
@@ -187,14 +212,30 @@ or operation failure, `4` object not found, `5` safe-install conflict, `6`
 Coder API/configuration failure, `7` update check/install failure, and `130`
 interrupted.
 
-## Short aliases
+## Partial commands and completion
 
-`j` jobs, `g` get, `e` events, `l` logs, `a` attach, `t` top, `m` metrics,
-`k` kill, `c` clean, `d` dashboard, `r` resources, and `s` setup. Completion
-shows base GPU presets first; after a GPU preset, the next Tab completes only
+Every top-level command accepts any unambiguous prefix: `falcon dash`,
+`falcon res`, `falcon l`, and `falcon k` mean `dashboard`, `resources`, `logs`,
+and `kill`. Full names always work. Ambiguous prefixes require more letters:
+`c` matches clean, coder, config, and completion; `m` matches metrics and mcp.
+This replaces the former fixed one-letter aliases for `c` and `m`.
+
+Tab expands prefixes and corrects command misspellings in Bash and Zsh:
+`falcon dasboard<Tab>` becomes `falcon dashboard`, and
+`falcon resoures<Tab>` becomes `falcon resources`. Prefix matches take priority;
+otherwise completion offers the closest command names or prefixes within two
+edits for words of at least four characters. Unfinished typos work too:
+`falcon resuo<Tab>` completes to `falcon resources`. Typed misspellings show suggestions and do not
+execute automatically. Job names, paths, GPU presets, and commands after `--`
+are not fuzzily rewritten. Reload completion after updating:
+
+```console
+eval "$(falcon completion zsh)"  # use bash for Bash
+```
+
+Completion shows base GPU presets first; after a GPU preset, Tab completes only
 the counts allowed by that preset (`h100x2` through `h100x8`, `2080tix2`
 through `2080tix4`, and `a6000x2`/`pro6000x2`). `falcon coder <Tab>` lists only
 short workspace names read from
 live Coder Job labels—for example, `falcon` or `lime-gull-30`—and no presets or
-options. One-letter aliases remain accepted but are intentionally omitted from
-completion suggestions.
+options. Command suggestions show full names.

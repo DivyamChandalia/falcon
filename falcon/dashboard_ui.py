@@ -31,11 +31,13 @@ from textual.css.query import NoMatches
 from textual.geometry import NULL_OFFSET, Offset, Region, Size
 from textual.layout import ArrangeResult, Layout, WidgetPlacement
 from textual.layouts.vertical import VerticalLayout
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Button, Input, RichLog, Static
 
+from .agent_presence import connected_jobs
 from .dashboard import (
     KUBERNETES_USAGE_SECONDS,
     JobEvent,
@@ -54,6 +56,8 @@ from .dashboard_terminal import (
     TerminalSession,
     exec_command,
 )
+from .output_search import highlight_strip
+from .output_search import matches as output_matches
 from .planning import GPU_MODEL_DISPLAY_ORDER, canonical_gpu
 from .theme import (
     BACKGROUND,
@@ -71,6 +75,21 @@ from .theme import (
     YELLOW,
     configure_color,
 )
+
+
+class InventoryChanged(Message):
+    """Coalesced wakeup from the namespace watch thread."""
+
+
+AGENT_PRESENCE_REFRESH_SECONDS = 1.0
+
+
+class AgentPresenceChanged(Message):
+    """Local wait leases changed independently of Kubernetes inventory."""
+
+    def __init__(self, uids: Set[str]) -> None:
+        super().__init__()
+        self.uids = uids
 
 
 def _restart_job_manifest(job: Dict, new_name: str, namespace: str) -> Dict:
@@ -188,7 +207,7 @@ RESOURCE_PANE_HEIGHT = 6
 # selected/mark indicator are both rendered in full.
 JOBS_MARK_WIDTH = 6
 JOBS_STATUS_WIDTH = 15  # ``● Eviction risk``
-JOBS_ACTIVE_POD_WIDTH = 13  # ``No active pod``
+JOBS_ACTIVE_POD_WIDTH = 13  # Keep the fixed column wide enough for pod states.
 JOBS_NODE_WIDTH = 12
 JOBS_GPU_WIDTH = 9  # ``pro6000x2``
 JOBS_RESTARTS_WIDTH = 8
@@ -200,6 +219,16 @@ def _display_log_line(value: str) -> str:
     """Keep pathological single-line output from dominating Rich layout."""
 
     return _truncate(value, MAX_DISPLAY_LOG_LINE_CHARS)
+
+
+NO_ACTIVE_POD = "—"
+
+
+def _active_pod_state_display(value: str) -> str:
+    """Use a compact marker when a Job has no current Pod attempt."""
+
+    state = str(value or "").strip()
+    return NO_ACTIVE_POD if not state or state.casefold() == "no active pod" else state
 
 
 class DashboardBodyLayout(Layout):
@@ -434,8 +463,21 @@ def _status_style(status: str) -> Tuple[str, str]:
     return ("●", PALETTE.warning)
 
 
-def _job_status_display(row: JobUsage) -> Tuple[str, str, str]:
+def _job_status_display(row: JobUsage, spinner: int = 0) -> Tuple[str, str, str]:
     """Return icon, label, and color for the Jobs-table status cell."""
+    if row.agent_managed:
+        state = row.agent_state.strip().lower()
+        status = row.status.strip().lower()
+        if status in {"failed", "unknown"}:
+            return "✕", row.status, PALETTE.danger
+        if state == "fixing" and status not in {"running", "succeeded"}:
+            return "↻", "Fixing", PALETTE.warning
+        if status in {"succeeded", "completed"}:
+            return "✓", row.status, PALETTE.success
+        if state == "connected":
+            if row.at_risk:
+                return "◴◷◶◵"[spinner % 4], "Eviction risk", PALETTE.warning
+            return "◴◷◶◵"[spinner % 4], row.status, _status_style(row.status)[1]
     if row.at_risk:
         return "●", "Eviction risk", PALETTE.warning
     icon, color = _status_style(row.status)
@@ -496,6 +538,8 @@ class SelectedJobScroll(RichLog):
     # and the Pod arrows) handle keys instead of VerticalScroll's generic
     # bindings, which would bypass the selected-section state.
     BINDINGS = []
+    search_query = ""
+    search_match = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(
@@ -844,6 +888,9 @@ class SelectedJobScroll(RichLog):
             scroll_x,
             self.scrollable_content_region.width,
         ).apply_style(self.rich_style)
+        if self.search_query and 0 <= content_y < len(self.lines):
+            strip = highlight_strip(strip, self.lines[content_y].text,
+                                    self.search_query, content_y, scroll_x, self.search_match)
         selection = self._manual_selection
         if selection is None:
             selection = self.text_selection
@@ -1055,6 +1102,38 @@ class SelectedJobScroll(RichLog):
         self._notify_scroll_position()
 
 
+class RestartSummaryScroll(SelectedJobScroll):
+    """Scrollable, selectable issue/fix excerpt below its archived logs."""
+
+    def set_summary(self, summary: str) -> None:
+        self.display = bool(summary)
+        self.replace_content(summary, tuple(summary.splitlines()), follow=False)
+        self._fit_summary()
+
+    def _fit_summary(self) -> None:
+        width = max(1, self.size.width - 5)
+        lines = sum(max(1, len(Text(line).wrap(self.app.console, width))) for line in self._source_lines)
+        self.styles.height = min(4, max(1, lines)) + 2
+
+    def on_resize(self, event: events.Resize) -> None:
+        super().on_resize(event)
+        self._fit_summary()
+
+    def on_key(self, event: events.Key) -> None:
+        movement = {"up": -1, "down": 1, "pageup": -3, "pagedown": 3}
+        if event.key in movement:
+            self.scroll_relative(y=movement[event.key], animate=False)
+            event.stop()
+            event.prevent_default()
+        elif event.key in {"home", "end"}:
+            if event.key == "home":
+                self.scroll_home(animate=False)
+            else:
+                self.scroll_end(animate=False)
+            event.stop()
+            event.prevent_default()
+
+
 class SelectedCommandRow(Horizontal):
     """A non-selectable command label with a value-column copy button."""
 
@@ -1100,10 +1179,15 @@ class SelectedJobInspector(Container):
                 compact=True,
                 flat=True,
             )
+        with Horizontal(id="output-search-bar"):
+            yield Input(placeholder="Find output · Enter next · Shift+Enter previous · Esc close", id="output-search-input")
+            yield Static("0 matches", id="output-search-count")
         yield SelectedJobScroll(id="selected-logs-scroll")
+        yield RestartSummaryScroll(id="selected-restart-summary")
         yield DashboardTerminal(id="selected-terminal")
 
     def clear(self, message: str = "No Job selected") -> None:
+        self.query_one("#selected-restart-summary", RestartSummaryScroll).set_summary("")
         self.query_one("#selected-details-left", Static).update(
             Text(message, style=MUTED)
         )
@@ -1123,8 +1207,12 @@ class SelectedJobInspector(Container):
         *,
         logs_collapsed: bool,
         attempt_label: str,
+        restart_summary: str = "",
     ) -> None:
         left_details, right_details = detail_columns
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        summary.border_title = " ISSUE / FIX "
+        summary.set_summary(restart_summary)
         self.query_one("#selected-details-left", Static).update(left_details)
         self.query_one("#selected-details-right", Static).update(right_details)
         self.update_logs(
@@ -1132,6 +1220,13 @@ class SelectedJobInspector(Container):
             logs_collapsed=logs_collapsed,
             attempt_label=attempt_label,
         )
+
+    def update_details(self, detail_columns) -> None:
+        """Refresh metadata without rebuilding the log viewport."""
+
+        left_details, right_details = detail_columns
+        self.query_one("#selected-details-left", Static).update(left_details)
+        self.query_one("#selected-details-right", Static).update(right_details)
 
     def update_logs(
         self,
@@ -1548,6 +1643,9 @@ Static, Input, Container {{ background: {BACKGROUND}; }}
 #summary {{ height: 2; color: {WHITE}; border-bottom: solid {BORDER}; padding: 0 1; }}
 #controls {{ height: 1; color: {GRAY}; padding: 0 1; }}
 #search-input {{ height: 1; display: none; border: none; padding: 0 1; color: {WHITE}; }}
+#output-search-bar {{ display: none; height: 1; }}
+#output-search-input {{ width: 1fr; height: 1; border: none; padding: 0; }}
+#output-search-count {{ width: 16; height: 1; color: {CYAN}; }}
 #dashboard-body {{ width: 1fr; height: 1fr; }}
 DashboardPane {{ border: solid {BORDER}; background: {BACKGROUND}; color: {WHITE}; padding: 0 1; scrollbar-visibility: hidden; }}
 DashboardPane:focus {{ border: solid {CYAN}; }}
@@ -1577,6 +1675,8 @@ SelectedJobScroll:focus {{ border: solid {CYAN}; }}
 SelectedJobScroll.selected {{ border: solid {CYAN}; }}
 #selected-logs-scroll {{ width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
 #selected-logs-scroll.collapsed {{ height: 4; min-height: 4; max-height: 4; }}
+#selected-restart-summary {{ display: none; width: 1fr; height: 4; min-height: 3; max-height: 6; border: solid {BORDER}; padding: 0 1; scrollbar-size-vertical: 1; }}
+#selected-logs-scroll:focus, #selected-logs-scroll.selected, #selected-restart-summary:focus, #selected-restart-summary.selected {{ border: solid {CYAN}; }}
 #selected-terminal {{ display: none; width: 1fr; height: 1fr; min-height: 3; border: solid {BORDER}; padding: 0 1; overflow-x: hidden; overflow-y: auto; scrollbar-size-vertical: 1; background: {BACKGROUND}; color: {WHITE}; }}
 #selected-terminal:focus {{ border: solid {CYAN}; }}
 #selected-terminal-screen {{ width: 1fr; height: auto; }}
@@ -1599,6 +1699,8 @@ class FalconDashboard(App):
         Binding("super+c", "copy_or_quit", "Copy or quit", show=False, priority=True),
         Binding("tab", "next_pane", "Next pane", priority=True),
         Binding("ctrl+t", "new_terminal", "New terminal", show=False, priority=True),
+        Binding("ctrl+f", "find_output", "Find output", show=False, priority=True),
+        Binding("shift+enter", "previous_output_match", "Previous match", show=False, priority=True),
         Binding("ctrl+w", "close_terminal", "Close terminal", show=False, priority=True),
         Binding("ctrl+d", "close_terminal", "Close terminal", show=False, priority=True),
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
@@ -1696,9 +1798,18 @@ class FalconDashboard(App):
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
         self.event_search = ""
+        self._output_search_target = None
+        self._output_matches = []
+        self._output_match_index = -1
         self.histories: Dict[str, Deque[MetricPoint]] = {}
         self.summary_history: Deque[MetricPoint] = deque(maxlen=120)
         self._refreshing = False
+        self._inventory_notification_lock = threading.Lock()
+        self._inventory_notification_pending = False
+        self._inventory_unsubscribe = None
+        self._presence_stop = threading.Event()
+        self._presence_thread = None
+        self._last_api_error = None
         self._stale = False
         self._spinner = 0
         self._result_queue = __import__("queue").Queue(maxsize=1)
@@ -1713,6 +1824,9 @@ class FalconDashboard(App):
         self._resource_pane_scroll_callback_pending = False
         self._building_expanded_resource = False
         self._selected_log_view_key: Optional[Tuple[str, str, int]] = None
+        self._selected_detail_cache: Optional[
+            Tuple[str, List[Tuple[str, str]], List[Tuple[str, str]]]
+        ] = None
         self._jobs_render_pending = False
         self._selection_render_pending = False
 
@@ -1752,6 +1866,11 @@ class FalconDashboard(App):
             scroll_visible=False,
         )
         self._apply_layout()
+        self._start_presence_monitor()
+        source = getattr(self.collector, "inventory_source", None)
+        if source is not None:
+            self._inventory_unsubscribe = source.subscribe(self._inventory_changed)
+            self._inventory_changed()
         self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
@@ -1766,6 +1885,9 @@ class FalconDashboard(App):
         self._render_all()
 
     def on_unmount(self) -> None:
+        self._presence_stop.set()
+        if self._inventory_unsubscribe:
+            self._inventory_unsubscribe()
         for sessions in self._terminals.values():
             for session in sessions:
                 session.close()
@@ -1774,6 +1896,45 @@ class FalconDashboard(App):
         close = getattr(self.collector, "close", None)
         if close:
             close()
+
+    def _start_presence_monitor(self) -> None:
+        namespace = getattr(self.collector, "namespace", None)
+        if not namespace:
+            return
+        context = getattr(self.collector, "context", None)
+
+        def monitor():
+            previous = None
+            while not self._presence_stop.is_set():
+                uids = connected_jobs(context, namespace)
+                if uids != previous and not self._presence_stop.is_set():
+                    self.post_message(AgentPresenceChanged(uids))
+                    previous = uids
+                if self._presence_stop.wait(AGENT_PRESENCE_REFRESH_SECONDS):
+                    break
+
+        self._presence_thread = threading.Thread(
+            target=monitor, name="falcon-dashboard-presence", daemon=True,
+        )
+        self._presence_thread.start()
+
+    def on_agent_presence_changed(self, message: AgentPresenceChanged) -> None:
+        changed = set()
+        for row in self.rows:
+            if not row.agent_managed or row.status.lower() in {
+                "failed", "unknown", "succeeded", "completed",
+            }:
+                continue
+            state = "connected" if row.uid in message.uids else "disconnected"
+            if state != row.agent_state:
+                row.agent_state = state
+                changed.add(row.uid)
+        if not changed:
+            return
+        self._render_jobs(layout=False)
+        selected = self._selected_row()
+        if selected is not None and selected.uid in changed:
+            self._render_selected_status()
 
     def on_resize(self, event: events.Resize) -> None:
         # Some terminal backends dispatch Resize before Textual commits the
@@ -1811,9 +1972,25 @@ class FalconDashboard(App):
         self._spinner = (self._spinner + 1) % 4
         try:
             self._render_header()
+            # Repaint only the Jobs table while an agent-owned workload is
+            # active. Keep the selected-job status in sync without making the
+            # log/metrics panes redraw on every frame.
+            if any(self._agent_is_connected(row) for row in self.filtered_rows):
+                self._render_jobs(layout=False)
+                selected = self._selected_row()
+                if selected is not None and self._agent_is_connected(selected):
+                    self._render_selected_status()
         except Exception:
             # A timer may race with Textual tearing down the default screen.
             return
+
+    @staticmethod
+    def _agent_is_connected(row: JobUsage) -> bool:
+        """Animate nonterminal Jobs with an active wait_for_events lease."""
+        return (
+            row.agent_managed and row.agent_state == "connected"
+            and row.status.strip().lower() not in {"failed", "unknown", "succeeded", "completed"}
+        )
 
     def pane_focused(self, pane: str) -> None:
         self.state.focused_pane = pane
@@ -2043,6 +2220,50 @@ class FalconDashboard(App):
         ram = _percent(sum(row.memory_used_gib for row in self.rows), sum(row.memory_requested_gib for row in self.rows))
         self.summary_history.append(MetricPoint(time.time(), gpu, None, cpu, ram))
 
+    def _inventory_changed(self) -> None:
+        with self._inventory_notification_lock:
+            if self._inventory_notification_pending:
+                return
+            self._inventory_notification_pending = True
+        self.post_message(InventoryChanged())
+
+    def on_inventory_changed(self, message: InventoryChanged) -> None:
+        self.set_timer(0.1, self._flush_inventory)
+
+    def _flush_inventory(self) -> None:
+        with self._inventory_notification_lock:
+            self._inventory_notification_pending = False
+        if not self.is_mounted:
+            return
+        previous_uid = self.state.cursor_job_uid
+        previous_events = self.job_events
+        previous_stale = self._stale
+        rows = self.collector.collect_inventory()
+        rows_changed = rows != self.rows
+        self.rows = rows
+        self.state.marked_job_uids.intersection_update(row.uid for row in self.rows)
+        self._filter_rows()
+        selected = self._selected_row()
+        self.job_events = (
+            self.collector.events(selected)
+            if selected and "events" not in self.state.hidden_panes else []
+        )
+        self._stale = bool(self.collector.last_error)
+        self.state.last_successful_refresh = self.collector.last_successful_refresh
+        if rows_changed and self.log_manager is not None:
+            self.log_manager.reconcile(self.rows)
+        if rows_changed:
+            self._render_summary()
+            self._render_controls()
+            self._render_jobs(layout=False)
+            self._render_selected()
+            self._render_resources()
+            self._render_footer()
+        if previous_events != self.job_events or previous_uid != self.state.cursor_job_uid:
+            self._render_events()
+        if previous_stale != self._stale:
+            self._render_header()
+
     def _request_update(self) -> None:
         if self._refreshing:
             return
@@ -2083,6 +2304,12 @@ class FalconDashboard(App):
         self._refreshing = False
         self.state.loading_states["refresh"] = False
         if rows is not None:
+            if getattr(self.collector, "inventory_source", None) is not None:
+                # An inventory event can arrive while the metrics worker is
+                # blocked in kubectl top. Never restore its older Job state.
+                rows = self.collector.collect_inventory()
+                error = self.collector.last_error or None
+                refreshed_at = self.collector.last_successful_refresh
             current_uids = {row.uid for row in rows}
             self.state.marked_job_uids.intersection_update(current_uids)
             self.rows = rows
@@ -2093,16 +2320,21 @@ class FalconDashboard(App):
             self._stale = bool(error)
             self._record_history()
             self._filter_rows()
+            if getattr(self.collector, "inventory_source", None) is not None:
+                selected = self._selected_row()
+                self.job_events = self.collector.events(selected) if selected else []
+                event_uid = self.state.cursor_job_uid
             if self.log_manager is not None:
                 self.log_manager.reconcile(self.rows)
-            if error:
+            if error and error != self._last_api_error:
                 self.notify(f"API error: {error} · retrying…", severity="warning")
             if event_uid != self.state.cursor_job_uid:
                 self._request_update()
         else:
             self._stale = True
-            if error:
+            if error and error != self._last_api_error:
                 self.notify(f"API error: {error} · retrying…", severity="error")
+        self._last_api_error = error
         try:
             self._render_all()
         except NoMatches:
@@ -2110,15 +2342,23 @@ class FalconDashboard(App):
             # Textual screen is being torn down.
             return
 
+    def _pane_title(self, pane: str) -> str:
+        focused = self.app_focus and pane == self.state.focused_pane
+        base = {
+            "jobs": "JOBS", "selected": "SELECTED JOB",
+            "resources": "RESOURCE USAGE", "events": "EVENTS",
+        }[pane]
+        if pane == "resources":
+            row = self._selected_row()
+            if row is not None:
+                base += " — " + _truncate(row.job, 42)
+        return f" {base}{' · focused' if focused else ''} "
+
     def _set_titles(self) -> None:
         for pane in ("jobs", "selected", "resources", "events"):
             widget = self.query_one(f"#{pane}-pane", DashboardPane)
-            focused = self.app_focus and pane == self.state.focused_pane
-            base = {
-                "jobs": "JOBS", "selected": "SELECTED JOB",
-                "resources": "RESOURCE USAGE", "events": "EVENTS",
-            }[pane]
-            widget.border_title = f" {base}{' · focused' if focused else ''} "
+            widget.border_title = self._pane_title(pane)
+        self._set_selected_subtitle()
 
     def _render_header(self) -> None:
         target = self.query_one("#falcon-header", Static)
@@ -2328,14 +2568,14 @@ class FalconDashboard(App):
             marked = row.uid in self.state.marked_job_uids
             marker = ">" if selected else " "
             mark = "[x]" if marked else "[ ]"
-            icon, status_text, status_color = _job_status_display(row)
+            icon, status_text, status_color = _job_status_display(row, self._spinner)
             selection_active = selected and jobs_focused
             cells: List[Text] = [Text(f"{marker}{mark}", style=CYAN if selection_active or marked else GRAY)]
             name_style = f"bold {WHITE}" if selected else WHITE
             cells.append(Text(row.job, style=name_style, no_wrap=True, overflow="ellipsis"))
             cells.append(Text(f"{icon} {status_text}", style=status_color))
             if show_active_pod:
-                cells.append(Text(row.active_pod_state, style=WHITE, no_wrap=True, overflow="ellipsis"))
+                cells.append(Text(_active_pod_state_display(row.active_pod_state), style=WHITE, no_wrap=True, overflow="ellipsis"))
             if show_node:
                 cells.append(Text(row.nodes, style=WHITE))
             if show_gpu:
@@ -2360,10 +2600,21 @@ class FalconDashboard(App):
 
     def _selected_attempts(self, row: JobUsage) -> List[PodAttempt]:
         attempts = list(row.attempt_details)
+        archived = []
+        if self.log_manager is not None:
+            reader = getattr(self.log_manager, "archived_attempts", None)
+            for entry in reader(row) if callable(reader) else []:
+                summary = entry.get("summary")
+                archived.append(PodAttempt(
+                    name=entry["pod"], uid=entry["pod_uid"], phase=entry["phase"],
+                    created_at=entry.get("created_at", ""), container=entry["container"],
+                    archived_job_uid=entry["source_uid"],
+                    restart_summary=f"Issue: {summary['issue']}\nFix: {summary['fix']}" if summary else "",
+                ))
         if attempts:
-            return attempts
+            return archived + attempts
         if row.active_pod:
-            return [
+            return archived + [
                 PodAttempt(
                     name=row.active_pod,
                     uid=row.active_pod_uid or row.active_pod,
@@ -2374,7 +2625,7 @@ class FalconDashboard(App):
                     ),
                 )
             ]
-        return []
+        return archived
 
     def _selected_attempt(self, row: JobUsage) -> Optional[PodAttempt]:
         attempts = self._selected_attempts(row)
@@ -2485,6 +2736,8 @@ class FalconDashboard(App):
         self.state.focused_pane = "selected"
         if section_id in {"selected-logs-scroll", "selected-terminal"}:
             self.state.selected_section = "logs"
+        elif section_id == "selected-restart-summary":
+            self.state.selected_section = "summary"
         self._set_titles()
         self._set_selected_subtitle()
         self._render_footer()
@@ -2507,13 +2760,13 @@ class FalconDashboard(App):
             return "No Pod attempt"
         index = attempts.index(attempt) if attempt in attempts else -1
         return (
-            f"Pod {index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+            f"{'Archived ' if attempt.archived_job_uid else ''}Pod {index + 1}/{len(attempts)} · {attempt.name}{' / ' + attempt.container if attempt.archived_job_uid else ''} · {attempt.phase}"
             if index >= 0
             else f"Pod · {attempt.name} · {attempt.phase}"
         )
 
     def _set_selected_subtitle(self) -> None:
-        """Show the active inspector section and selected Pod in its border."""
+        """Highlight inspector focus; inner output borders identify the attempt."""
 
         try:
             target = self.query_one("#selected-pane", DashboardPane)
@@ -2532,27 +2785,29 @@ class FalconDashboard(App):
         # Keep the selected section visibly marked even when the terminal
         # itself is unfocused (Textual may clear its :focus pseudo-class while
         # a tmux pane is being reattached).
-        for section, selector in (("logs", "#selected-logs-scroll"),):
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        if self.state.selected_section == "summary" and not summary.display:
+            self.state.selected_section = "logs"
+        for section, selector in (("logs", "#selected-logs-scroll"), ("summary", "#selected-restart-summary")):
             try:
                 widget = self.query_one(selector)
                 widget.set_class(
-                    self.state.selected_section == section, "selected"
+                    selected_active and widget.display and self.state.selected_section == section, "selected"
                 )
             except NoMatches:
                 pass
-        row = self._selected_row()
-        section = self.state.selected_section.upper()
-        terminal = self._active_terminal()
-        target.border_subtitle = f" TERMINAL · {terminal.label} " if terminal else f" {section} · {self._selected_attempt_label(row)} "
+        target.border_subtitle = ""
 
     def _focus_selected_section(self) -> None:
-        """Give the active Logs viewport the real keyboard focus."""
+        """Give the selected output or issue/fix viewport keyboard focus."""
 
         row = self._selected_row()
         if not self._selected_inspector_visible() or (self.log_manager is None and not (row and self._terminals.get(row.uid))):
             return
         self.state.focused_pane = "selected"
         target_id = "#selected-terminal" if self._active_terminal() else "#selected-logs-scroll"
+        if self.state.selected_section == "summary" and self.query_one("#selected-restart-summary").display:
+            target_id = "#selected-restart-summary"
         try:
             target = self.query_one(target_id)
         except NoMatches:
@@ -2646,10 +2901,13 @@ class FalconDashboard(App):
         self.call_after_refresh(self._focus_selected_section)
 
     def _copy_text_selection(self) -> bool:
-        """Copy a native text selection from the selected-job log viewport."""
+        """Copy the selected text from Logs or the focused issue/fix box."""
 
         try:
-            logs = self.query_one("#selected-logs-scroll", SelectedJobScroll)
+            logs = (
+                self.focused if isinstance(self.focused, RestartSummaryScroll)
+                else self.query_one("#selected-logs-scroll", SelectedJobScroll)
+            )
         except NoMatches:
             return False
         value = logs.selection_for_copy()
@@ -2685,6 +2943,10 @@ class FalconDashboard(App):
             self._copy_terminal_selection()
             return
         if self._copy_text_selection():
+            return
+        if isinstance(self.focused, RestartSummaryScroll):
+            # This box copies only an explicit selection; do not accidentally
+            # copy the Pod's logs when no issue/fix text is selected.
             return
         if self._selected_inspector_active():
             self._copy_selected_content()
@@ -2763,7 +3025,7 @@ class FalconDashboard(App):
                 return
 
     def _scroll_selected_section(self, amount: int) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -2780,7 +3042,7 @@ class FalconDashboard(App):
             )
 
     def _page_selected_section(self, direction: int) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -2788,7 +3050,7 @@ class FalconDashboard(App):
         self._scroll_selected_section(max(1, target.size.height - 1) * direction)
 
     def _jump_selected_section(self, end: bool) -> None:
-        target_id = "#selected-logs-scroll"
+        target_id = "#selected-restart-summary" if self.state.selected_section == "summary" else "#selected-logs-scroll"
         try:
             target = self.query_one(target_id, SelectedJobScroll)
         except NoMatches:
@@ -2812,6 +3074,7 @@ class FalconDashboard(App):
         return isinstance(self.focused, DashboardTerminal) and self._active_terminal() is not None
 
     def action_new_terminal(self) -> None:
+        self._close_output_search(restore_focus=False)
         if self.state.focused_pane != "selected":
             return
         row = self._selected_row()
@@ -2854,6 +3117,7 @@ class FalconDashboard(App):
         self.call_after_refresh(self._focus_selected_section)
 
     def action_close_terminal(self) -> None:
+        self._close_output_search(restore_focus=False)
         row = self._selected_row()
         session = self._active_terminal()
         if row is None or session is None:
@@ -2901,6 +3165,10 @@ class FalconDashboard(App):
             # Modal screens and teardown may temporarily hide the inspector.
             return
         session = self._active_terminal()
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        summary_visible = session is None and bool(summary._source_lines)
+        if summary.display != summary_visible:
+            summary.display = summary_visible
         tooltip = "Copy terminal output" if session is not None else "Ctrl/Cmd+C"
         if copy_button.tooltip != tooltip:
             copy_button.tooltip = tooltip
@@ -2922,13 +3190,14 @@ class FalconDashboard(App):
         subtitle = f" exited {session.returncode} · Ctrl+D close " if session.returncode is not None else " Ctrl+T new · ←/→ windows · Ctrl+D close "
         if terminal.border_subtitle != subtitle:
             terminal.border_subtitle = subtitle
-        key = (id(session), session.revision, self._terminal_has_focus())
+        key = (id(session), session.revision, self._terminal_has_focus(), terminal.search_query, terminal.search_match)
         if key != self._terminal_render_key:
             first_line = max(0, session.screen.history_rows_seen + session.screen.lines - max(TERMINAL_SCROLLBACK_LINES, session.screen.lines))
             terminal.update_screen(session.render(cursor=self._terminal_has_focus(), scrollback=True), source=(id(session), first_line))
             self._terminal_render_key = key
 
     def _move_selected_window(self, amount: int) -> None:
+        self._close_output_search(restore_focus=False)
         row = self._selected_row()
         if row is None:
             return
@@ -2953,29 +3222,69 @@ class FalconDashboard(App):
         self._sync_terminal_view()
         self.call_after_refresh(self._focus_selected_section)
 
-    def _move_selected_attempt(self, amount: int) -> None:
+    def _selected_detail_table(
+        self,
+        row: JobUsage,
+        values: List[Tuple[str, str]],
+        status_color: str,
+    ) -> Table:
+        table = Table.grid(expand=True, padding=(0, 1))
+        # Keep each metadata item to one terminal row. In addition to avoiding
+        # wrapped pod names, this guarantees that the Command row cannot
+        # overlap the right column's last row.
+        table.add_column(
+            style=GRAY, width=18, no_wrap=True, overflow="ellipsis"
+        )
+        table.add_column(
+            style=WHITE, ratio=1, no_wrap=True, overflow="ellipsis"
+        )
+        for label, value in values:
+            value_style = (
+                status_color
+                if label == "Status"
+                else RED
+                if label == "Eviction risk" and row.at_risk
+                else WHITE
+            )
+            table.add_row(label, Text(value, style=value_style))
+        return table
+
+    def _render_selected_status(self) -> None:
+        """Update selected-job status without repainting logs or charts."""
+
         row = self._selected_row()
         if row is None:
             return
-        attempts = self._selected_attempts(row)
-        if not attempts:
+        if not self._selected_inspector_visible():
+            self._render_selected()
             return
-        current = self._selected_attempt(row)
-        index = attempts.index(current) if current in attempts else len(attempts) - 1
-        next_index = max(0, min(len(attempts) - 1, index + amount))
-        if next_index == index:
-            return
-        self.state.selected_attempt_index = next_index
-        self.state.logs_auto_follow = True
-        self._ensure_selected_terminal_logs(row)
         try:
-            self.query_one("#selected-logs-scroll", SelectedJobScroll).scroll_home(
-                animate=False, force=True, immediate=True
-            )
+            inspector = self.query_one("#selected-inspector", SelectedJobInspector)
         except NoMatches:
-            pass
-        self._set_selected_subtitle()
-        self._render_selected()
+            return
+        # Demo mode may intentionally render its legacy overview in the parent
+        # pane even though the inspector layout is logically selected.
+        if not inspector.display:
+            self._render_selected()
+            return
+        cache = self._selected_detail_cache
+        if cache is None or cache[0] != row.uid:
+            self._render_selected()
+            return
+        status_icon, status_label, status_color = _job_status_display(
+            row, self._spinner
+        )
+        details = list(cache[1])
+        if len(details) > 1 and details[1][0] == "Status":
+            details[1] = ("Status", f"{status_icon} {status_label}")
+        right_details = list(cache[2])
+        inspector.update_details(
+            (
+                self._selected_detail_table(row, details, status_color),
+                self._selected_detail_table(row, right_details, status_color),
+            )
+        )
+        self._selected_detail_cache = (row.uid, details, right_details)
 
     def _render_selected(self) -> None:
         row = self._selected_row()
@@ -2988,6 +3297,7 @@ class FalconDashboard(App):
         inspector = target.query_one("#selected-inspector", SelectedJobInspector)
         if not row:
             self._selected_log_view_key = None
+            self._selected_detail_cache = None
             compact_content.update(Text("No Job selected", style=MUTED))
             inspector.clear()
             compact_content.display = True
@@ -2996,17 +3306,17 @@ class FalconDashboard(App):
         if inspector_visible:
             compact_content.display = False
             inspector.display = True
-            status_icon, status_color = _status_style(row.status)
+            status_icon, status_label, status_color = _job_status_display(row, self._spinner)
             attempt = self._selected_attempt(row)
             attempts = self._selected_attempts(row)
             attempt_index = attempts.index(attempt) if attempt in attempts else -1
             selected_pod = attempt.name if attempt is not None else (row.active_pod or "—")
-            pod_phase = attempt.phase if attempt is not None else (row.active_pod_state or "—")
+            pod_phase = attempt.phase if attempt is not None else _active_pod_state_display(row.active_pod_state)
             pod_uid = _truncate(attempt.uid, 16) if attempt is not None and attempt.uid else "—"
             pod_container = attempt.container if attempt is not None and attempt.container else "—"
             details = [
-                ("Job", row.job), ("Status", f"{status_icon} {row.status}"),
-                ("Active pod state", row.active_pod_state), ("Active pod", row.active_pod or "—"),
+                ("Job", row.job), ("Status", f"{status_icon} {status_label}"),
+                ("Active pod state", _active_pod_state_display(row.active_pod_state)), ("Active pod", row.active_pod or "—"),
                 ("Node", row.nodes), ("Age", row.age),
                 (
                     "GPU requested",
@@ -3068,29 +3378,15 @@ class FalconDashboard(App):
                         else "—",
                     ),
                 ]
-            def detail_table(values: List[Tuple[str, str]]) -> Table:
-                table = Table.grid(expand=True, padding=(0, 1))
-                # Keep each metadata item to one terminal row.  In addition
-                # to avoiding wrapped pod names, this guarantees that the
-                # Command row cannot overlap the right column's last row.
-                table.add_column(
-                    style=GRAY, width=18, no_wrap=True, overflow="ellipsis"
-                )
-                table.add_column(
-                    style=WHITE, ratio=1, no_wrap=True, overflow="ellipsis"
-                )
-                for label, value in values:
-                    value_style = (
-                        status_color
-                        if label == "Status"
-                        else RED
-                        if label == "Eviction risk" and row.at_risk
-                        else WHITE
-                    )
-                    table.add_row(label, Text(value, style=value_style))
-                return table
-
-            detail_columns = (detail_table(details), detail_table(right_details))
+            self._selected_detail_cache = (
+                row.uid,
+                list(details),
+                list(right_details),
+            )
+            detail_columns = (
+                self._selected_detail_table(row, details, status_color),
+                self._selected_detail_table(row, right_details, status_color),
+            )
             # Demo collectors do not own a Kubernetes log manager. Keep their
             # explicit full-screen rendering as a single Rich page so the
             # deterministic visual/scroll fixtures remain useful without
@@ -3152,7 +3448,7 @@ class FalconDashboard(App):
                 )
                 self._selected_log_view_key = None
             attempt_label = (
-                f"Pod {attempt_index + 1}/{len(attempts)} · {attempt.name} · {attempt.phase}"
+                f"{'Archived ' if attempt.archived_job_uid else ''}Pod {attempt_index + 1}/{len(attempts)} · {attempt.name}{' / ' + attempt.container if attempt.archived_job_uid else ''} · {attempt.phase}"
                 if attempt is not None
                 else "No Pod attempt"
             )
@@ -3161,6 +3457,7 @@ class FalconDashboard(App):
                 logs,
                 logs_collapsed=self.state.logs_collapsed,
                 attempt_label=attempt_label,
+                restart_summary=attempt.restart_summary if attempt else "",
             )
             self._set_selected_subtitle()
             return
@@ -3169,7 +3466,10 @@ class FalconDashboard(App):
         command = _truncate(row.command or "—", max(8, self.size.width // 3))
         marked = len(self.state.marked_job_uids)
         text = Text(row.job, style=f"bold {WHITE}")
-        text.append(f"   {row.status}   Active pod: {row.active_pod_state}   {row.nodes}   {row.age}", style=GRAY)
+        status_icon, status_label, status_color = _job_status_display(row, self._spinner)
+        text.append("   ", style=GRAY)
+        text.append(f"{status_icon} {status_label}", style=status_color)
+        text.append(f"   Active pod: {_active_pod_state_display(row.active_pod_state)}   {row.nodes}   {row.age}", style=GRAY)
         if command and self.size.width >= 90:
             text.append(f"   {command}", style=WHITE)
         if marked:
@@ -3401,7 +3701,7 @@ class FalconDashboard(App):
         return grid
 
     def _selected_resource_strip(self, row: JobUsage, layout: str) -> Panel:
-        icon, status_color = _status_style(row.status)
+        icon, status_label, status_color = _job_status_display(row, self._spinner)
         command = row.command or "—"
         risk = ""
         if row.at_risk:
@@ -3418,21 +3718,21 @@ class FalconDashboard(App):
         if layout == "wide":
             text.append("Selected job: ", style=GRAY)
             text.append(_truncate(row.job, max(20, self.size.width // 4)), style=f"bold {CYAN_2}")
-            text.append(f"   {icon} {row.status}", style=status_color)
-            text.append(f"   Active Pod {row.active_pod_state}   ", style=GRAY)
+            text.append(f"   {icon} {status_label}", style=status_color)
+            text.append(f"   Active Pod {_active_pod_state_display(row.active_pod_state)}   ", style=GRAY)
             text.append(row.nodes, style=CYAN_2)
             text.append(f"   {row.age}   ", style=GRAY)
             text.append(_truncate(command, max(12, self.size.width - 106)), style=WHITE)
         elif layout == "compact":
             text.append("Job: ", style=GRAY)
             text.append(_truncate(row.job, max(20, self.size.width - 8)), style=f"bold {CYAN_2}")
-            text.append(f"\n{icon} {row.status} | Pod {row.active_pod_state} | ", style=status_color)
+            text.append(f"\n{icon} {status_label} | Pod {_active_pod_state_display(row.active_pod_state)} | ", style=status_color)
             text.append(f"{row.nodes} | {row.age} | ", style=GRAY)
             text.append(_truncate(command, max(12, self.size.width // 2)), style=WHITE)
         else:
             text.append("Job: ", style=GRAY)
             text.append(_truncate(row.job, max(12, self.size.width // 3)), style=f"bold {CYAN_2}")
-            text.append(f" | {row.status} | Pod {row.active_pod_state} | {row.nodes} | {row.age} | ", style=GRAY)
+            text.append(f" | {status_label} | Pod {_active_pod_state_display(row.active_pod_state)} | {row.nodes} | {row.age} | ", style=GRAY)
             text.append(_truncate(command, max(8, self.size.width // 4)), style=WHITE)
         if risk:
             text.append("\n" + risk, style=f"bold {RED}")
@@ -3647,7 +3947,7 @@ class FalconDashboard(App):
     def _render_resources(self) -> None:
         target = self.query_one("#resources-pane", DashboardPane)
         row = self._selected_row()
-        target.border_title = f" RESOURCE USAGE{(' — ' + _truncate(row.job, 42)) if row else ''} "
+        target.border_title = self._pane_title("resources")
         if not row:
             target.update(Align.center("Resource metrics unavailable for this Job.", vertical="middle"))
             return
@@ -3922,6 +4222,16 @@ class FalconDashboard(App):
         self._cycle_pane(-1)
 
     def _cycle_pane(self, amount: int, panes: Optional[List[str]] = None) -> None:
+        summary = self.query_one("#selected-restart-summary", RestartSummaryScroll)
+        if self.state.focused_pane == "selected" and self._selected_inspector_visible() and summary.display:
+            if amount > 0 and self.state.selected_section == "logs":
+                self.state.selected_section = "summary"
+                self._focus_selected_section()
+                return
+            if amount < 0 and self.state.selected_section == "summary":
+                self.state.selected_section = "logs"
+                self._focus_selected_section()
+                return
         panes = panes or self._visible_panes()
         if self.state.focused_pane not in panes:
             self.state.focused_pane = "jobs"
@@ -3934,6 +4244,9 @@ class FalconDashboard(App):
             self._render_all()
         else:
             self._focus(pane)
+        if pane == "selected" and self._selected_inspector_visible() and summary.display:
+            self.state.selected_section = "logs" if amount > 0 else "summary"
+            self._focus_selected_section()
 
     def action_focus_jobs(self) -> None: self._focus("jobs")
     def action_focus_selected(self) -> None: self._focus("selected")
@@ -3965,6 +4278,9 @@ class FalconDashboard(App):
             self.call_after_refresh(self._focus_selected_section)
 
     def action_escape(self) -> None:
+        if self._output_search_target is not None:
+            self._close_output_search()
+            return
         # Application bindings remain active while a ModalScreen is mounted in
         # the Textual version supported by Falcon.  Handle Escape here as well
         # as on each dialog so it can never leak through to the dashboard.
@@ -3997,6 +4313,7 @@ class FalconDashboard(App):
             self._selection_changed()
 
     def _selection_changed(self) -> None:
+        self._close_output_search(restore_focus=False)
         self.state.events_scroll_offset = 0
         self.state.events_auto_follow = True
         self.state.resource_scroll_offset = 0
@@ -4010,7 +4327,11 @@ class FalconDashboard(App):
                 force=True,
                 immediate=False,
             )
-        self._request_update()
+        if getattr(self.collector, "inventory_source", None) is not None:
+            selected = self._selected_row()
+            self.job_events = self.collector.events(selected) if selected else []
+        else:
+            self._request_update()
         self._schedule_selection_render()
 
     def _schedule_selection_render(self) -> None:
@@ -4088,6 +4409,15 @@ class FalconDashboard(App):
         self.action_kill()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        if action == "copy_or_quit" and getattr(self.focused, "id", None) == "output-search-input":
+            return False
+        if action == "find_output":
+            return not isinstance(self.screen, ModalScreen) and (
+                self._selected_logs_focused()
+                or getattr(self.focused, "id", None) == "output-search-input"
+            )
+        if action == "previous_output_match":
+            return getattr(self.focused, "id", None) == "output-search-input"
         if action in {"new_terminal", "close_terminal"} and isinstance(self.screen, ModalScreen):
             return False
         if self._terminal_has_focus():
@@ -4100,34 +4430,14 @@ class FalconDashboard(App):
         return True
 
     def action_left(self) -> None:
-        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+        if self.state.focused_pane == "selected":
             self._move_selected_window(-1)
-            return
-        if (
-            self.log_manager is not None
-            and self.state.focused_pane == "selected"
-            and (
-                self.state.expanded_pane == "selected"
-                or (self._selected_inspector_active() and self._selected_logs_focused())
-            )
-        ):
-            self._move_selected_attempt(-1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(1)
 
     def action_right(self) -> None:
-        if self.state.focused_pane == "selected" and self._terminals.get(getattr(self._selected_row(), "uid", "")):
+        if self.state.focused_pane == "selected":
             self._move_selected_window(1)
-            return
-        if (
-            self.log_manager is not None
-            and self.state.focused_pane == "selected"
-            and (
-                self.state.expanded_pane == "selected"
-                or (self._selected_inspector_active() and self._selected_logs_focused())
-            )
-        ):
-            self._move_selected_attempt(1)
         elif self.state.focused_pane == "resources":
             self._scroll_history(-1)
 
@@ -4369,7 +4679,81 @@ class FalconDashboard(App):
         control.display = True
         control.focus()
 
+    def action_find_output(self) -> None:
+        self.screen.clear_selection()
+        target_id = "selected-terminal" if self._active_terminal() is not None else "selected-logs-scroll"
+        self._output_search_target = target_id
+        self.query_one("#output-search-bar").display = True
+        control = self.query_one("#output-search-input", Input)
+        control.focus()
+        self._search_output(0, reset=True)
+
+    def _close_output_search(self, *, restore_focus: bool = True) -> None:
+        target_id = self._output_search_target
+        if target_id is None:
+            return
+        self._output_search_target = None
+        self._output_matches = []
+        self._output_match_index = -1
+        try:
+            self.query_one("#output-search-bar").display = False
+        except NoMatches:
+            return
+        for selector in ("#selected-logs-scroll", "#selected-terminal"):
+            target = self.query_one(selector)
+            target.search_query = ""
+            target.search_match = None
+            target.refresh()
+        if restore_focus:
+            self.set_focus(self.query_one(f"#{target_id}"), scroll_visible=False)
+        self._sync_terminal_view()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "output-search-input" and self._output_search_target:
+            self._search_output(0, reset=True)
+            event.stop()
+
+    def action_previous_output_match(self) -> None:
+        self._search_output(-1)
+
+    def _search_output(self, amount: int, *, reset: bool = False) -> None:
+        if self._output_search_target is None:
+            return
+        target = self.query_one(f"#{self._output_search_target}")
+        query = self.query_one("#output-search-input", Input).value
+        if isinstance(target, SelectedJobScroll):
+            lines = [line.text for line in target.lines]
+        else:
+            session = self._active_terminal()
+            lines = session.render(cursor=False, scrollback=True).plain.split("\n") if session else []
+        matches = output_matches(lines, query)
+        old_match = self._output_matches[self._output_match_index] if self._output_matches and self._output_match_index >= 0 else None
+        if reset:
+            index = 0
+        elif old_match in matches:
+            index = matches.index(old_match) + amount
+        else:
+            index = 0 if amount >= 0 else -1
+        self._output_matches = matches
+        self._output_match_index = index % len(matches) if matches else -1
+        target.search_query = query
+        target.search_match = matches[self._output_match_index] if matches else None
+        self.query_one("#output-search-count", Static).update(
+            f"{self._output_match_index + 1}/{len(matches)}" if matches else ("No matches" if query else "Type to search")
+        )
+        if isinstance(target, SelectedJobScroll):
+            self.state.logs_auto_follow = False if query else self.state.logs_auto_follow
+            target.refresh()
+        else:
+            self._sync_terminal_view()
+        if target.search_match:
+            target.call_after_refresh(target.scroll_to, y=target.search_match[0], animate=False, force=True)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "output-search-input":
+            self._search_output(1)
+            event.stop()
+            return
         if event.input.id != "search-input":
             return
         if "events" in event.input.placeholder.lower():
@@ -4566,7 +4950,7 @@ class FalconDashboard(App):
                     detail = f" · {failures[0]}" if failures else ""
                     self.notify(f"Deleted {succeeded} of {len(rows)} Jobs · {len(rows) - succeeded} failed{detail}", severity="error")
                 invalidate = getattr(self.collector, "invalidate", None)
-                if invalidate:
+                if invalidate and getattr(self.collector, "inventory_source", None) is None:
                     invalidate()
                 self._request_update()
             self.call_from_thread(finish)

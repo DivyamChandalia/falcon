@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List, Optional, Sequence
 
 from rich import box
@@ -428,6 +428,23 @@ def _short_cpu(value: float) -> str:
 def _short_memory(value: int) -> str:
     gib = value / (1024**3)
     return f"{gib:.1f}G" if gib < 10 else f"{gib:.0f}G"
+
+
+def _resource_age(created_at: Optional[str], now: float) -> str:
+    """One largest elapsed-time unit, capped at two digits."""
+    if not isinstance(created_at, str) or not created_at:
+        return "-"
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        seconds = max(0, int(now - created.timestamp()))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "-"
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{min(99, seconds // size)}{unit}"
+    return f"{seconds}s"
 
 
 def _truncate(value: object, width: int) -> str:
@@ -2560,7 +2577,9 @@ class FalconResourcesApp(App[None]):
         width = max(1, int(width))
         rows = self._allocation_rows()
         colors = self._namespace_colors()
-        show_node = width >= 46
+        # Reserve the resource fields and hierarchy marker before showing
+        # an optional Node column; Age must not clip GPU requests or the tree.
+        show_node = width >= 58
         table = Table(
             box=box.SIMPLE_HEAD,
             expand=True,
@@ -2572,6 +2591,7 @@ class FalconResourcesApp(App[None]):
         table.add_column(
             "NAMESPACE / WORKLOAD",
             ratio=1,
+            min_width=3,
             no_wrap=True,
             overflow="ellipsis",
         )
@@ -2585,6 +2605,7 @@ class FalconResourcesApp(App[None]):
         table.add_column("GPU", width=10, justify="right", no_wrap=True)
         table.add_column("MEM", width=8, justify="right", no_wrap=True)
         table.add_column("CPU", width=7, justify="right", no_wrap=True)
+        table.add_column("AGE", width=7, justify="right", no_wrap=True)
         start = self.state.allocation_scroll
         visible = self._allocation_visible_rows()
         for group, consumer in rows[start : start + visible]:
@@ -2599,6 +2620,7 @@ class FalconResourcesApp(App[None]):
                         Text(str(group.gpu_count), style=CYAN),
                         Text(_short_memory(group.memory_bytes), style=WHITE),
                         Text(_short_cpu(group.cpu_cores), style=WHITE),
+                        Text(""),
                     )
                 )
                 table.add_row(*row)
@@ -2625,11 +2647,14 @@ class FalconResourcesApp(App[None]):
                     ),
                     Text(_short_memory(consumer.requested.memory_bytes), style=WHITE),
                     Text(_short_cpu(consumer.requested.cpu_cores), style=WHITE),
+                    Text(self._consumer_age(consumer), style=WHITE),
                 )
             )
             table.add_row(*row)
         if not rows:
-            table.add_row(Text("No workloads match filters" if self.state.allocation_filters != AllocationFilters() else "No active resource allocations", style=MUTED))
+            # A status message must use the entire pane, not the narrow name
+            # column left after reserving resource and Age fields.
+            table.caption = Text("No workloads match filters" if self.state.allocation_filters != AllocationFilters() else "No active resource allocations", style=MUTED)
         return table
 
     @staticmethod
@@ -2735,6 +2760,8 @@ class FalconResourcesApp(App[None]):
             telemetry.sampled_pods,
             telemetry.stale,
             self._nodes_revision,
+            tuple(self._consumer_age(consumer) if consumer is not None else ""
+                  for _, consumer in rows[self.state.allocation_scroll:self.state.allocation_scroll + self._allocation_visible_rows()]),
             categories,
             tuple(colors.items()),
         )
@@ -3068,6 +3095,7 @@ class FalconResourcesApp(App[None]):
             box=box.SIMPLE_HEAD if expanded else None,
             expand=True,
             padding=(0, 1),
+            collapse_padding=True,
             show_header=expanded,
             header_style=f"bold {CYAN_2}",
         )
@@ -3092,6 +3120,9 @@ class FalconResourcesApp(App[None]):
         table.add_column("CPU", width=8, justify="right")
         table.add_column("RAM", width=9, justify="right")
         table.add_column("GPU", width=10, justify="right")
+        # Three characters of age plus two leading cells separate this last
+        # field from GPU without changing padding between the other columns.
+        table.add_column("AGE", width=5, justify="right", no_wrap=True)
         visible = self._visible_consumers()
         start = self.state.consumer_scroll
         visible_consumers = self._sorted_consumers(node)
@@ -3133,6 +3164,7 @@ class FalconResourcesApp(App[None]):
                         ),
                         style=WHITE,
                     ),
+                    Text(self._consumer_age(consumer), style=WHITE),
                 ]
             )
             table.add_row(
@@ -3146,6 +3178,20 @@ class FalconResourcesApp(App[None]):
         if not visible_consumers:
             table.add_row(Text("No active workloads", style=MUTED))
         return table
+
+    def _consumer_age(self, consumer: WorkloadConsumer) -> str:
+        created = consumer.created_at
+        if consumer.workload_kind.lower() == "job":
+            for job in self.snapshot.jobs:
+                if job.namespace == consumer.namespace and job.name == consumer.workload_name:
+                    created = job.created_at or created
+                    break
+        # Snapshot time makes demo/golden output deterministic and matches the
+        # refresh cadence of resource data. Legacy monotonic stamps aren't dates.
+        now = self.snapshot.collected_at
+        if not now or now < 1_000_000_000:
+            now = time.time()
+        return _resource_age(created, now)
 
     def _cluster_namespace_values(
         self,

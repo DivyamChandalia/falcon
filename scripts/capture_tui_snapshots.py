@@ -12,6 +12,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, Tuple
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -65,6 +66,7 @@ def write_svg(name: str, value: str) -> None:
     )
 
 
+@patch("falcon.dashboard_ui.time.time", lambda: DEMO_NOW)
 async def dashboard_capture(
     name: str,
     *,
@@ -97,6 +99,7 @@ async def dashboard_capture(
     return name, digest(value)
 
 
+@patch("falcon.dashboard_ui.time.time", lambda: DEMO_NOW)
 async def resources_capture(
     name: str,
     *,

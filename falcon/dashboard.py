@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
+from .agent_presence import connected_jobs
 from .coder import CoderClient, CoderError, resolve_connection
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
@@ -20,7 +21,9 @@ from .config import (
     save_dashboard_sort,
     save_hidden_panes,
 )
+from .dashboard_inventory import DashboardInventory
 from .dashboard_logs import DashboardLogManager
+from .kubernetes import KubernetesClient
 from .resource_service import ResourceServiceCollector
 from .resources import canonical_gpu, fetch_nodes
 from .theme import metric_color
@@ -80,6 +83,8 @@ class PodAttempt:
     phase: str = "Unknown"
     created_at: str = ""
     container: str = "main"
+    archived_job_uid: str = ""
+    restart_summary: str = ""
 
     @property
     def running(self) -> bool:
@@ -108,10 +113,15 @@ class JobUsage:
     memory_requested_gib: float
     age: str
     at_risk: bool
+    # MCP-created Jobs opt into Falcon's agent-owned lifecycle. Keep this as
+    # row metadata rather than adding another table column; the Dashboard can
+    # use it for the status-cell animation.
+    agent_managed: bool = False
+    agent_state: str = ""
     uid: str = ""
     active_pod: str = ""
     active_pod_uid: str = ""
-    active_pod_state: str = "Unknown"
+    active_pod_state: str = "—"
     command: str = ""
     created_at: str = ""
     started_at: str = ""
@@ -145,6 +155,7 @@ class JobUsage:
     attempt_pods: List[str] = field(default_factory=list)
     attempt_details: Tuple[PodAttempt, ...] = ()
     image: str = ""
+    restart_history: str = ""
 
     @property
     def gpu_memory_percent(self) -> Optional[float]:
@@ -346,6 +357,63 @@ def _gpu_model(spec: Dict, metadata: Optional[Dict] = None) -> str:
     return next((str(value) for value in candidates if value), "-")
 
 
+def _is_agent_managed_metadata(metadata: Optional[Mapping[str, Any]]) -> bool:
+    """Return whether Kubernetes metadata identifies an MCP-owned Job.
+
+    The MCP service writes ``falcon.dev/agent-managed=true`` on both the Job
+    and its Pod template. The value-based aliases keep the Dashboard useful
+    for older or hand-authored manifests without treating the ordinary
+    ``falcon.dev/managed=true`` label as agent-owned.
+    """
+
+    if not isinstance(metadata, Mapping):
+        return False
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    if not isinstance(labels, Mapping):
+        labels = {}
+    if not isinstance(annotations, Mapping):
+        annotations = {}
+    if str(labels.get("falcon.dev/agent-managed") or "").strip().lower() in {
+        "1", "true", "yes"
+    }:
+        return True
+    for values in (labels, annotations):
+        for key in ("falcon.dev/managed-by", "app.kubernetes.io/managed-by"):
+            value = str(values.get(key) or "").strip().lower()
+            if value in {"mcp", "falcon-mcp", "falcon mcp", "agent"}:
+                return True
+    return False
+
+
+def _agent_state_metadata(metadata: Optional[Mapping[str, Any]]) -> str:
+    """Return a small UI state for an agent-owned Job, if metadata has one."""
+
+    if not isinstance(metadata, Mapping):
+        return ""
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    if not isinstance(labels, Mapping):
+        labels = {}
+    if not isinstance(annotations, Mapping):
+        annotations = {}
+    state = str(
+        labels.get("falcon.dev/agent-state")
+        or annotations.get("falcon.dev/agent-state")
+        or ""
+    ).strip().lower()
+    if state in {"fixing", "repairing", "restarting"}:
+        return "fixing"
+    if state in {"disconnected", "offline"}:
+        return "disconnected"
+    # MCP restart Jobs already carry this durable link. A pending linked Job
+    # is the one point at which the Dashboard can distinguish an agent repair
+    # from an ordinary first submission without polling the MCP process.
+    if str(annotations.get("falcon.dev/previous-job-uid") or "").strip():
+        return "fixing"
+    return ""
+
+
 def _short_cpu(value: float) -> str:
     if value < 0.01:
         return f"{value * 1000:.0f}m"
@@ -374,9 +442,22 @@ def _job_sort_key(row: JobUsage) -> Tuple[bool, bool, bool, str]:
     return (succeeded, not row.at_risk, row.status != "Running", row.job)
 
 
-def _kubectl(args: List[str], timeout: int = 15) -> Optional[str]:
+def _with_kubectl_context(args: List[str], context: Optional[str]) -> List[str]:
+    if context is None:
+        return args
+    return ["--context", context, *args]
+
+
+def _kubectl(
+    args: List[str], timeout: int = 15, *, context: Optional[str] = None
+) -> Optional[str]:
     try:
-        result = subprocess.run(["kubectl"] + args, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            ["kubectl"] + _with_kubectl_context(args, context),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
         return result.stdout if result.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -397,20 +478,33 @@ def _age(timestamp: str) -> str:
         return "-"
 
 
-def _gpu_metrics(namespace: str, pod: str) -> GpuSample:
+def _gpu_metrics(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> GpuSample:
     query = (
         "index,name,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu,"
         "power.draw,ecc.errors.uncorrected.volatile.total,driver_version"
     )
     output = _kubectl(
-        ["exec", "-n", namespace, pod, "--", "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                f"--query-gpu={query}", "--format=csv,noheader,nounits",
+            ],
+            context,
+        ),
         timeout=8,
     )
     sample = _parse_gpu_lines(output.splitlines() if output else [])
-    processes = _gpu_processes(namespace, pod)
+    if context is None:
+        processes = _gpu_processes(namespace, pod)
+        process_utilization = _gpu_process_utilization(namespace, pod)
+    else:
+        processes = _gpu_processes(namespace, pod, context=context)
+        process_utilization = _gpu_process_utilization(namespace, pod, context=context)
     _apply_gpu_process_utilization(
         processes,
-        _gpu_process_utilization(namespace, pod),
+        process_utilization,
     )
     _attach_gpu_processes(sample, processes)
     return sample
@@ -438,24 +532,34 @@ def _parse_gpu_process_lines(lines: List[str]) -> List[GpuProcess]:
     return processes
 
 
-def _gpu_processes(namespace: str, pod: str) -> List[GpuProcess]:
+def _gpu_processes(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> List[GpuProcess]:
     query = "gpu_uuid,pid,process_name,used_gpu_memory"
     output = _kubectl(
-        [
-            "exec", "-n", namespace, pod, "--", "nvidia-smi",
-            f"--query-compute-apps={query}", "--format=csv,noheader,nounits",
-        ],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                f"--query-compute-apps={query}", "--format=csv,noheader,nounits",
+            ],
+            context,
+        ),
         timeout=8,
     )
     return _parse_gpu_process_lines(output.splitlines() if output else [])
 
 
-def _gpu_process_utilization(namespace: str, pod: str) -> Dict[int, float]:
+def _gpu_process_utilization(
+    namespace: str, pod: str, context: Optional[str] = None
+) -> Dict[int, float]:
     output = _kubectl(
-        [
-            "exec", "-n", namespace, pod, "--", "nvidia-smi",
-            "pmon", "-c", "1", "-s", "u",
-        ],
+        _with_kubectl_context(
+            [
+                "exec", "-n", namespace, pod, "--", "nvidia-smi",
+                "pmon", "-c", "1", "-s", "u",
+            ],
+            context,
+        ),
         timeout=8,
     )
     return _parse_gpu_process_utilization(
@@ -553,9 +657,15 @@ def _parse_gpu_lines(lines: List[str]) -> GpuSample:
 class StreamingGpuSampler:
     """Keep one nvidia-smi stream per running pod instead of execing each frame."""
 
-    def __init__(self, namespace: str, interval_ms: int = 1000):
+    def __init__(
+        self,
+        namespace: str,
+        interval_ms: int = 1000,
+        context: Optional[str] = None,
+    ):
         self.namespace = namespace
         self.interval_ms = interval_ms
+        self.context = context
         self._lock = threading.Lock()
         self._processes: Dict[str, subprocess.Popen] = {}
         self._samples: Dict[str, GpuSample] = {}
@@ -594,8 +704,14 @@ class StreamingGpuSampler:
         try:
             process = subprocess.Popen(
                 [
-                    "kubectl", "exec", "-n", self.namespace, pod, "--",
-                    "nvidia-smi", "pmon", "-d", "1", "-s", "u",
+                    "kubectl",
+                    *_with_kubectl_context(
+                        [
+                            "exec", "-n", self.namespace, pod, "--",
+                            "nvidia-smi", "pmon", "-d", "1", "-s", "u",
+                        ],
+                        self.context,
+                    ),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -631,9 +747,15 @@ class StreamingGpuSampler:
         try:
             process = subprocess.Popen(
                 [
-                    "kubectl", "exec", "-n", self.namespace, pod, "--", "nvidia-smi",
-                    f"--query-gpu={query}", "--format=csv,noheader,nounits",
-                    f"--loop-ms={self.interval_ms}",
+                    "kubectl",
+                    *_with_kubectl_context(
+                        [
+                            "exec", "-n", self.namespace, pod, "--", "nvidia-smi",
+                            f"--query-gpu={query}", "--format=csv,noheader,nounits",
+                            f"--loop-ms={self.interval_ms}",
+                        ],
+                        self.context,
+                    ),
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             )
@@ -691,6 +813,14 @@ class StreamingGpuSampler:
         now = time.monotonic()
         if pods and now - self._process_samples_at >= KUBERNETES_USAGE_SECONDS:
             pod_names = list(pods)
+            if self.context is None:
+                def load_processes(pod: str) -> List[GpuProcess]:
+                    return _gpu_processes(self.namespace, pod)
+            else:
+                def load_processes(pod: str) -> List[GpuProcess]:
+                    return _gpu_processes(
+                        self.namespace, pod, context=self.context
+                    )
             with ThreadPoolExecutor(
                 max_workers=min(8, max(1, len(pod_names)))
             ) as pool:
@@ -698,7 +828,7 @@ class StreamingGpuSampler:
                     zip(
                         pod_names,
                         pool.map(
-                            lambda pod: _gpu_processes(self.namespace, pod),
+                            load_processes,
                             pod_names,
                         ),
                     )
@@ -744,8 +874,16 @@ class UsageCollector:
         risk_average_samples: int = RISK_AVERAGE_SAMPLES,
         collect_availability: bool = True,
         resource_source: Optional[Any] = None,
+        context: Optional[str] = None,
+        inventory_source: Optional[Any] = None,
     ):
         self.namespace = namespace
+        self.context = context
+        self.inventory_source = inventory_source
+        self._projection_lock = threading.RLock()
+        self._latest_samples: Dict[str, GpuSample] = {}
+        self._latest_live: Dict[str, Tuple[float, float]] = {}
+        self._latest_metrics_at = 0.0
         self.thresholds = thresholds
         self.ema_alpha = ema_alpha
         self.job_filter = job_filter
@@ -759,7 +897,15 @@ class UsageCollector:
         self._items_at = 0.0
         self._live: Optional[Dict[str, Tuple[float, float]]] = None
         self._live_at = 0.0
-        self._gpu_sampler = StreamingGpuSampler(namespace) if streaming_gpu else None
+        self._gpu_sampler = (
+            (
+                StreamingGpuSampler(namespace, context=context)
+                if context is not None
+                else StreamingGpuSampler(namespace)
+            )
+            if streaming_gpu
+            else None
+        )
         self._event_cache: Dict[str, Tuple[float, List[JobEvent]]] = {}
         self.metrics_url = metrics_url
         self.collect_availability = collect_availability
@@ -769,11 +915,23 @@ class UsageCollector:
         self.last_error = ""
         self.last_successful_refresh = 0.0
 
+    def _kubectl(
+        self, args: List[str], timeout: Optional[int] = None
+    ) -> Optional[str]:
+        args = _with_kubectl_context(args, self.context)
+        if timeout is None:
+            return _kubectl(args)
+        return _kubectl(args, timeout=timeout)
+
     def invalidate(self) -> None:
         self._items_at = 0.0
         self._live_at = 0.0
+        if self.inventory_source is not None:
+            self.inventory_source.resync()
 
     def close(self) -> None:
+        if self.inventory_source is not None:
+            self.inventory_source.close()
         if self._gpu_sampler:
             self._gpu_sampler.close()
         if self.resource_source is not None:
@@ -807,7 +965,9 @@ class UsageCollector:
             if nodes:
                 unschedulable_names = set()
                 if any(not node.scheduling_info_available for node in nodes):
-                    raw_nodes = _kubectl(["get", "nodes", "-o", "json"], timeout=15)
+                    raw_nodes = self._kubectl(
+                        ["get", "nodes", "-o", "json"], timeout=15
+                    )
                     if isinstance(raw_nodes, str):
                         try:
                             for item in json.loads(raw_nodes).get("items", []):
@@ -829,7 +989,10 @@ class UsageCollector:
                     availability[gpu_type] = (free + node.gpu_free, total + node.gpu_total)
                 self.gpu_availability = availability
                 return
-        raw = _kubectl(["get", "nodes,pods", "--all-namespaces", "-o", "json"], timeout=15)
+        raw = self._kubectl(
+            ["get", "nodes,pods", "--all-namespaces", "-o", "json"],
+            timeout=15,
+        )
         if raw is None:
             return
         try:
@@ -878,7 +1041,7 @@ class UsageCollector:
     def events(self, row: JobUsage, force: bool = False) -> List[JobEvent]:
         cached = self._event_cache.get(row.uid)
         now = time.monotonic()
-        if cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
+        if self.inventory_source is None and cached and not force and now - cached[0] < EVENT_REFRESH_SECONDS:
             return cached[1]
         names = {row.job} | {
             name for name in row.attempt_pods if name and name != row.job
@@ -886,18 +1049,24 @@ class UsageCollector:
         collected: Dict[Tuple[str, str, str, str], JobEvent] = {}
         # One namespace query is considerably cheaper than one subprocess per
         # historical attempt, especially for retried Jobs.
-        raw = _kubectl(
+        raw = None if self.inventory_source is not None else self._kubectl(
             ["get", "events", "-n", self.namespace, "-o", "json"],
             timeout=15,
         )
         try:
-            items = json.loads(raw).get("items", []) if raw is not None else []
+            items = (
+                self.inventory_source.events_for(
+                    {row.uid} | {attempt.uid for attempt in row.attempt_details}, names,
+                )
+                if self.inventory_source is not None
+                else json.loads(raw).get("items", []) if raw is not None else []
+            )
         except json.JSONDecodeError:
             items = []
             raw = None
         for item in items:
             object_name = str(
-                item.get("involvedObject", {}).get("name") or ""
+                (item.get("involvedObject") or item.get("regarding") or {}).get("name") or ""
             )
             if object_name not in names:
                 continue
@@ -912,7 +1081,7 @@ class UsageCollector:
                 timestamp=str(timestamp),
                 event_type=str(item.get("type") or "Normal"),
                 reason=str(item.get("reason") or "Unknown"),
-                message=str(item.get("message") or ""),
+                message=str(item.get("note") or item.get("message") or ""),
                 object_name=object_name,
                 count=int(
                     item.get("count")
@@ -932,7 +1101,7 @@ class UsageCollector:
             else:
                 collected[key] = event
         events = sorted(collected.values(), key=lambda value: _timestamp(value.timestamp))[-200:]
-        if raw is not None:
+        if raw is not None or self.inventory_source is not None:
             self._event_cache[row.uid] = (now, events)
             return events
         # Cache the failed attempt time while retaining the last valid data so
@@ -989,18 +1158,20 @@ class UsageCollector:
         now = time.monotonic()
         if self.collect_availability:
             self._refresh_gpu_availability(now)
-        if self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
+        if self.inventory_source is not None:
+            self._items = self._inventory_items()
+        elif self._items is None or now - self._items_at >= KUBERNETES_INVENTORY_SECONDS:
             # Job objects do not normally carry the controller's ``job-name``
             # Pod label, so a combined label-filtered query loses the durable
             # Job template.  Fetch the named Job and its attempts separately.
             if self.job_filter:
-                raw_job = _kubectl(
+                raw_job = self._kubectl(
                     [
                         "get", "job.batch", self.job_filter, "-n",
                         self.namespace, "-o", "json",
                     ]
                 )
-                raw_pods = _kubectl(
+                raw_pods = self._kubectl(
                     [
                         "get", "pods", "-n", self.namespace, "-l",
                         f"job-name={self.job_filter}", "-o", "json",
@@ -1016,7 +1187,7 @@ class UsageCollector:
                     except (TypeError, json.JSONDecodeError):
                         raw = None
             else:
-                combined = _kubectl(
+                combined = self._kubectl(
                     [
                         "get", "jobs.batch,pods", "-n", self.namespace,
                         "-o", "json",
@@ -1038,17 +1209,13 @@ class UsageCollector:
         if self._items is None:
             return []
         all_items = self._items
-        job_items = {
-            item.get("metadata", {}).get("name", ""): item
-            for item in all_items if item.get("kind") == "Job"
-        }
         items = [item for item in all_items if item.get("kind") != "Job"]
         if self._live is None or now - self._live_at >= KUBERNETES_USAGE_SECONDS:
             top_args = ["top", "pods", "-n", self.namespace]
             if self.job_filter:
                 top_args.extend(["-l", f"job-name={self.job_filter}"])
             top_args.append("--no-headers")
-            top = _kubectl(top_args, timeout=10)
+            top = self._kubectl(top_args, timeout=10)
             self._live_at = now
             if top is not None:
                 self._live = {
@@ -1056,7 +1223,6 @@ class UsageCollector:
                     for line in top.splitlines() if len(parts := line.split()) >= 3
                 }
         live = self._live or {}
-        live_pods = set(live)
         running_gpu_pods: Dict[str, int] = {}
         for item in items:
             spec = item.get("spec", {})
@@ -1070,11 +1236,55 @@ class UsageCollector:
             samples = self._gpu_sampler.samples(running_gpu_pods)
         else:
             pod_names = list(running_gpu_pods)
-            with ThreadPoolExecutor(max_workers=min(8, max(1, len(pod_names)))) as pool:
-                samples = dict(
-                    zip(pod_names, pool.map(lambda pod: _gpu_metrics(self.namespace, pod), pod_names))
+
+            def load_metrics(pod: str) -> GpuSample:
+                if self.context is None:
+                    return _gpu_metrics(self.namespace, pod)
+                return _gpu_metrics(
+                    self.namespace, pod, context=self.context
                 )
 
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(pod_names)))) as pool:
+                samples = dict(
+                    zip(pod_names, pool.map(load_metrics, pod_names))
+                )
+
+        with self._projection_lock:
+            self._latest_samples = samples
+            self._latest_live = dict(live)
+            self._latest_metrics_at = time.time()
+            if self.inventory_source is not None:
+                all_items = self._inventory_items()
+            return self._build_rows(all_items, live, samples, sample_metrics=True)
+
+    def collect_inventory(self) -> List[JobUsage]:
+        """Project the latest watch revision without performing network I/O."""
+        with self._projection_lock:
+            return self._build_rows(
+                self._inventory_items(), self._latest_live,
+                self._latest_samples, sample_metrics=False,
+            )
+
+    def _inventory_items(self):
+        snapshot = self.inventory_source.snapshot(include_events=False)
+        self.last_error = snapshot.error
+        self.last_successful_refresh = snapshot.observed_at
+        return snapshot.items
+
+    def _build_rows(self, all_items, live, samples, *, sample_metrics):
+        waiting_uids = connected_jobs(self.context, self.namespace)
+        if self.job_filter:
+            all_items = [item for item in all_items if (
+                item.get("kind") == "Job" and item.get("metadata", {}).get("name") == self.job_filter
+                or item.get("kind") != "Job" and (
+                    item.get("metadata", {}).get("labels", {}).get("job-name") == self.job_filter
+                    or any(owner.get("kind") == "Job" and owner.get("name") == self.job_filter
+                           for owner in item.get("metadata", {}).get("ownerReferences", []))
+                ))]
+        job_items = {item.get("metadata", {}).get("name", ""): item
+                     for item in all_items if item.get("kind") == "Job"}
+        items = [item for item in all_items if item.get("kind") != "Job"]
+        live_pods = set(live)
         def new_group(job_item: Optional[Dict]) -> Dict:
             template = (
                 (job_item or {}).get("spec", {}).get("template", {})
@@ -1127,7 +1337,14 @@ class UsageCollector:
             is_running = status.get("phase") == "Running"
             pod = metadata.get("name", "")
             labels = metadata.get("labels", {})
-            job = labels.get("job-name", pod)
+            owner = next((owner for owner in metadata.get("ownerReferences", [])
+                          if owner.get("kind") == "Job"), {})
+            job = owner.get("name") or labels.get("job-name", pod)
+            template = job_items.get(job)
+            if template is not None and owner.get("uid") and (
+                owner["uid"] != template.get("metadata", {}).get("uid")
+            ):
+                continue
             group = groups.setdefault(job, new_group(job_items.get(job)))
             group["pod_items"].append(item)
             group["statuses"].append(status.get("phase", "Unknown"))
@@ -1183,16 +1400,23 @@ class UsageCollector:
             ema = None
             risk_average = None
             if utilization is not None:
-                ema = self._update_ema(job, utilization)
-                risk_average = self._update_risk_average(job, utilization)
+                if sample_metrics:
+                    ema = self._update_ema(job, utilization)
+                    risk_average = self._update_risk_average(job, utilization)
+                else:
+                    ema = self.ema.get(job)
+                    values = self.risk_samples.get(job, ())
+                    risk_average = sum(values) / len(values) if values else None
             vram_utilization = _percent(
                 group["vram_used"], group["vram_total"]
             )
             vram_risk_average = None
             if vram_utilization is not None:
-                vram_risk_average = self._update_vram_risk_average(
-                    job, vram_utilization
-                )
+                if sample_metrics:
+                    vram_risk_average = self._update_vram_risk_average(job, vram_utilization)
+                else:
+                    values = self.vram_risk_samples.get(job, ())
+                    vram_risk_average = sum(values) / len(values) if values else None
             active_attempts = [
                 pod for pod in group["pod_items"]
                 if pod.get("status", {}).get("phase")
@@ -1233,6 +1457,20 @@ class UsageCollector:
             status = _job_status(group.get("job_item"), statuses)
             job_metadata = (group.get("job_item") or {}).get("metadata", {})
             job_spec = (group.get("job_item") or {}).get("spec", {})
+            agent_managed = _is_agent_managed_metadata(job_metadata) or any(
+                _is_agent_managed_metadata(pod.get("metadata"))
+                for pod in group["pod_items"]
+            )
+            agent_state = _agent_state_metadata(job_metadata)
+            if not agent_state:
+                agent_state = next(
+                    (
+                        state
+                        for pod in group["pod_items"]
+                        if (state := _agent_state_metadata(pod.get("metadata")))
+                    ),
+                    "",
+                )
             created = job_metadata.get("creationTimestamp") or min(
                 (value for value in group["created"] if value), default=""
             )
@@ -1241,6 +1479,8 @@ class UsageCollector:
                 {},
             )
             uid = str(job_metadata.get("uid") or owner.get("uid") or job)
+            if agent_managed and status.lower() not in {"failed", "unknown", "succeeded", "completed"}:
+                agent_state = "connected" if uid in waiting_uids else "disconnected"
             restarts = sum(
                 int(container_status.get("restartCount", 0) or 0)
                 for pod in group["pod_items"]
@@ -1291,17 +1531,20 @@ class UsageCollector:
                 memory_requested_gib=group["memory_requested"],
                 age=_age(created),
                 at_risk=at_risk,
+                agent_managed=agent_managed,
+                agent_state=agent_state,
+                restart_history=str((job_metadata.get("annotations") or {}).get("falcon.dev/restart-history") or ""),
                 uid=uid,
                 active_pod=str(relevant_metadata.get("name") or ""),
                 active_pod_uid=str(relevant_metadata.get("uid") or ""),
-                active_pod_state=_pod_state(relevant) if relevant else "No active pod",
+                active_pod_state=_pod_state(relevant) if relevant else "—",
                 command=group["command"],
                 created_at=created,
                 started_at=str(relevant_status.get("startTime") or ""),
                 restarts=restarts,
                 completions=completions,
                 metrics_updated_at=(
-                    time.time()
+                    (self._latest_metrics_at if self.inventory_source is not None else time.time())
                     if (
                         utilization is not None
                         or vram_utilization is not None
@@ -1432,7 +1675,7 @@ class DemoUsageCollector:
                     at_risk="eviction-risk" in job.name,
                     uid=job.uid,
                     active_pod=job.attempts.active_pod or "",
-                    active_pod_state="Running" if running else "No active pod",
+                    active_pod_state="Running" if running else "—",
                     command=" ".join(job.command),
                     created_at=job.created_at or "",
                     started_at=job.started_at or "",
@@ -1542,6 +1785,12 @@ def run_dashboard(
     from .resources_history import stop_legacy_history_collector
 
     namespace = namespace or config["cluster"]["namespace"]
+    inventory = None
+    context = None
+    if not demo_state:
+        probe = KubernetesClient(namespace)
+        context = probe._run(["config", "current-context"]).stdout.strip() or None
+        inventory = DashboardInventory(KubernetesClient(namespace, context=context))
     thresholds = {
         preset["gpu_type"].lower(): float(preset.get("minimum_utilization", 30))
         for preset in config["presets"].values()
@@ -1555,6 +1804,8 @@ def run_dashboard(
             job_filter=job,
             ema_warmup_samples=EMA_WARMUP_SAMPLES,
             streaming_gpu=True,
+            inventory_source=inventory,
+            context=context,
             metrics_url=(
                 config.get("cluster", {}).get("kube_state_metrics_url")
                 if config.get("cluster", {}).get("resource_service_url") is None
@@ -1574,7 +1825,7 @@ def run_dashboard(
     log_manager = (
         None
         if demo_state
-        else DashboardLogManager(namespace)
+        else DashboardLogManager(namespace, client=KubernetesClient(namespace, context=context))
     )
 
     FalconDashboard(

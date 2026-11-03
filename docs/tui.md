@@ -6,8 +6,17 @@ sizes through wide monitoring displays. At `160×30` and larger, Dashboard uses
 two equal-width columns: Jobs occupies the upper half of the left column,
 Events occupies the remaining left-column space, Selected Job fills the right
 column above Resources, and Resources remains six rows high at the bottom.
-Below that breakpoint Dashboard keeps its stacked layout. Dashboard and
-Resources refresh on the same one-second cadence. At the shortest supported
+Below that breakpoint Dashboard keeps its stacked layout. Resources retains
+its one-second refresh cadence. Dashboard Job, Pod, and
+Event inventory updates arrive through Kubernetes watches, coalesced over
+100 milliseconds, rather than five-second full listings. CPU/memory metrics
+still refresh every five seconds and GPU telemetry streams roughly once per
+second. Each Dashboard owns three namespace watch streams using the same
+watch code as MCP; the processes do not share live connections.
+Transient interruptions retain the last valid data; expired resource versions
+trigger a fresh snapshot. If watching is forbidden but listing is allowed,
+that resource falls back to five-second polling and retries watches once per
+minute. `r` requests a fresh snapshot. At the shortest supported
 heights Events is temporarily hidden and returns automatically when space is
 available.
 The Resources header keeps its view selector on the title row. The summary
@@ -60,6 +69,23 @@ succeeded or failed attempts Falcon loads the equivalent of
 with the newest active Pod selected initially. Captured output is bounded to
 200 lines per Pod and expires from memory after 24 hours.
 
+Logs preserve carriage-return progress updates such as `tqdm` in place. Jobs
+restarted through Falcon's MCP tools also expose archived Pod logs from earlier
+runs through `←`/`→`. These archives live in Falcon's local state; review them
+on the same machine and state directory. When an agent supplies an issue/fix
+summary, a compact scrollable box appears below that failed Pod's logs.
+Click Logs or Issue/Fix to focus and highlight it, or use `Tab`/`Shift+Tab`
+to move between them. Drag-select summary text and press `Ctrl/Cmd+C` to copy
+it. Left/right switches attempts throughout the Selected Job pane.
+
+With the Logs or terminal viewport focused, `Ctrl+F` opens an inline search bar
+for its retained output. Search is literal and case-insensitive, highlights all
+matches, and scrolls to the active match. `Enter` moves to the next match and
+`Shift+Enter` moves backward, wrapping at either end; `Esc` closes the bar and
+restores viewport focus. Typing in the search bar never sends shell commands or
+filters the Jobs table. Searching Logs pauses automatic follow; `End` resumes
+follow after closing search. Changing Jobs or output windows clears highlighting.
+
 With Selected Job focused, `Ctrl+T` opens a separate interactive `kubectl exec`
 session in the selected running Pod/container, replacing the log viewport with
 a terminal. If the selected attempt has finished, Falcon uses its newest running
@@ -108,6 +134,12 @@ Device metrics and per-process GPU utilization use persistent `nvidia-smi`
 streams; process names and allocated VRAM are reconciled every five seconds.
 
 ## Resources
+
+Selected Node consumers and Namespace/Workload Allocation include a fixed
+`AGE` column with at most three characters of text. It shows the largest elapsed unit (`59s`, `1m`,
+`1h`, `4d`, `1w`), capped at `99w`, as of the resource snapshot. Job creation
+time takes precedence over Pod creation time; unknown ages show `-`, and
+namespace aggregate rows are blank.
 
 - `↑` / `↓`, `j` / `k`: navigate the active side
 - `PageUp` / `PageDown`, `Home` / `End`: page or jump

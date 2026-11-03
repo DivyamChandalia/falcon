@@ -15,6 +15,7 @@ from unittest.mock import patch
 from falcon.cli import (
     EXIT_KUBERNETES,
     EXIT_USAGE,
+    _confirm_claude_mcp_compatibility,
     _parser,
     _resources_command,
     _rewrite_shorthand,
@@ -23,7 +24,7 @@ from falcon.cli import (
     main,
     resolve_preset,
 )
-from falcon.completion import COMMAND_ALIASES, candidates, shell_script
+from falcon.completion import BASE_COMMANDS, candidates, resolve_command, shell_script
 from falcon.config import (
     DEFAULT_CONFIG,
     ensure_kubectl_in_home,
@@ -54,6 +55,24 @@ class CliHarness(unittest.TestCase):
 
 
 class ParserTests(CliHarness):
+    def test_setup_can_configure_mcp_clients(self) -> None:
+        args = _parser(DEFAULT_CONFIG).parse_args([
+            "setup",
+            "--non-interactive",
+            "--configure-mcp",
+            "all",
+            "--mcp-dry-run",
+        ])
+
+        self.assertEqual(args.configure_mcp, "all")
+        self.assertTrue(args.mcp_dry_run)
+        self.assertFalse(args.skip_mcp)
+
+        legacy = _parser(DEFAULT_CONFIG).parse_args([
+            "setup", "--install-skills", "codex", "--skill-mode", "legacy"
+        ])
+        self.assertEqual(legacy.skill_mode, "legacy")
+
     def test_tui_color_mode_options_are_explicit(self) -> None:
         parser = _parser(DEFAULT_CONFIG)
         for command in ("dashboard", "resources"):
@@ -100,13 +119,21 @@ class ParserTests(CliHarness):
         self.assertEqual(code, EXIT_USAGE)
         self.assertIn("pro6000 supports at most 2", stderr)
 
-    def test_one_letter_command_aliases_rewrite_to_canonical_commands(self) -> None:
-        for alias, canonical in COMMAND_ALIASES.items():
-            with self.subTest(alias=alias):
-                self.assertEqual(
-                    _rewrite_shorthand([alias, "value"], DEFAULT_CONFIG),
-                    [canonical, "value"],
-                )
+    def test_every_command_accepts_all_unambiguous_prefixes(self) -> None:
+        for canonical in BASE_COMMANDS:
+            for length in range(1, len(canonical) + 1):
+                prefix = canonical[:length]
+                matches = [name for name in BASE_COMMANDS if name.startswith(prefix)]
+                with self.subTest(prefix=prefix, command=canonical):
+                    if len(matches) == 1 or prefix in BASE_COMMANDS:
+                        self.assertEqual(resolve_command(prefix), canonical)
+                        self.assertEqual(
+                            _rewrite_shorthand([prefix, "value"], DEFAULT_CONFIG),
+                            [canonical, "value"],
+                        )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Ambiguous command"):
+                            resolve_command(prefix)
 
     def test_unknown_preset_is_not_rewritten(self) -> None:
         self.assertIsNone(resolve_preset("bogus", DEFAULT_CONFIG))
@@ -127,8 +154,7 @@ class ParserTests(CliHarness):
         self.assertNotIn("delete", commands)
         self.assertIn("kill", commands)
         self.assertIn("metrics", commands)
-        for alias in COMMAND_ALIASES:
-            self.assertNotIn(alias, commands)
+        self.assertNotIn("d", commands)
         self.assertIn("h100", commands)
         self.assertNotIn("h100x2", commands)
         self.assertEqual(
@@ -180,7 +206,7 @@ class ParserTests(CliHarness):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            return completed.stdout.splitlines()
+            return [line for line in completed.stdout.splitlines() if line]
 
         top_level = complete("falcon ''", 1)
         self.assertEqual(
@@ -198,6 +224,63 @@ class ParserTests(CliHarness):
             [f"h100x{count}" for count in range(2, 9)],
         )
         self.assertEqual(complete("falcon pro6000", 1), ["pro6000x2"])
+        for typo, expected in [
+            ("dasboard", ["dashboard"]), ("resoures", ["resources"]),
+            ("resuo", ["resources"]), ("dashba", ["dashboard"]),
+            ("dash", ["dashboard"]), ("res", ["resources"]),
+            ("l", ["logs"]), ("k", ["kill"]),
+            ("c", ["clean", "coder", "config", "completion"]),
+            ("zzzzzz", []),
+        ]:
+            with self.subTest(word=typo):
+                self.assertEqual(complete(f"falcon {typo}", 1), expected)
+        self.assertIn("--demo", complete("falcon dash ''", 2))
+        self.assertIn("--node", complete("falcon res ''", 2))
+
+    def test_zsh_completes_command_typos_and_prefixes(self) -> None:
+        executable = shutil.which("zsh")
+        if executable is None:
+            self.skipTest("zsh is unavailable")
+        script = shell_script("zsh", config=DEFAULT_CONFIG)
+        # Exercise the completion function with ZLE's output hook captured.
+        hooks = '''
+compdef() { :; }
+compadd() {
+  while (( $# )); do
+    if [[ "$1" == -- ]]; then shift; print -rl -- "$@"; return; fi
+    shift
+  done
+}
+typeset -A compstate
+'''
+        for word, expected in [
+            ("dasboard", ["dashboard"]), ("resoures", ["resources"]),
+            ("resuo", ["resources"]), ("dashba", ["dashboard"]),
+            ("dash", ["dashboard"]), ("res", ["resources"]),
+            ("c", ["clean", "coder", "config", "completion"]),
+        ]:
+            with self.subTest(word=word):
+                result = subprocess.run(
+                    [executable, "-f"], input=hooks + script + f"\nwords=(falcon {word}); CURRENT=2; _falcon_native\n",
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_prefix_preserves_global_options_and_workload_arguments(self) -> None:
+        self.assertEqual(
+            _rewrite_shorthand(["--config", "/tmp/example", "dash", "--job", "resoures"], DEFAULT_CONFIG),
+            ["--config", "/tmp/example", "dashboard", "--job", "resoures"],
+        )
+        self.assertEqual(
+            _rewrite_shorthand(["h100", "--", "dasboard"], DEFAULT_CONFIG)[-2:],
+            ["--", "dasboard"],
+        )
+        code, _, stderr = self.invoke("dasboard")
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Did you mean dashboard", stderr)
+        code, _, stderr = self.invoke("c")
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Ambiguous command", stderr)
 
     def test_resources_completion_includes_consumer_bound(self) -> None:
         self.assertIn(
@@ -1247,6 +1330,82 @@ class InspectionCliTests(CliHarness):
         self.assertEqual(removed_code, EXIT_USAGE)
         self.assertIn("falcon kill JOB", removed_stderr)
 
+    def test_kill_patterns_resolve_all_matches_once_and_deduplicate(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli.kill") as killer:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}}
+                for name in ("benchmark-b", "benchmark-a", "train-ascformer-v2", "unrelated")
+            ]}
+            code, stdout, stderr = self.invoke("kill", "benchmark-*", "*-ascformer-*", "benchmark-a", "--namespace", "team")
+            self.assertEqual((code, stderr), (0, ""))
+            client.assert_called_once_with("team")
+            client.return_value.list_jobs.assert_called_once_with()
+            killer.assert_called_once_with("team", ["benchmark-a", "benchmark-b", "train-ascformer-v2"])
+            self.assertIn("Killed 3 Job", stdout)
+
+    def test_kill_unmatched_pattern_prevents_all_deletions(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            client.return_value.list_jobs.return_value = {"items": [{"metadata": {"name": "benchmark-a"}}]}
+            code, _, stderr = self.invoke("kill", "benchmark-*", "missing-*")
+            self.assertEqual(code, 4)
+            self.assertIn("nothing deleted", stderr)
+            delete.assert_not_called()
+
+    def test_kill_dry_run_resolves_patterns_without_deleting_or_coder_auth(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete, patch("falcon.cli._authenticated_coder_connection") as auth:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}} for name in ("benchmark-a", "coder-user-workspace")
+            ]}
+            code, stdout, stderr = self.invoke("kill", "*", "--dry-run", "--output", "json")
+            self.assertEqual((code, stderr), (0, ""))
+            data = json.loads(stdout)["data"]
+            self.assertEqual(data["jobs"], ["benchmark-a", "coder-user-workspace"])
+            self.assertFalse(data["killed"])
+            self.assertTrue(data["dry_run"])
+            delete.assert_not_called()
+            auth.assert_not_called()
+
+    def test_kill_literal_dry_run_does_not_require_listing_and_reports_owner(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            code, stdout, stderr = self.invoke("kill", "job-a", "coder-user-workspace", "--dry-run")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertIn("Kubernetes Job deletion", stdout)
+            self.assertIn("Coder workspace deletion", stdout)
+            client.assert_not_called()
+            delete.assert_not_called()
+
+    def test_kill_question_mark_and_character_class_patterns(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets", return_value=([], ["job-a", "job-b"])) as delete:
+            client.return_value.list_jobs.return_value = {"items": [
+                {"metadata": {"name": name}} for name in ("job-a", "job-b", "job-aa")
+            ]}
+            code, _, stderr = self.invoke("kill", "job-?", "job-[ab]")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(delete.call_args.args[0], ["job-a", "job-b"])
+
+    def test_kill_pattern_coder_matches_use_existing_owner_routing(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets", return_value=([("workspace", "coder-user-workspace")], [])) as delete:
+            client.return_value.list_jobs.return_value = {"items": [{"metadata": {"name": "coder-user-workspace"}}]}
+            code, _, stderr = self.invoke("kill", "coder-*")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(delete.call_args.args[0], ["coder-user-workspace"])
+
+    def test_kill_pattern_listing_failure_never_deletes(self) -> None:
+        with patch("falcon.cli.KubernetesClient") as client, patch("falcon.cli._delete_job_targets") as delete:
+            client.return_value.list_jobs.side_effect = KubernetesError("Forbidden")
+            code, _, stderr = self.invoke("kill", "benchmark-*")
+            self.assertEqual(code, EXIT_KUBERNETES)
+            self.assertIn("Forbidden", stderr)
+            delete.assert_not_called()
+
+    def test_kill_dry_run_retains_last_job_fallback(self) -> None:
+        with patch("falcon.cli.target_job", return_value="last-job") as last, patch("falcon.cli._delete_job_targets") as delete:
+            code, stdout, stderr = self.invoke("kill", "--dry-run", "--output", "json")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["data"]["jobs"], ["last-job"])
+            last.assert_called_once_with(None)
+            delete.assert_not_called()
+
     def test_unavailable_kubernetes_has_distinct_exit(self) -> None:
         class Broken:
             def __init__(self, namespace):
@@ -1262,6 +1421,36 @@ class InspectionCliTests(CliHarness):
 
 
 class SetupTests(unittest.TestCase):
+    def test_mcp_setup_asks_before_continuing_with_old_claude(self) -> None:
+        stderr = io.StringIO()
+        with patch(
+            "falcon.mcp_config.claude_code_mcp_warning",
+            return_value="Claude Code is too old; upgrade it",
+        ), patch("builtins.input", return_value="n") as prompt, contextlib.redirect_stderr(
+            stderr
+        ):
+            allowed = _confirm_claude_mcp_compatibility(
+                ["claude"], all_agents=False, non_interactive=False
+            )
+
+        self.assertFalse(allowed)
+        self.assertIn("Claude Code is too old", stderr.getvalue())
+        self.assertIn("rerun falcon setup", stderr.getvalue())
+        self.assertIn("without upgrading Claude Code", prompt.call_args.args[0])
+
+    def test_noninteractive_mcp_setup_warns_but_can_continue(self) -> None:
+        stderr = io.StringIO()
+        with patch(
+            "falcon.mcp_config.claude_code_mcp_warning",
+            return_value="Claude Code is too old; upgrade it",
+        ), contextlib.redirect_stderr(stderr):
+            allowed = _confirm_claude_mcp_compatibility(
+                None, all_agents=True, non_interactive=True
+            )
+
+        self.assertTrue(allowed)
+        self.assertIn("Claude Code is too old", stderr.getvalue())
+
     def test_interactive_skill_offer_warns_about_increased_usage(self) -> None:
         args = SimpleNamespace(
             uninstall_skills=None,

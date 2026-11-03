@@ -6,14 +6,18 @@ import json
 import posixpath
 import subprocess
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import yaml
 
 from .models import SubmittedJob
 
 DEFAULT_TIMEOUT = 15.0
+MCP_KUBERNETES_RETRY_SECONDS = 60.0
+_RETRY_DEADLINE: ContextVar[Optional[float]] = ContextVar("falcon_kubernetes_deadline", default=None)
 
 _ZSH_DEBUG_RC = """\
 export CONDA_AUTO_ACTIVATE_BASE=false
@@ -148,6 +152,13 @@ class KubernetesError(RuntimeError):
     def unavailable(self) -> bool:
         text = f"{self} {self.stderr}".lower()
         markers = (
+            "timed out",
+            "tls handshake timeout",
+            "service unavailable",
+            "kubernetes unavailable",
+            "connection reset",
+            "unexpected eof",
+            "temporary failure in name resolution",
             "unable to connect",
             "connection refused",
             "i/o timeout",
@@ -156,6 +167,38 @@ class KubernetesError(RuntimeError):
             "couldn't get current server api group",
         )
         return any(marker in text for marker in markers)
+
+
+def retry_kubernetes_operation(function, /, *args, **kwargs):
+    """Retry an MCP operation within one deadline; writes reconcile by UID/key."""
+    if _RETRY_DEADLINE.get() is not None:
+        return function(*args, **kwargs)
+    deadline = time.monotonic() + MCP_KUBERNETES_RETRY_SECONDS
+    token = _RETRY_DEADLINE.set(deadline)
+    delay = 1.0
+    failure = None
+    try:
+        while True:
+            if failure is not None and time.monotonic() >= deadline:
+                raise KubernetesError(
+                    "Kubernetes is unavailable after 60 seconds of internal retries. "
+                    "Inform the user that cluster access could not be restored. "
+                    "This does not mean the workload failed. A write may have been accepted; "
+                    "reuse the original submission key or Job reference when retrying."
+                ) from failure
+            try:
+                return function(*args, **kwargs)
+            except KubernetesError as exc:
+                if not exc.unavailable:
+                    raise
+                failure = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 5.0)
+    finally:
+        _RETRY_DEADLINE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -178,6 +221,7 @@ class KubernetesClient:
         namespace: str = "default",
         *,
         executable: str = "kubectl",
+        context: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         clock: Callable[[], float] = time.monotonic,
@@ -189,11 +233,19 @@ class KubernetesClient:
             raise ValueError("Kubernetes timeout must be positive")
         self.namespace = namespace
         self.executable = executable
+        self.context = context
         self.timeout = float(timeout)
         self._runner = runner
         self._clock = clock
         self._sleep = sleeper
         self._closed = False
+
+    def command_argv(self, args: Sequence[str]) -> List[str]:
+        """Build argv, optionally pinned to the context captured by an MCP session."""
+        prefix = [self.executable]
+        if self.context is not None:
+            prefix += ["--context", self.context]
+        return [*prefix, *map(str, args)]
 
     def _run(
         self,
@@ -203,21 +255,28 @@ class KubernetesClient:
         timeout: Optional[float] = None,
         capture: bool = True,
         check: bool = True,
+        preserve_carriage_returns: bool = False,
     ) -> ProcessResult:
         if self._closed:
             raise KubernetesError("Kubernetes client is closed")
-        argv = [self.executable, *map(str, args)]
+        argv = self.command_argv(args)
         timeout_value = (
             self.timeout
             if timeout is None
             else (None if timeout <= 0 else timeout)
         )
+        deadline = _RETRY_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KubernetesError("Kubernetes command timed out before retry")
+            timeout_value = min(timeout_value, remaining) if timeout_value is not None else remaining
         try:
             completed = self._runner(
                 argv,
-                input=input_text,
+                input=(input_text.encode("utf-8") if preserve_carriage_returns and input_text is not None else input_text),
                 capture_output=capture,
-                text=True,
+                text=not preserve_carriage_returns,
                 timeout=timeout_value,
                 check=False,
             )
@@ -239,17 +298,19 @@ class KubernetesClient:
         result = ProcessResult(
             argv=tuple(argv),
             returncode=int(completed.returncode),
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
+            stdout=(completed.stdout.decode("utf-8", errors="replace") if isinstance(completed.stdout, bytes) else completed.stdout) or "",
+            stderr=(completed.stderr.decode("utf-8", errors="replace") if isinstance(completed.stderr, bytes) else completed.stderr) or "",
         )
-        if check and result.returncode:
+        if result.returncode and (check or deadline is not None):
             detail = result.stderr.strip() or result.stdout.strip()
-            raise KubernetesError(
+            error = KubernetesError(
                 detail or f"Kubernetes command exited {result.returncode}",
                 returncode=result.returncode,
                 stderr=result.stderr,
                 command=argv,
             )
+            if check or error.unavailable:
+                raise error
         return result
 
     @staticmethod
@@ -361,6 +422,23 @@ class KubernetesClient:
             created=True,
         )
 
+    def create_service(self, manifest: Mapping[str, Any]) -> Dict[str, Any]:
+        return self._json(self._run(
+            ["create", "--filename", "-", "--output", "json"],
+            input_text=yaml.safe_dump(dict(manifest), sort_keys=False),
+        ))
+
+    def delete_service_uid(self, name: str, uid: str, *, namespace: Optional[str] = None) -> ProcessResult:
+        if not name or not uid:
+            raise ValueError("Service name and UID are required")
+        path = f"/api/v1/namespaces/{quote(namespace or self.namespace, safe='')}/services/{quote(name, safe='')}"
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({
+                "apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid},
+            }),
+        )
+
     def delete_jobs(
         self,
         names: Iterable[str],
@@ -379,6 +457,66 @@ class KubernetesClient:
             ],
             timeout=max(self.timeout, 40.0) if wait else self.timeout,
         )
+
+    def delete_job_uid(
+        self, name: str, uid: str, *, namespace: Optional[str] = None,
+        propagation_policy: str = "Background",
+    ) -> ProcessResult:
+        """Delete exactly one Job identity, not a same-name replacement.
+
+        The API checks the UID atomically. A preceding GET alone would leave
+        a race between identity validation and ordinary ``kubectl delete``.
+        """
+        if not name or not uid:
+            raise ValueError("Job name and UID are required")
+        if propagation_policy not in {"Background", "Foreground", "Orphan"}:
+            raise ValueError("invalid Job deletion propagation policy")
+        effective = namespace or self.namespace
+        path = (
+            "/apis/batch/v1/namespaces/"
+            f"{quote(effective, safe='')}/jobs/{quote(name, safe='')}"
+        )
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({
+                "apiVersion": "v1", "kind": "DeleteOptions",
+                "preconditions": {"uid": uid},
+                "propagationPolicy": propagation_policy,
+            }),
+        )
+
+    def delete_pod_uid(self, name: str, uid: str, *, namespace: Optional[str] = None) -> ProcessResult:
+        """Delete a specific old attempt, never a same-name replacement Pod."""
+        if not name or not uid:
+            raise ValueError("Pod name and UID are required")
+        effective = namespace or self.namespace
+        path = f"/api/v1/namespaces/{quote(effective, safe='')}/pods/{quote(name, safe='')}"
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({"apiVersion": "v1", "kind": "DeleteOptions",
+                                   "preconditions": {"uid": uid}, "propagationPolicy": "Background"}),
+        )
+
+    def finish_orphaned_job_deletion(
+        self, job: Mapping[str, Any], *, namespace: Optional[str] = None,
+    ) -> None:
+        """Recover an old orphan deletion after the caller deletes its old Pods."""
+        metadata = job.get("metadata") or {}
+        finalizers = metadata.get("finalizers") or []
+        if not metadata.get("deletionTimestamp") or "orphan" not in finalizers:
+            return
+        if not metadata.get("uid") or not metadata.get("resourceVersion"):
+            raise KubernetesError("Job UID and resourceVersion are required for orphan recovery")
+        operations = [
+            {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+            {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]},
+            {"op": "test", "path": "/metadata/finalizers", "value": finalizers},
+            {"op": "remove", "path": f"/metadata/finalizers/{finalizers.index('orphan')}"},
+        ]
+        self._run([
+            "patch", "job", metadata["name"], "--namespace", namespace or self.namespace,
+            "--type=json", "--patch", json.dumps(operations),
+        ])
 
     def delete_pod(
         self,
@@ -487,6 +625,8 @@ class KubernetesClient:
         namespace: Optional[str] = None,
         tail: int = -1,
         container: Optional[str] = None,
+        timestamps: bool = False,
+        since_time: Optional[str] = None,
     ) -> ProcessResult:
         """Return bounded, non-following logs for one Pod attempt.
 
@@ -507,11 +647,16 @@ class KubernetesClient:
         ]
         if container:
             args += ["--container", container]
+        if timestamps:
+            args.append("--timestamps=true")
+        if since_time is not None:
+            args += ["--since-time", since_time]
         return self._run(
             args,
             capture=True,
             check=False,
             timeout=self.timeout,
+            preserve_carriage_returns=True,
         )
 
     def attach_stream(
@@ -531,14 +676,13 @@ class KubernetesClient:
         if not pod_name:
             raise ValueError("Kubernetes Pod name must not be empty")
         effective = namespace or self.namespace
-        args = [
-            self.executable,
+        args = self.command_argv([
             "attach",
             pod_name,
             "--namespace", effective,
             "--stdin=false",
             "--tty=false",
-        ]
+        ])
         if container:
             args += ["--container", container]
         try:
