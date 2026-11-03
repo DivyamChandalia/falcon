@@ -24,7 +24,7 @@ from falcon.cli import (
     main,
     resolve_preset,
 )
-from falcon.completion import COMMAND_ALIASES, candidates, shell_script
+from falcon.completion import BASE_COMMANDS, candidates, resolve_command, shell_script
 from falcon.config import (
     DEFAULT_CONFIG,
     ensure_kubectl_in_home,
@@ -119,13 +119,21 @@ class ParserTests(CliHarness):
         self.assertEqual(code, EXIT_USAGE)
         self.assertIn("pro6000 supports at most 2", stderr)
 
-    def test_one_letter_command_aliases_rewrite_to_canonical_commands(self) -> None:
-        for alias, canonical in COMMAND_ALIASES.items():
-            with self.subTest(alias=alias):
-                self.assertEqual(
-                    _rewrite_shorthand([alias, "value"], DEFAULT_CONFIG),
-                    [canonical, "value"],
-                )
+    def test_every_command_accepts_all_unambiguous_prefixes(self) -> None:
+        for canonical in BASE_COMMANDS:
+            for length in range(1, len(canonical) + 1):
+                prefix = canonical[:length]
+                matches = [name for name in BASE_COMMANDS if name.startswith(prefix)]
+                with self.subTest(prefix=prefix, command=canonical):
+                    if len(matches) == 1 or prefix in BASE_COMMANDS:
+                        self.assertEqual(resolve_command(prefix), canonical)
+                        self.assertEqual(
+                            _rewrite_shorthand([prefix, "value"], DEFAULT_CONFIG),
+                            [canonical, "value"],
+                        )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Ambiguous command"):
+                            resolve_command(prefix)
 
     def test_unknown_preset_is_not_rewritten(self) -> None:
         self.assertIsNone(resolve_preset("bogus", DEFAULT_CONFIG))
@@ -146,8 +154,7 @@ class ParserTests(CliHarness):
         self.assertNotIn("delete", commands)
         self.assertIn("kill", commands)
         self.assertIn("metrics", commands)
-        for alias in COMMAND_ALIASES:
-            self.assertNotIn(alias, commands)
+        self.assertNotIn("d", commands)
         self.assertIn("h100", commands)
         self.assertNotIn("h100x2", commands)
         self.assertEqual(
@@ -199,7 +206,7 @@ class ParserTests(CliHarness):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            return completed.stdout.splitlines()
+            return [line for line in completed.stdout.splitlines() if line]
 
         top_level = complete("falcon ''", 1)
         self.assertEqual(
@@ -217,6 +224,63 @@ class ParserTests(CliHarness):
             [f"h100x{count}" for count in range(2, 9)],
         )
         self.assertEqual(complete("falcon pro6000", 1), ["pro6000x2"])
+        for typo, expected in [
+            ("dasboard", ["dashboard"]), ("resoures", ["resources"]),
+            ("resuo", ["resources"]), ("dashba", ["dashboard"]),
+            ("dash", ["dashboard"]), ("res", ["resources"]),
+            ("l", ["logs"]), ("k", ["kill"]),
+            ("c", ["clean", "coder", "config", "completion"]),
+            ("zzzzzz", []),
+        ]:
+            with self.subTest(word=typo):
+                self.assertEqual(complete(f"falcon {typo}", 1), expected)
+        self.assertIn("--demo", complete("falcon dash ''", 2))
+        self.assertIn("--node", complete("falcon res ''", 2))
+
+    def test_zsh_completes_command_typos_and_prefixes(self) -> None:
+        executable = shutil.which("zsh")
+        if executable is None:
+            self.skipTest("zsh is unavailable")
+        script = shell_script("zsh", config=DEFAULT_CONFIG)
+        # Exercise the completion function with ZLE's output hook captured.
+        hooks = '''
+compdef() { :; }
+compadd() {
+  while (( $# )); do
+    if [[ "$1" == -- ]]; then shift; print -rl -- "$@"; return; fi
+    shift
+  done
+}
+typeset -A compstate
+'''
+        for word, expected in [
+            ("dasboard", ["dashboard"]), ("resoures", ["resources"]),
+            ("resuo", ["resources"]), ("dashba", ["dashboard"]),
+            ("dash", ["dashboard"]), ("res", ["resources"]),
+            ("c", ["clean", "coder", "config", "completion"]),
+        ]:
+            with self.subTest(word=word):
+                result = subprocess.run(
+                    [executable, "-f"], input=hooks + script + f"\nwords=(falcon {word}); CURRENT=2; _falcon_native\n",
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_prefix_preserves_global_options_and_workload_arguments(self) -> None:
+        self.assertEqual(
+            _rewrite_shorthand(["--config", "/tmp/example", "dash", "--job", "resoures"], DEFAULT_CONFIG),
+            ["--config", "/tmp/example", "dashboard", "--job", "resoures"],
+        )
+        self.assertEqual(
+            _rewrite_shorthand(["h100", "--", "dasboard"], DEFAULT_CONFIG)[-2:],
+            ["--", "dasboard"],
+        )
+        code, _, stderr = self.invoke("dasboard")
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Did you mean dashboard", stderr)
+        code, _, stderr = self.invoke("c")
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Ambiguous command", stderr)
 
     def test_resources_completion_includes_consumer_bound(self) -> None:
         self.assertIn(

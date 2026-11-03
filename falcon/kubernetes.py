@@ -6,6 +6,7 @@ import json
 import posixpath
 import subprocess
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from urllib.parse import quote
@@ -15,6 +16,8 @@ import yaml
 from .models import SubmittedJob
 
 DEFAULT_TIMEOUT = 15.0
+MCP_KUBERNETES_RETRY_SECONDS = 60.0
+_RETRY_DEADLINE: ContextVar[Optional[float]] = ContextVar("falcon_kubernetes_deadline", default=None)
 
 _ZSH_DEBUG_RC = """\
 export CONDA_AUTO_ACTIVATE_BASE=false
@@ -149,6 +152,13 @@ class KubernetesError(RuntimeError):
     def unavailable(self) -> bool:
         text = f"{self} {self.stderr}".lower()
         markers = (
+            "timed out",
+            "tls handshake timeout",
+            "service unavailable",
+            "kubernetes unavailable",
+            "connection reset",
+            "unexpected eof",
+            "temporary failure in name resolution",
             "unable to connect",
             "connection refused",
             "i/o timeout",
@@ -157,6 +167,38 @@ class KubernetesError(RuntimeError):
             "couldn't get current server api group",
         )
         return any(marker in text for marker in markers)
+
+
+def retry_kubernetes_operation(function, /, *args, **kwargs):
+    """Retry an MCP operation within one deadline; writes reconcile by UID/key."""
+    if _RETRY_DEADLINE.get() is not None:
+        return function(*args, **kwargs)
+    deadline = time.monotonic() + MCP_KUBERNETES_RETRY_SECONDS
+    token = _RETRY_DEADLINE.set(deadline)
+    delay = 1.0
+    failure = None
+    try:
+        while True:
+            if failure is not None and time.monotonic() >= deadline:
+                raise KubernetesError(
+                    "Kubernetes is unavailable after 60 seconds of internal retries. "
+                    "Inform the user that cluster access could not be restored. "
+                    "This does not mean the workload failed. A write may have been accepted; "
+                    "reuse the original submission key or Job reference when retrying."
+                ) from failure
+            try:
+                return function(*args, **kwargs)
+            except KubernetesError as exc:
+                if not exc.unavailable:
+                    raise
+                failure = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 5.0)
+    finally:
+        _RETRY_DEADLINE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -213,6 +255,7 @@ class KubernetesClient:
         timeout: Optional[float] = None,
         capture: bool = True,
         check: bool = True,
+        preserve_carriage_returns: bool = False,
     ) -> ProcessResult:
         if self._closed:
             raise KubernetesError("Kubernetes client is closed")
@@ -222,12 +265,18 @@ class KubernetesClient:
             if timeout is None
             else (None if timeout <= 0 else timeout)
         )
+        deadline = _RETRY_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KubernetesError("Kubernetes command timed out before retry")
+            timeout_value = min(timeout_value, remaining) if timeout_value is not None else remaining
         try:
             completed = self._runner(
                 argv,
-                input=input_text,
+                input=(input_text.encode("utf-8") if preserve_carriage_returns and input_text is not None else input_text),
                 capture_output=capture,
-                text=True,
+                text=not preserve_carriage_returns,
                 timeout=timeout_value,
                 check=False,
             )
@@ -249,17 +298,19 @@ class KubernetesClient:
         result = ProcessResult(
             argv=tuple(argv),
             returncode=int(completed.returncode),
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
+            stdout=(completed.stdout.decode("utf-8", errors="replace") if isinstance(completed.stdout, bytes) else completed.stdout) or "",
+            stderr=(completed.stderr.decode("utf-8", errors="replace") if isinstance(completed.stderr, bytes) else completed.stderr) or "",
         )
-        if check and result.returncode:
+        if result.returncode and (check or deadline is not None):
             detail = result.stderr.strip() or result.stdout.strip()
-            raise KubernetesError(
+            error = KubernetesError(
                 detail or f"Kubernetes command exited {result.returncode}",
                 returncode=result.returncode,
                 stderr=result.stderr,
                 command=argv,
             )
+            if check or error.unavailable:
+                raise error
         return result
 
     @staticmethod
@@ -369,6 +420,23 @@ class KubernetesClient:
                 else None
             ),
             created=True,
+        )
+
+    def create_service(self, manifest: Mapping[str, Any]) -> Dict[str, Any]:
+        return self._json(self._run(
+            ["create", "--filename", "-", "--output", "json"],
+            input_text=yaml.safe_dump(dict(manifest), sort_keys=False),
+        ))
+
+    def delete_service_uid(self, name: str, uid: str, *, namespace: Optional[str] = None) -> ProcessResult:
+        if not name or not uid:
+            raise ValueError("Service name and UID are required")
+        path = f"/api/v1/namespaces/{quote(namespace or self.namespace, safe='')}/services/{quote(name, safe='')}"
+        return self._run(
+            ["delete", "--raw", path, "--filename", "-"],
+            input_text=json.dumps({
+                "apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid},
+            }),
         )
 
     def delete_jobs(
@@ -588,6 +656,7 @@ class KubernetesClient:
             capture=True,
             check=False,
             timeout=self.timeout,
+            preserve_carriage_returns=True,
         )
 
     def attach_stream(

@@ -360,13 +360,15 @@ class DashboardTerminal(ScrollableContainer, inherit_bindings=False):
             self.call_after_refresh(self._follow_output, position)
         elif removed:
             self.call_after_refresh(
-                self.scroll_to, y=max(0, position - removed), animate=False, force=True
+                self.scroll_to, y=max(0, position - removed), animate=False, force=True, immediate=True
             )
 
     def _follow_output(self, previous_position: float) -> None:
         # A wheel/drag may have moved the viewport since output was queued.
         if not self.search_query and abs(self.scroll_y - previous_position) < 0.01:
-            self.scroll_end(animate=False)
+            # The guard and scroll must happen together. A second deferred
+            # scroll can otherwise override a user scroll after this check.
+            self.scroll_end(animate=False, immediate=True)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         self.app.set_focus(self, scroll_visible=False)

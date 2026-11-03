@@ -17,6 +17,7 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from falcon.config import DEFAULT_CONFIG
+from falcon.kubernetes import KubernetesError
 from falcon.mcp_server import create_server
 
 REF = {"name": "train", "uid": "uid-1"}
@@ -61,6 +62,89 @@ class FakeService:
 
 
 @pytest.mark.asyncio
+async def test_tool_retries_transient_failure_without_agent_intervention(monkeypatch):
+    service = FakeService(DEFAULT_CONFIG)
+    calls = []
+
+    def list_jobs(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise KubernetesError("connection refused")
+        return {"jobs": []}
+
+    service.list_jobs = list_jobs
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("list_jobs", {})
+        assert not result.isError
+        assert result.structuredContent == {"jobs": []}
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_reports_kubernetes_unavailable_after_retry_budget(monkeypatch):
+    monkeypatch.setattr("falcon.kubernetes.MCP_KUBERNETES_RETRY_SECONDS", 0.01)
+    service = FakeService(DEFAULT_CONFIG)
+
+    def list_jobs(**kwargs):
+        raise KubernetesError("Kubernetes command timed out after 15s")
+
+    service.list_jobs = list_jobs
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("list_jobs", {})
+        assert result.isError
+        assert "Kubernetes is unavailable" in result.content[0].text
+        assert "Inform the user" in result.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restart_job", "cancel_job"])
+async def test_retried_mutation_keeps_original_resolved_uid(method):
+    service = FakeService(DEFAULT_CONFIG)
+    resolved = []
+    received = []
+
+    def resolve(ref):
+        resolved.append(ref)
+        return REF
+
+    def mutate(ref, **kwargs):
+        received.append(ref.copy())
+        if len(received) == 1:
+            raise KubernetesError("TLS handshake timeout")
+        return {"job": ref}
+
+    service._job_ref = resolve
+    setattr(service, method, mutate)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool(method, {"job": {"name": "train"}})
+        assert not result.isError
+    assert len(resolved) == 1
+    assert received == [REF, REF]
+
+
+@pytest.mark.asyncio
+async def test_cancel_timeout_reconciles_deleted_job():
+    service = FakeService(DEFAULT_CONFIG)
+    calls = []
+
+    def cancel(ref):
+        calls.append(ref)
+        if len(calls) == 1:
+            raise KubernetesError("Kubernetes command timed out")
+        raise KubernetesError("NotFound")
+
+    service.cancel_job = cancel
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool("cancel_job", {"job": REF})
+        assert not result.isError
+        assert result.structuredContent == {"job": REF, "cancelled": True}
+
+
+@pytest.mark.asyncio
 async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
     with patch("falcon.mcp_server.JobService") as service:
         server = create_server(DEFAULT_CONFIG)
@@ -70,6 +154,7 @@ async def test_catalog_is_lazy_and_annotations_preserve_host_approvals():
             assert set(tools) == {
                 "plan_job", "submit_job", "list_jobs", "inspect_job", "job_logs",
                 "job_metrics", "wait_for_events", "cancel_job", "restart_job",
+                "create_service", "list_services", "inspect_service", "delete_service",
             }
             assert tools["wait_for_events"].annotations.readOnlyHint
             assert not tools["submit_job"].annotations.readOnlyHint
@@ -405,7 +490,7 @@ async def test_real_stdio_catalog_has_no_stdout_noise_or_cluster_access(tmp_path
         async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=15)) as session:
             await session.initialize()
             catalog = await session.list_tools()
-            assert len(catalog.tools) == 9
+            assert len(catalog.tools) == 13
     assert not state.exists(), "catalog discovery must not open state or query Kubernetes"
 
 

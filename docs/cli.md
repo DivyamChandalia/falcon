@@ -212,14 +212,30 @@ or operation failure, `4` object not found, `5` safe-install conflict, `6`
 Coder API/configuration failure, `7` update check/install failure, and `130`
 interrupted.
 
-## Short aliases
+## Partial commands and completion
 
-`j` jobs, `g` get, `e` events, `l` logs, `a` attach, `t` top, `m` metrics,
-`k` kill, `c` clean, `d` dashboard, `r` resources, and `s` setup. Completion
-shows base GPU presets first; after a GPU preset, the next Tab completes only
+Every top-level command accepts any unambiguous prefix: `falcon dash`,
+`falcon res`, `falcon l`, and `falcon k` mean `dashboard`, `resources`, `logs`,
+and `kill`. Full names always work. Ambiguous prefixes require more letters:
+`c` matches clean, coder, config, and completion; `m` matches metrics and mcp.
+This replaces the former fixed one-letter aliases for `c` and `m`.
+
+Tab expands prefixes and corrects command misspellings in Bash and Zsh:
+`falcon dasboard<Tab>` becomes `falcon dashboard`, and
+`falcon resoures<Tab>` becomes `falcon resources`. Prefix matches take priority;
+otherwise completion offers the closest command names or prefixes within two
+edits for words of at least four characters. Unfinished typos work too:
+`falcon resuo<Tab>` completes to `falcon resources`. Typed misspellings show suggestions and do not
+execute automatically. Job names, paths, GPU presets, and commands after `--`
+are not fuzzily rewritten. Reload completion after updating:
+
+```console
+eval "$(falcon completion zsh)"  # use bash for Bash
+```
+
+Completion shows base GPU presets first; after a GPU preset, Tab completes only
 the counts allowed by that preset (`h100x2` through `h100x8`, `2080tix2`
 through `2080tix4`, and `a6000x2`/`pro6000x2`). `falcon coder <Tab>` lists only
 short workspace names read from
 live Coder Job labels—for example, `falcon` or `lime-gull-30`—and no presets or
-options. One-letter aliases remain accepted but are intentionally omitted from
-completion suggestions.
+options. Command suggestions show full names.

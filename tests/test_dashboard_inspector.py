@@ -455,7 +455,8 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("LOGS", logs.border_title)
             self.assertIn("SELECTED JOB", app.query_one("#selected-pane").border_title)
-            self.assertIn("current-attempt", app.query_one("#selected-pane").border_subtitle)
+            self.assertEqual(app.query_one("#selected-pane").border_subtitle, "")
+            self.assertIn("current-attempt", logs.border_title)
             self.assertIn("live-79", app.export_screenshot(simplify=True))
 
             # A terminal reconnect can leave the app's remembered top-level

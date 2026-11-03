@@ -2342,15 +2342,22 @@ class FalconDashboard(App):
             # Textual screen is being torn down.
             return
 
+    def _pane_title(self, pane: str) -> str:
+        focused = self.app_focus and pane == self.state.focused_pane
+        base = {
+            "jobs": "JOBS", "selected": "SELECTED JOB",
+            "resources": "RESOURCE USAGE", "events": "EVENTS",
+        }[pane]
+        if pane == "resources":
+            row = self._selected_row()
+            if row is not None:
+                base += " — " + _truncate(row.job, 42)
+        return f" {base}{' · focused' if focused else ''} "
+
     def _set_titles(self) -> None:
         for pane in ("jobs", "selected", "resources", "events"):
             widget = self.query_one(f"#{pane}-pane", DashboardPane)
-            focused = self.app_focus and pane == self.state.focused_pane
-            base = {
-                "jobs": "JOBS", "selected": "SELECTED JOB",
-                "resources": "RESOURCE USAGE", "events": "EVENTS",
-            }[pane]
-            widget.border_title = f" {base}{' · focused' if focused else ''} "
+            widget.border_title = self._pane_title(pane)
         self._set_selected_subtitle()
 
     def _render_header(self) -> None:
@@ -2759,7 +2766,7 @@ class FalconDashboard(App):
         )
 
     def _set_selected_subtitle(self) -> None:
-        """Show the active inspector section and selected Pod in its border."""
+        """Highlight inspector focus; inner output borders identify the attempt."""
 
         try:
             target = self.query_one("#selected-pane", DashboardPane)
@@ -2789,10 +2796,7 @@ class FalconDashboard(App):
                 )
             except NoMatches:
                 pass
-        row = self._selected_row()
-        section = "ISSUE / FIX" if self.state.selected_section == "summary" else self.state.selected_section.upper()
-        terminal = self._active_terminal()
-        target.border_subtitle = f" TERMINAL · {terminal.label} " if terminal else f" {section} · {self._selected_attempt_label(row)} "
+        target.border_subtitle = ""
 
     def _focus_selected_section(self) -> None:
         """Give the selected output or issue/fix viewport keyboard focus."""
@@ -3943,7 +3947,7 @@ class FalconDashboard(App):
     def _render_resources(self) -> None:
         target = self.query_one("#resources-pane", DashboardPane)
         row = self._selected_row()
-        target.border_title = f" RESOURCE USAGE{(' — ' + _truncate(row.job, 42)) if row else ''} "
+        target.border_title = self._pane_title("resources")
         if not row:
             target.update(Align.center("Resource metrics unavailable for this Job.", vertical="middle"))
             return

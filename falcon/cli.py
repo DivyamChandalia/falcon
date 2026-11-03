@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import fnmatch
 import getpass
 import os
@@ -48,7 +49,7 @@ from .coder import (
     workspace_job_name,
 )
 from .commands import attach, capture_logs, kill, remember_job, target_job, top
-from .completion import COMMAND_ALIASES, shell_script
+from .completion import BASE_COMMANDS, resolve_command, shell_script
 from .config import (
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
     DEFAULT_CONFIG,
@@ -552,12 +553,6 @@ def _rewrite_shorthand(
         )
     if remaining[0] == "delete":
         raise CliError("'falcon delete' was removed; use 'falcon kill JOB'")
-    if remaining[0] in COMMAND_ALIASES:
-        return [
-            *prefix,
-            COMMAND_ALIASES[remaining[0]],
-            *remaining[1:],
-        ]
     if remaining[0] in public_commands or remaining[0] in {"-h", "--help", "--version"}:
         return argv
     resolved = resolve_preset(remaining[0], config)
@@ -572,6 +567,12 @@ def _rewrite_shorthand(
             str(count),
             *remaining[1:],
         ]
+    try:
+        command = resolve_command(remaining[0])
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    if command is not None:
+        return [*prefix, command, *remaining[1:]]
     before_command = (
         remaining[: remaining.index("--")] if "--" in remaining else remaining
     )
@@ -594,6 +595,10 @@ def _rewrite_shorthand(
             else:
                 rewritten.append(token)
         return [*prefix, *rewritten]
+    if not remaining[0].startswith("-"):
+        suggestions = difflib.get_close_matches(remaining[0], BASE_COMMANDS, n=3, cutoff=0.65)
+        if suggestions:
+            raise CliError(f"Unknown command {remaining[0]!r}. Did you mean {', '.join(suggestions)}? Press Tab to complete.")
     return argv
 
 

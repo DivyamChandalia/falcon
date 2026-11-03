@@ -63,6 +63,36 @@ def test_failure_log_budget_preserves_small_payload():
     assert payload == original
 
 
+def test_internal_submission_retry_reconciles_an_accepted_create(tmp_path, monkeypatch):
+    from falcon.kubernetes import retry_kubernetes_operation
+
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    create = client.create_job
+    get = client.get_json
+    accepted = []
+    failed_read = []
+
+    def create_then_timeout(manifest):
+        accepted.append(create(manifest))
+        raise KubernetesError("TLS handshake timeout")
+
+    def interrupted_reconciliation(*args, **kwargs):
+        if accepted and not failed_read:
+            failed_read.append(True)
+            raise KubernetesError("connection refused")
+        return get(*args, **kwargs)
+
+    monkeypatch.setattr(client, "create_job", create_then_timeout)
+    monkeypatch.setattr(client, "get_json", interrupted_reconciliation)
+    result = retry_kubernetes_operation(service.submit_job, _request(), "accepted-key")
+    assert result["reused"] is True
+    assert len(accepted) == 1
+    assert len(client.jobs) == 1
+    assert result["uid"] == accepted[0]["metadata"]["uid"]
+    asyncio.run(service.close())
+
+
 def _config() -> dict:
     value = copy.deepcopy(DEFAULT_CONFIG)
     value["cluster"].update(
@@ -589,6 +619,94 @@ def test_logs_use_exact_owner_uid_incremental_cursors_and_workload_exit_code(
     with pytest.raises(MCPServiceError, match="not an attempt"):
         service.job_logs(ref, pods=["foreign"])
     asyncio.run(service.close())
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_tqdm_frames_collapse_in_live_and_archived_logs(tmp_path, archived):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    ref = service.submit_job(_request(), "progress-key")["job"]
+    client.pods[:] = [_pod(client.jobs[ref["name"]], "running", "pod-running")]
+    text = (
+        "2026-01-01T00:00:01Z loading\r\n"
+        "2026-01-01T00:00:02Z \r10%\r20%\n"
+        "2026-01-01T00:00:02Z \r30%\n"
+        "2026-01-01T00:00:02Z \r40%\n"
+        "2026-01-01T00:00:03Z finished\r\n"
+    )
+    if archived:
+        service._restart_history.save(ref, ref["uid"], None, [{
+            "pod": "running", "pod_uid": "pod-running", "container": "main",
+            "phase": "Failed", "stdout": text, "stderr": "",
+        }])
+    else:
+        client.log_text["running"] = text
+    result = service.job_logs(ref, tail=3)
+    assert result["logs"][0]["stdout"] == (
+        "2026-01-01T00:00:01Z loading\n"
+        "2026-01-01T00:00:02Z 40%\n"
+        "2026-01-01T00:00:03Z finished"
+    )
+    assert result["logs"][0]["timestamped"] is True
+    unchanged = service.job_logs(ref, cursors=result["cursors"])
+    assert unchanged["logs"][0]["stdout"] == ""
+    asyncio.run(service.close())
+
+
+def test_tqdm_cursor_counts_source_frames_before_collapsing(tmp_path):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    ref = service.submit_job(_request(), "progress-cursor-key")["job"]
+    client.pods[:] = [_pod(client.jobs[ref["name"]], "running", "pod-running")]
+    client.log_text["running"] = (
+        "2026-01-01T00:00:01Z message\n"
+        "2026-01-01T00:00:02Z \r10%\n"
+        "2026-01-01T00:00:02Z \r20%\n"
+    )
+    initial = service.job_logs(ref, tail=2)
+    assert "message" in initial["logs"][0]["stdout"]
+    assert "20%" in initial["logs"][0]["stdout"]
+    client.log_text["running"] += "2026-01-01T00:00:02Z \r30%\n"
+    updated = service.job_logs(ref, cursors=initial["cursors"])
+    assert updated["logs"][0]["stdout"] == "2026-01-01T00:00:02Z 30%"
+    assert updated["cursors"] != initial["cursors"]
+    unchanged = service.job_logs(ref, cursors=updated["cursors"])
+    assert unchanged["logs"][0]["stdout"] == ""
+    asyncio.run(service.close())
+
+
+def test_unstamped_progress_and_normal_newlines():
+    from falcon.mcp_service import _incremental_log_text
+
+    text, cursor, state = _incremental_log_text(
+        "first\r\n\r10%\r20%\n\r30%\n\nlast\n",
+        pod_uid="pod", container="main", cursor=None,
+        max_chars=10000, max_bytes=10000, tail=10,
+    )
+    assert text == "first\n30%\n\nlast"
+    assert cursor is None
+    assert state["timestamped"] is False
+
+
+def test_inline_progress_changes_at_same_timestamp_are_not_lost():
+    from falcon.mcp_service import _decode_log_cursor, _incremental_log_text
+
+    cursor = None
+    for frame in ("10%", "20%", "100%"):
+        text, token, _ = _incremental_log_text(
+            f"2026-01-01T00:00:01Z \r0%\r{frame}",
+            pod_uid="pod", container="main", cursor=cursor,
+            max_chars=10000, max_bytes=10000, tail=10,
+        )
+        assert text == f"2026-01-01T00:00:01Z {frame}"
+        cursor = _decode_log_cursor(token)
+    text, token, _ = _incremental_log_text(
+        "2026-01-01T00:00:01Z \r0%\r100%",
+        pod_uid="pod", container="main", cursor=cursor,
+        max_chars=10000, max_bytes=10000, tail=10,
+    )
+    assert text == ""
+    assert token is None  # The service carries the prior cursor on an empty read.
 
 
 def test_job_logs_deduplicate_limit_and_carry_cursor_when_no_new_lines(

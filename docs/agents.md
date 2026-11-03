@@ -157,6 +157,51 @@ this does not cause Falcon to write that path. The Python configuration helper
 also accepts a custom executable path when a client should start a different
 Falcon binary.
 
+### Internal Service endpoints
+
+Expose a server already running in a Falcon Job:
+
+```json
+{
+  "job": {"name": "vllm-server"},
+  "ports": [{"name": "http", "port": 8000, "target_port": 8000}],
+  "idempotency_key": "vllm-endpoint"
+}
+```
+
+Pass these arguments to `create_service`. The Service defaults to the Job's
+name; an optional `name` selects another endpoint name. It always uses
+ClusterIP and targets only that Job UID. Type overrides, public exposure,
+external IPs/names, custom selectors, and namespace overrides are rejected.
+Each port requires a unique name, `port`, and numeric `target_port`; `protocol`
+defaults to TCP and also supports UDP. No Job settings or resource requests
+change, and Falcon does not create a Deployment or port-forward process.
+
+The response includes `service: {name, uid}`, `dns_name`, port addresses, and
+`application_health: "not_checked"`. Use the returned address directly from
+another Pod inside the cluster, subject to its network policies. The server
+must listen on `0.0.0.0` at the target port. Clients outside the cluster still
+need an existing network route or their own forwarding arrangement.
+
+Check application health with a separate `curl` from inside the cluster; Falcon
+does not install readiness probes or assume that an HTTP health route exists.
+`inspect_service` exposes Kubernetes EndpointSlice backend addresses and their
+readiness flags, which describe routing rather than application health. An API
+error remains an error, not an empty/unhealthy backend list. Ordinary
+`wait_for_events` still follows Job failures and eviction risk; Service creation
+does not add application-health events or start a wait.
+
+Reuse the creation key after an ambiguous response. Deleting the endpoint keeps
+the Job running; deleting the Job lets Kubernetes garbage-collect its owned
+Services. A restarted Job has a new UID, and old endpoints never follow it
+automatically. Remove any remaining old endpoint using its Service UID, then
+call `create_service` for the replacement Job with a fresh key. Reusing a key
+for a deleted endpoint returns its deleted identity instead of resurrecting it.
+
+The configured Kubernetes identity needs permission to get/list/create/delete
+Services, read Jobs/Pods, and list EndpointSlices for inspection. Falcon does not
+grant or modify those permissions.
+
 ### Tools and lifecycle rules
 
 MCP Job references accept `{"name": "train"}` for the latest run, or
@@ -179,7 +224,7 @@ normal return or cancellation clears it immediately. Dashboard checks local
 presence every second independently of metrics and Kubernetes watch updates.
 This indicates monitoring, not remaining model quota.
 
-The server exposes exactly these nine tools:
+The server exposes these tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -192,6 +237,10 @@ The server exposes exactly these nine tools:
 | `wait_for_events` | Explicitly follow Job events; configure GPU startup grace and reuse its cursor. |
 | `cancel_job` | Cancel an explicitly identified ordinary Job. |
 | `restart_job` | Relaunch a terminal Job, archive its logs, and optionally record an issue/fix summary. |
+| `create_service` | Expose an existing Falcon Job through a fixed internal ClusterIP Service. |
+| `list_services` | List Falcon MCP-managed endpoints. |
+| `inspect_service` | Inspect DNS, ports, and Kubernetes backend metadata. |
+| `delete_service` | Remove an endpoint while keeping the Job running. |
 
 Use the same idempotency key when retrying an ambiguous `submit_job` response.
 Repeat a restart's source reference, overrides and summary to resume it;
@@ -202,6 +251,21 @@ for Falcon's 120-second minimum grace period, or pass a larger value such as
 kept for that Job while this MCP process is running. `job_logs` can select exact pod identities
 from failure events or use `failed_only`; pod attempts remain separate and are
 not joined into one synthetic log stream.
+
+MCP operations retry transient Kubernetes timeouts and connection failures
+internally with backoff for up to 60 seconds. If access is still unavailable,
+the tool asks the agent to inform the user; it does not classify the workload
+as failed. Submission retries reuse the original idempotency key, and restart
+or cancellation retries stay bound to the resolved Job UID. Permission and
+validation errors return immediately. Active event watches continue their
+existing silent recovery behavior rather than ending after this retry window.
+
+MCP log responses collapse carriage-return progress updates such as `tqdm` to
+their latest state, preserving ordinary newline-separated messages. Log cursors
+follow the source records so collapsed frames are not replayed; changes to a
+progress record are returned even when its timestamp stays the same. This is a
+plain-text snapshot, not a full terminal emulator for nested or ANSI-positioned
+progress bars.
 
 For “schedule/queue and follow” requests, set
 `scheduling_policy="wait_for_capacity"` on each `wait_for_events` call. Recognized

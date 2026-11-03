@@ -209,6 +209,9 @@ eval "$(falcon completion zsh)"  # use bash for Bash
 ```
 
 Completion includes GPU presets, valid counts, Jobs, and Coder workspaces.
+Any unambiguous command prefix works directly (`falcon dash`, `falcon res`,
+`falcon l`, `falcon k`). Tab also corrects command typos such as `dasboard`.
+Ambiguous prefixes such as `c` require more letters or a choice from Tab.
 
 ### Updates and removal
 

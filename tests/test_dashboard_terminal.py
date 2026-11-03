@@ -175,6 +175,29 @@ class TerminalTests(unittest.TestCase):
 
 
 class TerminalDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_output_follow_cannot_override_a_subsequent_manual_scroll(self):
+        from rich.text import Text
+        from textual.app import App
+
+        class TerminalApp(App):
+            def compose(self):
+                yield DashboardTerminal(id="terminal")
+
+            def selected_section_focused(self, section):
+                pass
+
+        app = TerminalApp()
+        async with app.run_test(size=(80, 22)) as pilot:
+            terminal = app.query_one(DashboardTerminal)
+            terminal.update_screen(Text("\n".join(f"line {i}" for i in range(200))), source=(1, 0))
+            await pilot.pause()
+            terminal.scroll_to(y=0, animate=False, immediate=True, force=True)
+            terminal._follow_output(0)
+            # User scrolls after the guarded callback, before the next frame.
+            terminal.scroll_to(y=50, animate=False, immediate=True, force=True)
+            await pilot.pause()
+            self.assertEqual(terminal.scroll_y, 50)
+
     async def test_terminal_output_search_does_not_send_shell_input(self):
         row = _job(PodAttempt("pod-live", "pod-uid", "Running", container="trainer"))
         collector = _Collector(row)

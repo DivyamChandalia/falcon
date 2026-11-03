@@ -582,6 +582,27 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.state.focused_pane, pane)
                 self.assertIn("focused", app.query_one(f"#{pane}-pane").border_title)
 
+    async def test_resource_job_title_survives_clicks_refresh_and_blur(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.pause()
+            resources = app.query_one("#resources-pane", DashboardPane)
+            name = app._selected_row().job
+            for pane in ("resources", "selected", "jobs", "resources"):
+                await pilot.click(f"#{pane}-pane-content", offset=(1, 1))
+                self.assertIn(name, resources.border_title)
+                title = resources.border_title
+                app._render_resources()
+                self.assertEqual(resources.border_title, title)
+            app.app_focus = False
+            await pilot.pause()
+            self.assertIn(name, resources.border_title)
+            self.assertNotIn("focused", resources.border_title)
+            app.app_focus = True
+            await pilot.pause()
+            self.assertIn(name, resources.border_title)
+            self.assertIn("focused", resources.border_title)
+
     async def test_dashboard_refresh_keeps_highlight_off_while_app_is_blurred(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(140, 32)) as pilot:
@@ -3302,6 +3323,7 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
 # export: the settling waits can otherwise advance the header on slow runners.
 @patch.object(FalconDashboard, "_tick_clock", lambda self: None)
 @patch.object(FalconResourcesApp, "_tick_clock", lambda self: None)
+@patch("falcon.dashboard_ui.time.time", lambda: DEMO_NOW)
 class VisualMatrixTests(unittest.IsolatedAsyncioTestCase):
     async def test_combined_pies_rebuild_after_pane_resize(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)

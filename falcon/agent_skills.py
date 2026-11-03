@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 SKILL_NAME = "falcon"
-SKILL_BUNDLE_VERSION = 33
+SKILL_BUNDLE_VERSION = 36
 LEGACY_SKILL_BUNDLE_VERSION = 2
 METADATA_FILE = ".falcon-skill.json"
 SUPPORTED_AGENTS: Tuple[str, ...] = ("codex", "claude", "opencode")

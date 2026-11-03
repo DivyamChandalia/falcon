@@ -22,6 +22,7 @@ from mcp.shared.message import SessionMessage
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
+from .kubernetes import KubernetesError, retry_kubernetes_operation
 from .mcp_config import (
     DEFAULT_WAIT_TIMEOUT_SECONDS,
     MAX_EVICTION_STARTUP_SECONDS,
@@ -64,7 +65,7 @@ async def _run_blocking(function: Callable[..., Any], /, *args: Any, **kwargs: A
 
     def worker() -> None:
         try:
-            result_queue.put((True, function(*args, **kwargs)))
+            result_queue.put((True, retry_kubernetes_operation(function, *args, **kwargs)))
         except BaseException as exc:  # noqa: BLE001 - deliver worker failures
             result_queue.put((False, exc))
 
@@ -168,6 +169,14 @@ class PlanningRequest(SubmissionRequest):
     """Resource-only previews need no workload command; submission still does."""
 
     command: Optional[List[str]] = Field(default=None, min_length=1, max_length=512)
+
+
+class ServicePort(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str = Field(min_length=1, max_length=15, pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+    port: int = Field(ge=1, le=65535)
+    target_port: int = Field(ge=1, le=65535)
+    protocol: Literal["TCP", "UDP"] = "TCP"
 
 
 class RestartSummary(BaseModel):
@@ -291,8 +300,29 @@ def create_server(
         # Sync collectors/SQLite and idempotent operations share state. A long
         # event wait deliberately does not hold this lock or block other tools.
         async with operation_lock:
+            bound_args = args
+            uncertain_cancel = False
+
+            def execute():
+                nonlocal bound_args, uncertain_cancel
+                # Resolve name-only writes once. A retry must never target a
+                # replacement Job that appeared while Kubernetes was down.
+                if method in {"cancel_job", "restart_job", "create_service", "delete_service"} and bound_args and not bound_args[0].get("uid"):
+                    resolve = getattr(current, "_service_ref" if method == "delete_service" else "_job_ref", None)
+                    if callable(resolve):
+                        bound_args = (resolve(bound_args[0]), *bound_args[1:])
+                try:
+                    return getattr(current, method)(*bound_args, **kwargs)
+                except KubernetesError as exc:
+                    if method == "cancel_job":
+                        if uncertain_cancel and exc.not_found:
+                            return {"job": bound_args[0], "cancelled": True}
+                        if exc.unavailable:
+                            uncertain_cancel = True
+                    raise
+
             operation = asyncio.create_task(_run_blocking(
-                getattr(current, method), *args, **kwargs,
+                execute,
             ))
             try:
                 return _agent_response(await asyncio.shield(operation))
@@ -483,6 +513,47 @@ def create_server(
         """Cancel the latest run by name, or a specific run when uid is supplied."""
         return await invoke("cancel_job", job.model_dump(exclude_none=True))
 
+    @server.tool(annotations=write, structured_output=True)
+    async def create_service(
+        job: JobReference,
+        ports: List[ServicePort] = Field(min_length=1, max_length=16),
+        idempotency_key: str = Field(min_length=1, max_length=256),
+        name: Optional[str] = Field(default=None, min_length=1, max_length=63),
+    ) -> dict[str, Any]:
+        """Expose an existing Falcon Job through a fixed internal ClusterIP Service.
+
+        The application must listen on 0.0.0.0 at target_port. No Job template
+        changes, health probes, public exposure or port-forward processes are
+        added. Check application health separately with curl from the cluster.
+        Service deletion leaves the Job running; Job deletion removes its owned
+        Service. After restart_job, create an endpoint for the returned new UID
+        with a fresh idempotency key. Existing endpoints never route to a new
+        Job UID automatically. Reusing a key reconciles ambiguous creation.
+        """
+        return await invoke(
+            "create_service", job.model_dump(exclude_none=True),
+            [port.model_dump() for port in ports], idempotency_key, name=name,
+        )
+
+    @server.tool(annotations=read, structured_output=True)
+    async def list_services(limit: int = Field(default=50, ge=1, le=100)) -> dict[str, Any]:
+        """List Falcon MCP-managed ClusterIP endpoints in the configured namespace."""
+        return await invoke("list_services", limit=limit)
+
+    @server.tool(annotations=read, structured_output=True)
+    async def inspect_service(service: JobReference) -> dict[str, Any]:
+        """Inspect a Service's DNS, ports and exact Job's Kubernetes backends.
+
+        Kubernetes readiness flags are routing metadata, not application health.
+        No HTTP/TCP probe is performed; use a separate curl for application health.
+        """
+        return await invoke("inspect_service", service.model_dump(exclude_none=True))
+
+    @server.tool(annotations=destructive, structured_output=True)
+    async def delete_service(service: JobReference) -> dict[str, Any]:
+        """Remove a Falcon-managed endpoint by name/optional UID; keep its Job."""
+        return await invoke("delete_service", service.model_dump(exclude_none=True))
+
     @server.tool(annotations=destructive, structured_output=True)
     async def restart_job(
         job: JobReference, overrides: Optional[RestartOverrides] = None,
@@ -506,6 +577,15 @@ def create_server(
             **({"summary": summary.model_dump()} if summary else {}),
         )
 
+    # FastMCP otherwise ignores unexpected top-level tool arguments. Reject
+    # them for networking tools so forbidden exposure options cannot appear
+    # to have been accepted. Keep this SDK compatibility seam tested.
+    for tool_name in ("create_service", "list_services", "inspect_service", "delete_service"):
+        tool = server._tool_manager.get_tool(tool_name)  # noqa: SLF001
+        model = tool.fn_metadata.arg_model
+        model.model_config["extra"] = "forbid"
+        model.model_rebuild(force=True)
+        tool.parameters = model.model_json_schema()
     return server
 
 

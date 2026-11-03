@@ -30,21 +30,50 @@ BASE_COMMANDS = [
 ]
 PRIORITY_COMMANDS = ["logs", "top"]
 TOP_LEVEL_LAUNCH_OPTIONS = ["--cpu", "--memory", "--gpus"]
-COMMAND_ALIASES = {
-    "j": "jobs",
-    "g": "get",
-    "e": "events",
-    "l": "logs",
-    "a": "attach",
-    "t": "top",
-    "m": "metrics",
-    "k": "kill",
-    "c": "clean",
-    "d": "dashboard",
-    "r": "resources",
-    "s": "setup",
-}
 JOB_COMMANDS = {"get", "logs", "events", "kill", "attach", "top", "metrics"}
+
+
+def resolve_command(token: str) -> Optional[str]:
+    """Resolve every command through the same unambiguous-prefix rule."""
+    if token in BASE_COMMANDS:
+        return token
+    matches = [name for name in BASE_COMMANDS if token and name.startswith(token)]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous command {token!r}: {', '.join(matches)}. Type more letters or press Tab.")
+    return matches[0] if matches else None
+
+
+# Shared by Bash and Zsh, with no Python startup or cluster request. Offer
+# prefixes first, then at most two edits against full names or their prefixes.
+_FUZZY_COMPLETION = r'''_falcon_suggest() {
+  command awk -v word="$1" 'BEGIN {
+    count = split(ARGV[1], names, " "); delete ARGV[1]; found = 0;
+    for (k=1; k<=count; k++) if (index(names[k], word)==1) {
+      print names[k]; found=1;
+    }
+    if (found || length(word)<4 || substr(word,1,1)=="-") exit;
+    best=3;
+    for (k=1; k<=count; k++) {
+      name=names[k]; n=length(word); m=length(name);
+      for (i=0; i<=n; i++) d[i,0]=i;
+      for (j=0; j<=m; j++) d[0,j]=j;
+      for (i=1; i<=n; i++) for (j=1; j<=m; j++) {
+        v=d[i-1,j]+1;
+        if (d[i,j-1]+1<v) v=d[i,j-1]+1;
+        cost=(substr(word,i,1)!=substr(name,j,1));
+        if (d[i-1,j-1]+cost<v) v=d[i-1,j-1]+cost;
+        if (i>1 && j>1 && substr(word,i,1)==substr(name,j-1,1) &&
+            substr(word,i-1,1)==substr(name,j,1) && d[i-2,j-2]+1<v) v=d[i-2,j-2]+1;
+        d[i,j]=v;
+      }
+      distance[k]=d[n,m];
+      for (j=3; j<m; j++) if (j>=n-2 && d[n,j]<distance[k]) distance[k]=d[n,j];
+      if (distance[k]<best) best=distance[k];
+    }
+    for (k=1; k<=count; k++) if (distance[k]==best && best<=2) print names[k];
+  }' "${_falcon_canonical_commands[*]}"
+}
+'''
 
 LAUNCH_OPTIONS = [
     "--gpus", "--cpu", "--memory", "--name", "--environment",
@@ -120,7 +149,10 @@ def candidates(
     if kind == "jobs":
         return job_names(config["cluster"]["namespace"])
     if kind == "options":
-        command = COMMAND_ALIASES.get(command, command)
+        try:
+            command = resolve_command(command) or command
+        except ValueError:
+            return []
         if command == "coder":
             return (
                 preset_tokens(config)
@@ -173,9 +205,15 @@ def shell_script(
         f"{shlex.quote(name)}x*" for name in preset_names
     ) or "__no_falcon_counted_presets__"
     bash_preset_pattern = "|".join(re.escape(name) for name in preset_names) or "(?!)"
+    subject_aliases = {}
+    for name in BASE_COMMANDS:
+        for length in range(1, len(name)):
+            prefix = name[:length]
+            if prefix not in subject_aliases and prefix not in preset_names and sum(value.startswith(prefix) for value in BASE_COMMANDS) == 1:
+                subject_aliases[prefix] = name
     alias_cases = "\n".join(
         f"    {alias}) subject={canonical} ;;"
-        for alias, canonical in COMMAND_ALIASES.items()
+        for alias, canonical in subject_aliases.items()
     )
     option_cases = "\n".join(
         f"      {shlex.quote(name)}) values=({_words(values)}) ;;"
@@ -184,6 +222,8 @@ def shell_script(
     if shell == "zsh":
         return f"""# Falcon completion (the executable remains a normal PATH command)
 typeset -ga _falcon_commands=({commands})
+typeset -ga _falcon_canonical_commands=({_words(BASE_COMMANDS)})
+{_FUZZY_COMPLETION}
 typeset -ga _falcon_top_level_options=({top_level_options})
 typeset -ga _falcon_presets=({presets})
 typeset -ga _falcon_counted_presets=({counted_presets})
@@ -217,6 +257,14 @@ _falcon_native() {{
         return
       fi
     done
+    if [[ -n "$current" && "$current" != -* ]]; then
+      local -a suggestions
+      suggestions=("${{(@f)$(_falcon_suggest "$current")}}")
+      if (( ${{#suggestions}} )) && [[ -n "${{suggestions[1]}}" ]]; then
+        compadd -U -V falcon-commands -- $suggestions
+        return
+      fi
+    fi
   elif [[ "$subject" == coder ]]; then
     values=()
     local value
@@ -247,6 +295,8 @@ compdef _falcon_native falcon
         )
         return f"""# Falcon completion (the executable remains a normal PATH command)
 _falcon_commands=({commands})
+_falcon_canonical_commands=({_words(BASE_COMMANDS)})
+{_FUZZY_COMPLETION}
 _falcon_top_level_options=({top_level_options})
 _falcon_counted_presets=({counted_presets})
 _falcon_launch_options=({launch_options})
@@ -296,6 +346,12 @@ _falcon_native() {{
   fi
   compopt -o nosort 2>/dev/null || true
   COMPREPLY=( $(compgen -W "${{values[*]}}" -- "$cur") )
+  if [[ $COMP_CWORD -eq 1 && ${{#COMPREPLY[@]}} -eq 0 ]]; then
+    local suggestion
+    while IFS= read -r suggestion; do
+      [[ -n "$suggestion" ]] && COMPREPLY+=("$suggestion")
+    done < <(_falcon_suggest "$cur")
+  fi
 }}
 complete -F _falcon_native falcon
 """

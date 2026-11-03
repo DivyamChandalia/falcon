@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.2 — 2026-11-03
+
+- Share a server running in a Falcon Job with other workloads inside your
+  cluster. Your coding agent can create an internal address for an inference
+  API or web app, inspect it, or remove the address without stopping the Job.
+  These endpoints are internal-only, never public. Your agent checks whether
+  the application is responding separately.
+- Temporary Kubernetes connection problems no longer immediately interrupt
+  your agent's work. Falcon retries for up to 60 seconds before asking the
+  agent to tell you the cluster is unavailable. A connection problem does not
+  mean your Job failed, and retries do not create duplicate Jobs.
+- Type less and let Tab fix command typos: use `falcon dash` or `falcon res`,
+  and press Tab after `falcon resuo` to complete `falcon resources`. Any unique
+  command prefix works. **Shortcut change:** use `cl` for clean and `me` for
+  metrics; `c` and `m` now match multiple commands, so type more letters or
+  press Tab to choose.
+- Progress bars no longer fill your agent's log responses with repeated lines.
+  Falcon shows the latest progress update while keeping ordinary messages,
+  making both current and archived logs easier to read.
+- Dashboard is less distracting: the Job name in Resource Usage stays visible
+  when you click between panes, and Pod details appear once on the Logs border.
+  Reading older terminal output no longer unexpectedly jumps you back to the
+  bottom when new output arrives.
+- Coding agents now have instructions for internal server addresses and a
+  simpler CPU-only workflow: submit directly with the CPU and memory needed,
+  without a separate planning step or GPU settings.
+
+After upgrading, open a new terminal or reload Falcon's shell completion,
+reconnect Falcon in your coding agent, and reopen Dashboard to load the changes.
+`falcon update` also refreshes your existing Falcon-managed agent skills.
+
 ## 0.5.1 — 2026-10-29
 
 - Fixed an MCP event-loop freeze while preparing failure logs: when log metadata

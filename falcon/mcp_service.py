@@ -42,7 +42,7 @@ from .cluster import build_cluster_snapshot, build_job_snapshot
 from .coder import generate_workspace_name
 from .config import gpu_preset_max_count
 from .dashboard import UsageCollector
-from .kubernetes import KubernetesClient, KubernetesError, ProcessResult
+from .kubernetes import KubernetesClient, KubernetesError, ProcessResult, retry_kubernetes_operation
 from .launcher import resolve_environment
 from .manifest import build_job_manifest
 from .mcp_config import (
@@ -1289,7 +1289,7 @@ class JobService:
 
             def worker():
                 try:
-                    result_queue.put((True, function(*args, **kwargs)))
+                    result_queue.put((True, retry_kubernetes_operation(function, *args, **kwargs)))
                 except BaseException as exc:  # noqa: BLE001 - deliver worker failures
                     result_queue.put((False, exc))
 
@@ -2204,6 +2204,27 @@ class JobService:
     # Events and lifecycle
     # ------------------------------------------------------------------
 
+    def _services(self):
+        from .mcp_services import ServiceManager
+
+        return ServiceManager(self)
+
+    def create_service(self, job, ports, idempotency_key, name=None):
+        return self._services().create(job, ports, idempotency_key, name)
+
+    def list_services(self, limit=50):
+        return self._services().list(limit)
+
+    def inspect_service(self, service):
+        return self._services().inspect(service)
+
+    def delete_service(self, service):
+        return self._services().delete(service)
+
+    def _service_ref(self, service):
+        value = self._services().resolve(service)
+        return {"name": value["metadata"]["name"], "uid": value["metadata"]["uid"]}
+
     async def wait_for_events(
         self,
         jobs: list[dict],
@@ -3035,7 +3056,7 @@ def _process_output(value: Any) -> tuple[str, str, int]:
 
 _LOG_TIMESTAMP = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-    r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))(?P<separator>\s+)(?P<message>.*)$"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))(?P<separator>[ \t]+)(?P<message>.*)$"
 )
 _LOG_TIMESTAMP_FRACTION = re.compile(
     r"\.(?P<fraction>\d+)(?P<zone>Z|[+-]\d{2}:\d{2})$"
@@ -3088,6 +3109,7 @@ def _encode_log_cursor(
     container: str,
     timestamp: str,
     occurrence_count: int,
+    progress_hash: Optional[str] = None,
 ) -> str:
     payload = json.dumps(
         {
@@ -3096,6 +3118,7 @@ def _encode_log_cursor(
             "container": container,
             "timestamp": timestamp,
             "occurrence_count": occurrence_count,
+            **({"progress_hash": progress_hash} if progress_hash is not None else {}),
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -3118,6 +3141,11 @@ def _decode_log_cursor(value: str) -> dict[str, Any]:
     container = payload.get("container")
     timestamp = payload.get("timestamp")
     occurrence_count = payload.get("occurrence_count")
+    progress_hash = payload.get("progress_hash")
+    if progress_hash is not None and (
+        not isinstance(progress_hash, str) or re.fullmatch(r"[0-9a-f]{64}", progress_hash) is None
+    ):
+        raise MCPServiceError("log cursor has an invalid progress hash")
     if (
         not isinstance(pod_uid, str)
         or not pod_uid
@@ -3137,6 +3165,7 @@ def _decode_log_cursor(value: str) -> dict[str, Any]:
         "timestamp_value": _parse_log_timestamp(timestamp),
         "timestamp_key": _log_timestamp_key(timestamp),
         "occurrence_count": occurrence_count,
+        "progress_hash": progress_hash,
     }
 
 
@@ -3178,41 +3207,67 @@ def _incremental_log_text(
     Kubernetes log endpoint does not expose how many older lines it discarded.
     """
 
-    raw_lines = str(text or "").splitlines()
+    # Only LF ends a log record. splitlines() treats tqdm's carriage-return
+    # rewrites as separate lines and consumes the returned tail with progress.
+    raw_lines = str(text or "").split("\n")
+    if raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
     cursor_value = cursor.get("timestamp_key") if cursor else None
     cursor_count = int(cursor.get("occurrence_count", 0)) if cursor else 0
     timestamp_counts: dict[tuple[datetime, int], int] = {}
     candidates: list[dict[str, Any]] = []
     unparsed = False
+    full_count = 0
     for raw_line in raw_lines:
+        # CRLF is a normal newline, not a progress rewrite.
+        raw_line = raw_line.removesuffix("\r")
         match = _LOG_TIMESTAMP.match(raw_line)
         timestamp = match.group("timestamp") if match else None
         timestamp_key = _log_timestamp_key(timestamp) if timestamp else None
+        prefix = raw_line[:match.start("message")] if match else ""
+        message = match.group("message") if match else raw_line
+        progress = "\r" in message
+        rendered = prefix + message.rstrip("\r").rsplit("\r", 1)[-1]
+        progress_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest() if progress else None
         if timestamp_key is None:
             unparsed = True
-            candidates.append({"raw": raw_line, "token": None})
-            continue
-        occurrence = timestamp_counts.get(timestamp_key, 0) + 1
-        timestamp_counts[timestamp_key] = occurrence
-        if cursor_value is not None:
-            if timestamp_key < cursor_value:
-                continue
-            if timestamp_key == cursor_value and occurrence <= cursor_count:
-                continue
-        candidates.append(
-            {
-                "raw": raw_line,
-                "token": _encode_log_cursor(
-                    pod_uid=pod_uid,
-                    container=container,
-                    timestamp=timestamp or "",
-                    occurrence_count=occurrence,
-                ),
-            }
-        )
+            token = None
+        else:
+            occurrence = timestamp_counts.get(timestamp_key, 0) + 1
+            timestamp_counts[timestamp_key] = occurrence
+            if cursor_value is not None:
+                if timestamp_key < cursor_value:
+                    continue
+                if timestamp_key == cursor_value:
+                    changed_progress = (
+                        occurrence == cursor_count and progress_hash is not None
+                        and cursor.get("progress_hash") is not None
+                        and progress_hash != cursor["progress_hash"]
+                    )
+                    if occurrence <= cursor_count and not changed_progress:
+                        continue
+            token = _encode_log_cursor(
+                pod_uid=pod_uid,
+                container=container,
+                timestamp=timestamp or "",
+                occurrence_count=occurrence,
+                progress_hash=progress_hash,
+            )
+        full_count += 1
+        record = {
+            "raw": rendered,
+            "token": token,
+            "progress": progress,
+        }
+        # Runtimes may timestamp each flushed progress frame separately.
+        # Merge only explicit rewrites of another progress row, never normal
+        # messages; keep the newest source token for incremental retrieval.
+        if message.startswith("\r") and candidates and candidates[-1]["progress"]:
+            candidates[-1] = record
+        else:
+            candidates.append(record)
 
-    full_count = len(candidates)
-    tail_limited = bool(tail > 0 and full_count > tail)
+    tail_limited = bool(tail > 0 and len(candidates) > tail)
     tail_window_full = bool(tail > 0 and full_count >= tail)
     if tail > 0:
         candidates = candidates[-tail:]
@@ -3261,6 +3316,7 @@ def _incremental_log_text(
             container=container,
             timestamp=str(cursor["timestamp"]),
             occurrence_count=int(cursor["occurrence_count"]),
+            progress_hash=cursor.get("progress_hash"),
         )
         if cursor
         else None
