@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -585,6 +586,13 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_resource_job_title_survives_clicks_refresh_and_blur(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(200, 50)) as pilot:
+            async def wait_for_selected_job() -> None:
+                # Collection runs in a background thread and its results are
+                # drained by a timer; an idle message pump need not have data yet.
+                while app._selected_row() is None:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_selected_job(), timeout=5)
             await pilot.pause()
             resources = app.query_one("#resources-pane", DashboardPane)
             name = app._selected_row().job
