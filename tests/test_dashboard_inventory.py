@@ -112,7 +112,7 @@ def test_inventory_changes_reuse_three_streams_and_do_not_relist(inventory):
     for version in range(2, 50):
         changed = job()
         changed["metadata"]["resourceVersion"] = str(version)
-        changed["status"] = {"conditions": [{"type": "Complete", "status": "True"}]}
+        changed["status"] = {"succeeded": version, "conditions": [{"type": "Complete", "status": "True"}]}
         transport.queues["jobs.batch"].put({"type": "MODIFIED", "object": changed})
     eventually(lambda: source.snapshot().revision >= original_revision + 48)
     assert client.lists == Counter({r: 1 for r in RESOURCES})
@@ -371,3 +371,49 @@ async def test_textual_inventory_event_updates_while_metrics_worker_is_blocked(i
             assert len(app.summary_history) == before
     finally:
         release.set()
+
+
+def _unschedulable_pod(when, phase="Pending"):
+    pending = pod()
+    pending["metadata"]["resourceVersion"] = when
+    pending["status"] = {
+        "phase": phase,
+        "conditions": [{
+            "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+            "message": f"no nodes at {when}", "lastTransitionTime": when,
+        }],
+    }
+    return pending
+
+
+def test_scheduler_retry_updates_store_without_waking_readers(inventory):
+    source, _, transport = inventory
+    transport.queues["pods"].put({"type": "MODIFIED", "object": _unschedulable_pod("1")})
+    def pod_item():
+        return next(i for i in source.snapshot().items if i["kind"] == "Pod")
+
+    eventually(lambda: pod_item()["metadata"].get("resourceVersion") == "1")
+    revision = source.snapshot().revision
+
+    transport.queues["pods"].put({"type": "MODIFIED", "object": _unschedulable_pod("2")})
+    eventually(lambda: pod_item()["metadata"].get("resourceVersion") == "2")
+    assert source.snapshot().revision == revision
+
+    transport.queues["pods"].put(
+        {"type": "MODIFIED", "object": _unschedulable_pod("3", phase="Running")}
+    )
+    eventually(lambda: source.snapshot().revision > revision)
+    assert pod_item()["status"]["phase"] == "Running"
+
+
+def test_condition_status_change_still_wakes_readers(inventory):
+    source, _, transport = inventory
+    transport.queues["pods"].put({"type": "MODIFIED", "object": _unschedulable_pod("1")})
+    eventually(lambda: any(
+        i["metadata"].get("resourceVersion") == "1" for i in source.snapshot().items
+    ))
+    revision = source.snapshot().revision
+    scheduled = _unschedulable_pod("2")
+    scheduled["status"]["conditions"][0].update(status="True", reason="Scheduled")
+    transport.queues["pods"].put({"type": "MODIFIED", "object": scheduled})
+    eventually(lambda: source.snapshot().revision > revision)

@@ -78,11 +78,11 @@ class DashboardInventory:
     def snapshot(self, *, include_events=True) -> InventorySnapshot:
         with self._lock:
             return InventorySnapshot(
-                copy.deepcopy(
-                    list(self._objects["jobs.batch"].values())
-                    + list(self._objects["pods"].values())
-                ),
-                copy.deepcopy(list(self._objects["events"].values())) if include_events else [],
+                # Stored objects are replaced whole by the watch and never
+                # edited in place, so readers share them. Treat as read-only.
+                list(self._objects["jobs.batch"].values())
+                + list(self._objects["pods"].values()),
+                list(self._objects["events"].values()) if include_events else [],
                 self._revision,
                 "; ".join(f"{r}: {e}" for r, e in self._errors.items()),
                 self._observed_at,
@@ -107,6 +107,28 @@ class DashboardInventory:
                 )
             )
             return copy.deepcopy(selected[-200:])
+
+    @staticmethod
+    def _meaningful(obj):
+        """Object minus churn that cannot change a dashboard row.
+
+        An unschedulable Pod has its PodScheduled condition rewritten on every
+        scheduler retry, and every watch event carries a new resourceVersion.
+        """
+        metadata = {
+            key: value for key, value in (obj.get("metadata") or {}).items()
+            if key not in {"resourceVersion", "managedFields"}
+        }
+        status = dict(obj.get("status") or {})
+        if "conditions" in status:
+            status["conditions"] = [
+                {
+                    key: value for key, value in condition.items()
+                    if key not in {"lastTransitionTime", "lastProbeTime", "message"}
+                }
+                for condition in status["conditions"]
+            ]
+        return {**obj, "metadata": metadata, "status": status}
 
     @staticmethod
     def _key(obj):
@@ -150,9 +172,14 @@ class DashboardInventory:
         with self._lock:
             objects = self._objects[resource]
             if action == "DELETED":
-                changed = objects.pop(key, None) is not None
+                notify = objects.pop(key, None) is not None
             else:
-                changed = objects.get(key) != obj
+                previous = objects.get(key)
+                changed = previous != obj
+                # Still store bookkeeping-only updates, but do not wake readers.
+                notify = changed and (
+                    previous is None or self._meaningful(previous) != self._meaningful(obj)
+                )
                 if changed:
                     # Same-name replacements must not inherit old attempts.
                     name = (obj.get("metadata") or {}).get("name")
@@ -167,7 +194,7 @@ class DashboardInventory:
                     if resource == "events" and len(objects) > MAX_CACHED_EVENTS:
                         objects.pop(next(iter(objects)))
             self._observed_at = time.time()
-        if changed:
+        if notify:
             self._notify()
 
     async def _unavailable(self, resource, details):

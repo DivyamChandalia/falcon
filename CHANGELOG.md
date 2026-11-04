@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 — 2026-11-04
+
+- Dashboard uses less CPU when watching many Jobs, especially while Jobs are
+  waiting for resources. Repeated scheduler updates no longer rebuild unchanged
+  Job rows, and reading the inventory avoids unnecessary copying. Job status
+  changes and new events still update the dashboard.
+- Fixed a timing-sensitive dashboard test that could fail CI on Python 3.11
+  and 3.12 before Job data finished loading.
+
+Reopen Dashboard after upgrading to use the performance improvements.
+
 ## 0.5.2 — 2026-11-03
 
 - Share a server running in a Falcon Job with other workloads inside your
