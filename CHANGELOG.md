@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.4 — 2026-11-17
+
+- Coding agents can now restart running and queued Jobs directly, keeping the
+  same Job name. Falcon saves available logs, stops the old run, and launches
+  its replacement with a new run ID. Agents can include a short issue/fix
+  summary, and Dashboard keeps the earlier run's captured logs available.
+- Long commands and inline scripts no longer disconnect Falcon MCP when a
+  submission exceeds 64 KiB. The connection remains usable for later calls.
+- Internal tool failures now produce a short, actionable message instead of
+  exposing lengthy diagnostics to your agent. Temporary Kubernetes failures
+  still retry internally for up to 60 seconds; if recovery fails, the agent
+  receives an unavailable/try-again-later message. Invalid requests and missing
+  resources retain concise explanations.
+- Updated the Falcon agent skill to describe restarting active Jobs.
+  `falcon update` refreshes existing Falcon-managed skills automatically.
+
+After upgrading, reconnect Falcon MCP in your coding agent to load the fixes.
+Retry interrupted submissions with the original submission key so an accepted
+Job is not accidentally duplicated.
+
 ## 0.5.3 — 2026-11-04
 
 - Dashboard uses less CPU when watching many Jobs, especially while Jobs are

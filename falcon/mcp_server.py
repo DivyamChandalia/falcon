@@ -7,17 +7,20 @@ client configuration continue to work without starting an MCP server.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import queue
 import sys
 import threading
 from contextlib import asynccontextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 import anyio
 import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.message import SessionMessage
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,7 +31,35 @@ from .mcp_config import (
     MAX_EVICTION_STARTUP_SECONDS,
     MIN_EVICTION_STARTUP_SECONDS,
 )
-from .mcp_service import JobService
+from .mcp_service import JobService, MCPServiceError
+
+_UNAVAILABLE_MESSAGE = (
+    "Kubernetes is unavailable at the moment. Inform the user and try again later. "
+    "This does not mean the Job failed. "
+    "Reuse the original submission key or Job reference when retrying."
+)
+
+
+def _safe_tool_errors(function):
+    """Keep infrastructure diagnostics out of model-facing tool results."""
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await function(*args, **kwargs)
+        except MCPServiceError as exc:
+            raise ToolError(str(exc)[:512]) from None
+        except KubernetesError as exc:
+            if exc.not_found:
+                raise ToolError(
+                    "The requested Kubernetes resource was not found. Refresh its reference."
+                ) from None
+            logging.getLogger(__name__).error("Tool %s failed (%s)", function.__name__, type(exc).__name__)
+            raise ToolError(_UNAVAILABLE_MESSAGE) from None
+        except Exception as exc:
+            logging.getLogger(__name__).error("Tool %s failed (%s)", function.__name__, type(exc).__name__)
+            raise ToolError(_UNAVAILABLE_MESSAGE) from None
+
+    return wrapped
 
 
 class JobReference(BaseModel):
@@ -105,7 +136,7 @@ async def _stdio_server_without_file_threads():
     async def read_stdin() -> None:
         try:
             while True:
-                line = await reader.readline()
+                line = await _read_stdio_line(reader)
                 if not line:
                     break
                 try:
@@ -143,6 +174,24 @@ async def _stdio_server_without_file_threads():
         read_transport.close()
         await read_stream.aclose()
         await write_stream.aclose()
+
+
+async def _read_stdio_line(reader: asyncio.StreamReader) -> bytes:
+    """Read an MCP JSON frame without asyncio's default 64 KiB line cap.
+
+    Inline submission commands can legitimately exceed that cap. Consume
+    overrun chunks so the pipe keeps flowing, then parse the complete frame.
+    """
+    chunks = []
+    while True:
+        try:
+            chunks.append(await reader.readuntil(b"\n"))
+            return b"".join(chunks)
+        except asyncio.LimitOverrunError as exc:
+            chunks.append(await reader.readexactly(exc.consumed))
+        except asyncio.IncompleteReadError as exc:
+            chunks.append(exc.partial)
+            return b"".join(chunks)
 
 
 class SubmissionRequest(BaseModel):
@@ -559,10 +608,10 @@ def create_server(
         job: JobReference, overrides: Optional[RestartOverrides] = None,
         summary: Optional[RestartSummary] = None,
     ) -> dict[str, Any]:
-        """Restart a terminal job under the same name, with optional fixes and no retries.
+        """Restart a running, pending or finished job under the same name.
 
-        Requires a retained Job with a terminal Kubernetes condition. For an
-        active job, cancel it and use submit_job for a new run instead.
+        Requires a retained Job; running Jobs are stopped and replaced too.
+        The replacement has no automatic retries.
         The old Job and its Pods are deleted, then recreated under the same
         Job name with a new UID and new Pod names. Available logs are archived
         locally before deletion. Supply a concise summary with issue and fix;
@@ -586,6 +635,8 @@ def create_server(
         model.model_config["extra"] = "forbid"
         model.model_rebuild(force=True)
         tool.parameters = model.model_json_schema()
+    for tool in server._tool_manager.list_tools():  # noqa: SLF001
+        tool.fn = _safe_tool_errors(tool.fn)
     return server
 
 

@@ -800,29 +800,22 @@ def test_log_cursors_preserve_rfc3339_nanoseconds(tmp_path: Path) -> None:
     asyncio.run(service.close())
 
 
-def test_restart_rejects_failed_pod_before_job_terminal_condition(
+def test_restart_accepts_failed_pod_before_job_terminal_condition(
     tmp_path: Path,
 ) -> None:
     client = FakeClient()
     service = _service(tmp_path, client)
-    source = {
-        "metadata": {
-            "name": "retrying-job",
-            "namespace": "research",
-            "uid": "retrying-job-uid",
-        },
-        "spec": {"backoffLimit": 6},
-        "status": {"failed": 1, "active": 0},
-    }
-    client.jobs["retrying-job"] = copy.deepcopy(source)
+    ref = service.submit_job(_request(name="retrying-job"), "retrying-submit")["job"]
+    source = client.jobs[ref["name"]]
+    source["spec"]["backoffLimit"] = 6
+    source["status"] = {"failed": 1, "active": 0}
     client.pods[:] = [_pod(source, "failed-attempt", "failed-attempt-uid", phase="Failed")]
 
-    with pytest.raises(MCPServiceError, match="no Kubernetes terminal"):
-        service.restart_job(
-            {"name": "retrying-job", "namespace": "research", "uid": "retrying-job-uid"},
-            "retrying-job-key",
-        )
-    assert client.created_manifests == []
+    result = service.restart_job(ref, "retrying-job-key")
+    assert result["name"] == ref["name"]
+    assert result["uid"] != ref["uid"]
+    assert client.jobs[ref["name"]]["spec"]["backoffLimit"] == 0
+    assert not client.pods
     asyncio.run(service.close())
 
 
@@ -1116,11 +1109,14 @@ def test_restart_archives_full_logs_summary_and_lineage_across_restarts(tmp_path
     asyncio.run(fresh.close())
 
 
-def test_restart_archive_failure_keeps_source_job_and_pods(tmp_path: Path) -> None:
+@pytest.mark.parametrize("phase", ["Failed", "Running"])
+def test_restart_archive_failure_keeps_source_job_and_pods(tmp_path: Path, phase) -> None:
     client = FakeClient()
     service = _service(tmp_path, client)
     source = _terminal_job(service, client)
-    client.pods.append(_pod(client.jobs[source["name"]], "old", "old-uid", phase="Failed"))
+    if phase == "Running":
+        client.jobs[source["name"]]["status"] = {"active": 1}
+    client.pods.append(_pod(client.jobs[source["name"]], "old", "old-uid", phase=phase))
     original = client.pod_logs
     client.pod_logs = lambda *a, **kw: ProcessResult(("kubectl",), 1, stderr="temporarily unavailable")
     with pytest.raises(MCPServiceError, match="before deletion"):
@@ -1392,15 +1388,58 @@ def test_restart_waits_for_deletion_and_retries_safely(
     asyncio.run(service.close())
 
 
-def test_restart_refuses_active_pods_even_with_terminal_job(tmp_path: Path) -> None:
+@pytest.mark.parametrize("phase", ["Running", "Pending"])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_restart_accepts_active_pods_and_archives_before_deletion(
+    tmp_path: Path, monkeypatch, phase, terminal,
+) -> None:
     client = FakeClient()
     service = _service(tmp_path, client)
     source = _terminal_job(service, client)
-    client.pods.append(_pod(client.jobs[source["name"]], "terminating", "pod-uid"))
-    with pytest.raises(MCPServiceError, match="Pods to terminate"):
-        service.restart_job(source, "still-terminating")
-    assert client.deleted == []
+    if not terminal:
+        client.jobs[source["name"]]["status"] = {"active": 1}
+    client.pods.append(_pod(client.jobs[source["name"]], "old-attempt", "pod-uid", phase=phase))
+    client.log_text["old-attempt"] = "2026-01-01T00:00:01Z output before restart\n"
+    delete_pod = client.delete_pod_uid
+
+    def delete_after_controller(name, uid, **kwargs):
+        assert source["name"] not in client.jobs, "stop controller before deleting active Pods"
+        archived = service._restart_history.logs(source["uid"])
+        assert "output before restart" in archived["logs"][0]["stdout"]
+        delete_pod(name, uid, **kwargs)
+
+    monkeypatch.setattr(client, "delete_pod_uid", delete_after_controller)
+    result = service.restart_job(source, "active-restart")
+    assert result["name"] == source["name"]
+    assert result["uid"] != source["uid"]
+    assert not client.pods
+    assert client.deleted == [(source["name"], source["uid"])]
+    assert len(client.created_manifests) == 2
+    assert service.restart_job(source, "active-restart")["job"] == result["job"]
+    assert len(client.created_manifests) == 2
+    asyncio.run(service.close())
+
+
+def test_running_restart_recovers_pod_cleanup_after_source_job_was_deleted(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    source = service.submit_job(_request(), "active-submit")["job"]
+    client.pods.append(_pod(client.jobs[source["name"]], "active", "old-pod"))
+    delete_pod = client.delete_pod_uid
+    def interrupted_cleanup(*args, **kwargs):
+        raise KubernetesError("cleanup interrupted")
+
+    monkeypatch.setattr(client, "delete_pod_uid", interrupted_cleanup)
+    with pytest.raises(KubernetesError, match="cleanup interrupted"):
+        service.restart_job(source, "interrupted-active")
+    assert source["name"] not in client.jobs
     assert len(client.created_manifests) == 1
+    monkeypatch.setattr(client, "delete_pod_uid", delete_pod)
+    restarted = service.restart_job(source, "interrupted-active")
+    assert restarted["name"] == source["name"]
+    assert restarted["uid"] != source["uid"]
+    assert not client.pods
+    assert len(client.created_manifests) == 2
     asyncio.run(service.close())
 
 

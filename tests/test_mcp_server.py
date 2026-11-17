@@ -99,6 +99,36 @@ async def test_tool_reports_kubernetes_unavailable_after_retry_budget(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["list_jobs", "submit_job", "wait_for_events"])
+async def test_internal_errors_are_brief_and_connection_remains_usable(method):
+    service = FakeService(DEFAULT_CONFIG)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private diagnostic " * 10_000)
+
+    async def fail_wait(*args, **kwargs):
+        fail()
+
+    setattr(service, method, fail_wait if method == "wait_for_events" else fail)
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    arguments = {
+        "list_jobs": {},
+        "submit_job": {"request": {"command": ["true"]}, "idempotency_key": "safe-error"},
+        "wait_for_events": {"jobs": [REF]},
+    }
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool(method, arguments[method])
+        assert result.isError
+        text = result.content[0].text
+        assert "Kubernetes is unavailable at the moment" in text
+        assert "try again later" in text
+        assert "private diagnostic" not in text
+        assert "Traceback" not in text
+        assert len(text) < 400
+        assert len((await session.list_tools()).tools) == 13
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["restart_job", "cancel_job"])
 async def test_retried_mutation_keeps_original_resolved_uid(method):
     service = FakeService(DEFAULT_CONFIG)
@@ -492,6 +522,54 @@ async def test_real_stdio_catalog_has_no_stdout_noise_or_cluster_access(tmp_path
             catalog = await session.list_tools()
             assert len(catalog.tools) == 13
     assert not state.exists(), "catalog discovery must not open state or query Kubernetes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_size", [70_000, 300_000])
+async def test_real_stdio_accepts_large_submissions_and_stays_connected(command_size):
+    # Use the real subprocess/pipe transport without creating Kubernetes Jobs.
+    script = """
+from falcon.config import DEFAULT_CONFIG
+import falcon.mcp_server as module
+
+class Service:
+    def __init__(self, config, **kwargs):
+        pass
+    def submit_job(self, request, idempotency_key):
+        return {"command_size": len(request["command"][1])}
+    async def close(self):
+        pass
+
+server = module.create_server(DEFAULT_CONFIG, service_factory=Service)
+module.create_server = lambda *args, **kwargs: server
+module.serve(DEFAULT_CONFIG)
+"""
+    params = StdioServerParameters(command=sys.executable, args=["-c", script])
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=15)) as session:
+            await session.initialize()
+            for index in range(2):
+                result = await session.call_tool("submit_job", {
+                    "request": {"command": ["echo", "x" * command_size]},
+                    "idempotency_key": f"large-submit-{index}",
+                })
+                assert not result.isError
+                assert result.structuredContent == {"command_size": command_size}
+            catalog = await session.list_tools()
+            assert len(catalog.tools) == 13
+
+
+@pytest.mark.asyncio
+async def test_stdio_large_frame_eof_and_following_frames():
+    from falcon.mcp_server import _read_stdio_line
+
+    reader = asyncio.StreamReader(limit=32)
+    reader.feed_data(b"x" * 100 + b"\nnext\n" + b"y" * 100)
+    reader.feed_eof()
+    assert await _read_stdio_line(reader) == b"x" * 100 + b"\n"
+    assert await _read_stdio_line(reader) == b"next\n"
+    assert await _read_stdio_line(reader) == b"y" * 100
+    assert await _read_stdio_line(reader) == b""
 
 
 def test_cli_mcp_help_without_loading_sdk_or_starting_a_server():

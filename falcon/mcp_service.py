@@ -1767,7 +1767,7 @@ class JobService:
         overrides: Optional[dict] = None,
         summary: Optional[dict] = None,
     ) -> dict:
-        """Replace one terminal Job under its original name, with a new UID.
+        """Replace a running, pending or terminal Job under its name, with a new UID.
 
         ``overrides["env"]`` is a patch by variable name: entries not named
         in the patch, including ``valueFrom`` references such as secrets, are
@@ -1942,38 +1942,30 @@ class JobService:
                 f"Job {ref['name']!r} UID changed; refresh the Job reference"
             )
         self._reject_coder_job(ref, live)
-        if self._job_terminal_condition(live) is None:
-            raise MCPServiceError(
-                f"Job {ref['name']!r} has no Kubernetes terminal Complete=True or "
-                "Failed=True condition; wait for the Job controller before restarting"
-            )
-        if any(
-            _pod_phase(pod) not in {"Failed", "Succeeded"}
-            for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"])
-        ):
-            raise MCPServiceError("wait for all source Job Pods to terminate before restarting")
 
     def _remove_restart_source(self, ref: dict[str, str]) -> Optional[Mapping[str, Any]]:
+        def delete_source_pods():
+            # Owner UID filtering also makes interrupted-delete recovery safe
+            # when another Job has since reused the source name.
+            for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"]):
+                metadata = pod.get("metadata") or {}
+                try:
+                    self.client.delete_pod_uid(
+                        str(metadata.get("name") or ""), str(metadata.get("uid") or ""),
+                        namespace=ref["namespace"],
+                    )
+                except Exception as exc:
+                    if not _is_not_found(exc):
+                        raise
+
         live = self._get_job_optional(ref["name"], ref["namespace"])
         if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
+            delete_source_pods()
             return live
         self._validate_restart_source(ref, live)
-        # Delete attempts explicitly as well as cascading the Job: this also
-        # recovers interrupted legacy Orphan deletes without orphaning Pods.
-        for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"]):
-            metadata = pod.get("metadata") or {}
-            try:
-                self.client.delete_pod_uid(
-                    str(metadata.get("name") or ""), str(metadata.get("uid") or ""),
-                    namespace=ref["namespace"],
-                )
-            except Exception as exc:
-                if not _is_not_found(exc):
-                    raise
-        live = self._get_job_optional(ref["name"], ref["namespace"])
-        if live is None or str((live.get("metadata") or {}).get("uid") or "") != ref["uid"]:
-            return live
         if (live.get("metadata") or {}).get("deletionTimestamp"):
+            # Recover legacy Orphan deletes before releasing their finalizer.
+            delete_source_pods()
             try:
                 self.client.finish_orphaned_job_deletion(live, namespace=ref["namespace"])
             except Exception:
@@ -1995,7 +1987,11 @@ class JobService:
             current = self._get_job_optional(ref["name"], ref["namespace"])
             if current is not None and str((current.get("metadata") or {}).get("uid") or "") == ref["uid"]:
                 raise
+            delete_source_pods()
             return current
+        # Stop the Job controller before deleting active attempts, so it cannot
+        # replace them while we prepare the same-name replacement Job.
+        delete_source_pods()
         deadline = time.monotonic() + _RESTART_DELETE_TIMEOUT_SECONDS
         while True:
             current = self._get_job_optional(ref["name"], ref["namespace"])

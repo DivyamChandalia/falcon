@@ -33,7 +33,7 @@ description: Manage GPU and CPU Kubernetes Jobs and internal Service endpoints t
 - OpenCode parents may end the foreground turn; handle events, then re-arm. Never poll task status, Jobs, logs or metrics, or do busywork while waiting.
 - `list_jobs`, `inspect_job`, `job_logs`, `job_metrics`: targeted inspection only; missing usage is unknown.
 - Failures: inspect logs, use `restart_job` to relaunch or `cancel_job` to stop.
-- `restart_job`: read logs, then pass a short `summary={"issue": "…", "fix": "…"}` describing the failure and your fix. Logs are archived before replacement; same name, new UID: monitor the new reference.
+- `restart_job` supports running, pending and finished Jobs; it stops active workloads before replacement. Read logs, then pass a short `summary={"issue": "…", "fix": "…"}` when fixing an issue. Logs are archived before replacement; same name, new UID: monitor the new reference.
 - Services: `create_service` exposes an existing Job's ports internally; the app must bind to `0.0.0.0`. Use `inspect_service`/`list_services` for addresses and `delete_service` to remove only the endpoint. Check application health separately with `curl` from inside the cluster. After a Job restart, recreate its Service for the new UID with a fresh key; old endpoints never follow replacement Jobs automatically.
 ## Scheduling and eviction risk
 
