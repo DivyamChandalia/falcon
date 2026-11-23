@@ -238,6 +238,78 @@ def _request(**overrides) -> dict:
     return value
 
 
+def test_cancel_targets_matches_names_and_binds_exact_uids(tmp_path):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    refs = [service.submit_job(_request(name=name), name)["job"]
+            for name in ("bench-a", "bench-b", "unrelated")]
+    assert service.cancel_targets(None, "^bench-[ab]$")["jobs"] == refs[:2]
+    assert service.cancel_targets([refs[0], refs[0]], None)["jobs"] == refs[:1]
+    with pytest.raises(MCPServiceError, match="Invalid Job name regex"):
+        service.cancel_targets(None, "[")
+    with pytest.raises(MCPServiceError, match="No Jobs matched"):
+        service.cancel_targets(None, "^missing$")
+    assert not client.deleted
+    asyncio.run(service.close())
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_job_logs_pages_backward(tmp_path, archived):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    ref = service.submit_job(_request(), "history-submit")["job"]
+    client.pods.append(_pod(client.jobs[ref["name"]], "attempt", "pod-1"))
+    client.log_text["attempt"] = "".join(
+        f"2026-01-01T00:00:0{index}Z line {index}\n" for index in range(5)
+    )
+    if archived:
+        service.restart_job(ref)
+    newest = service.job_logs(ref, tail=2)["logs"][0]
+    assert "line 3" in newest["stdout"]
+    older = service.job_logs(ref, tail=2, before=newest["oldest_timestamp"])["logs"][0]
+    assert older["stdout"].splitlines() == [
+        "2026-01-01T00:00:01Z line 1", "2026-01-01T00:00:02Z line 2",
+    ]
+    if not archived:
+        assert client.log_calls[-1]["tail"] == -1
+    asyncio.run(service.close())
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_log_match_without_advancing_lifecycle_cursor(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    ref = service.submit_job(_request(), "keyword-submit")["job"]
+    client.pods.append(_pod(client.jobs[ref["name"]], "attempt", "pod-1"))
+    client.log_text["attempt"] = "2026-01-01T00:00:00Z CHECKPOINT_READY\n"
+    released = asyncio.Event()
+
+    class Monitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def wait(self, *args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                released.set()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("falcon.mcp_events.Monitor", Monitor)
+    result = await asyncio.wait_for(
+        service.wait_for_events([ref], cursor=7, log_keyword="CHECKPOINT_READY"), 2,
+    )
+    assert result["log_match"] == {
+        "job": ref, "pod": "attempt", "container": "main", "keyword": "CHECKPOINT_READY",
+    }
+    assert result["cursor"] == 7
+    assert result["events"] == []
+    assert released.is_set()
+    await service.close()
+
+
 def _pod(
     job: dict,
     name: str,
@@ -1697,3 +1769,95 @@ async def test_wait_reuses_one_monitor_and_closes_before_event_store(
     await service.close()
     assert order == ["monitor", "store"]
 
+
+
+def test_planning_value_errors_surface_as_request_errors(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    monkeypatch.setattr(service, "_planning_nodes", lambda: [
+        NodeResources("node-gpu", 64, 4, 256, 32, 4, 3, "2080ti"),
+    ])
+    try:
+        with pytest.raises(MCPServiceError, match="no schedulable"):
+            service.plan_job({"gpu": "a100", "gpus": 1})
+        with pytest.raises(MCPServiceError, match="was not reported"):
+            service.plan_job(_request(node="missing"))
+    finally:
+        asyncio.run(service.close())
+
+
+def test_auto_gpu_plan_reports_every_model_and_submit_rejects_it(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    calls = []
+    nodes = [
+        NodeResources("node-a", 64, 4, 256, 32, 4, 4, "2080ti"),
+        NodeResources("node-b", 64, 4, 256, 32, 2, 1, "NVIDIA-RTX-A6000"),
+        NodeResources("node-c", 64, 4, 256, 32, 8, 0, "H100"),
+    ]
+    monkeypatch.setattr(service, "_planning_nodes", lambda: calls.append(1) or nodes)
+    try:
+        result = service.plan_job({"gpu": "auto", "gpus": 2})
+        assert len(calls) == 1
+        assert result["resource_only"]
+        by_model = {item["gpu"]: item for item in result["models"]}
+        assert set(by_model) == {"2080ti", "a6000", "h100"}
+        assert result["schedulable_now"] == ["h100"]
+        assert result["models"][0]["gpu"] == "h100"
+        assert by_model["h100"]["gpu_free"] == 8
+        assert by_model["2080ti"]["schedulable_now"] is False
+        assert by_model["a6000"]["gpu_total"] == 2
+        assert by_model["a6000"]["fits_any_node_capacity"] is True
+        too_many = service.plan_job({"gpu": "auto", "gpus": 6})
+        assert {item["gpu"]: item for item in too_many["models"]}["a6000"]["error"]
+        with pytest.raises(MCPServiceError, match="concrete GPU model"):
+            service.submit_job(_request(gpu="auto"), "auto-key")
+        assert client.created_manifests == []
+    finally:
+        asyncio.run(service.close())
+
+
+def test_node_defaults_to_auto_and_named_node_plans_and_pins(tmp_path, monkeypatch):
+    client = FakeClient()
+    service = _service(tmp_path, client)
+    nodes = [
+        NodeResources("node-a", 64, 4, 256, 32, 4, 0, "2080ti"),
+        NodeResources("node-b", 32, 4, 128, 32, 4, 4, "2080ti"),
+        NodeResources("node-h", 64, 4, 256, 32, 8, 0, "H100"),
+        NodeResources("node-c", 64, 0, 256, 0, 0, 0, "", unschedulable=True),
+    ]
+    monkeypatch.setattr(service, "_planning_nodes", lambda: nodes)
+
+    def selector():
+        return client.created_manifests[-1]["spec"]["template"]["spec"]["nodeSelector"]
+
+    try:
+        auto = service.plan_job({"gpu": "2080ti", "gpus": 1})
+        assert auto["summary"]["requested_node"] == "auto"
+        service.submit_job(_request(gpu="2080ti", name="auto-run", cpu=None, memory=None), "k-auto")
+        assert "kubernetes.io/hostname" not in selector()
+
+        # node-b has no free GPUs; the planner would size elsewhere, but the
+        # named node is honoured and pinned.
+        pinned = service.plan_job({"gpu": "2080ti", "gpus": 1, "node": "node-b"})
+        assert pinned["summary"]["requested_node"] == "node-b"
+        assert pinned["summary"]["sizing_node"] == "node-b"
+        service.submit_job(
+            _request(gpu="2080ti", name="pinned-run", cpu=None, memory=None, node="node-b"), "k-pin",
+        )
+        assert selector()["kubernetes.io/hostname"] == "node-b"
+
+        service.submit_job(_request(name="cpu-run", node="node-a"), "k-cpu")
+        assert selector() == {"kubernetes.io/hostname": "node-a"}
+
+        with pytest.raises(MCPServiceError, match="not 2080ti"):
+            service.plan_job({"gpu": "2080ti", "gpus": 1, "node": "node-h"})
+        with pytest.raises(MCPServiceError, match="cordoned"):
+            service.plan_job(_request(node="node-c"))
+        with pytest.raises(MCPServiceError, match="node must be"):
+            service.plan_job(_request(node=True))
+        only_h = service.plan_job({"gpu": "auto", "node": "node-h"})
+        assert [item["gpu"] for item in only_h["models"]] == ["h100"]
+        with pytest.raises(MCPServiceError, match="unknown|unsupported|node"):
+            service.plan_job({**_request(), "pin_node": True})
+    finally:
+        asyncio.run(service.close())

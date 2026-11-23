@@ -38,6 +38,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import anyio
+import regex
+
 from .cluster import build_cluster_snapshot, build_job_snapshot
 from .coder import generate_workspace_name
 from .config import gpu_preset_max_count
@@ -53,12 +56,14 @@ from .mcp_config import (
 )
 from .mcp_risk import McpGpuRiskEvaluator
 from .models import GPURequest, JobRequest, ResourcePlan
-from .planning import canonical_gpu, plan_cpu_resources, plan_resources
+from .planning import AUTO_NODE, canonical_gpu, plan_cpu_resources, plan_resources, select_node
 from .resource_service import ResourceServiceClient, snapshot_nodes
 from .resources import fetch_nodes
 from .restart_history import HISTORY_ANNOTATION, RestartHistory, history_path
 
 AGENT_LABEL = "falcon.dev/agent-managed"
+# plan_job-only GPU token: report availability for every model on the cluster.
+AUTO_GPU = "auto"
 IDEMPOTENCY_LABEL = "falcon.dev/idempotency-hash"
 PREVIOUS_JOB_UID_ANNOTATION = "falcon.dev/previous-job-uid"
 _RESTART_DELETE_TIMEOUT_SECONDS = 15.0
@@ -100,7 +105,7 @@ _REQUEST_FIELDS = frozenset(
         "image",
         "working_dir",
         "env",
-        "pin_node",
+        "node",
         "maximize",
         "shared_memory",
         "shared_memory_percent",
@@ -471,6 +476,8 @@ class JobService:
             raise MCPServiceError("job request must be an object")
         resource_only = "command" not in request
         preview = {**request, **({"command": ["true"]} if resource_only else {})}
+        if self._is_auto_gpu(request.get("gpu")):
+            return self._plan_all_gpu_models(preview)
         job_request, plan, manifest = self._prepare_request(preview, force_agent=True)
         result = self._plan_response(job_request, plan, manifest)
         if resource_only:
@@ -480,21 +487,113 @@ class JobService:
             result["resource_only"] = True
         return result
 
+    def _is_auto_gpu(self, value: Any) -> bool:
+        """``gpu="auto"`` previews every model unless a preset claims the name."""
+
+        return (
+            isinstance(value, str)
+            and value.strip().lower() == AUTO_GPU
+            and value.strip() not in (self.config.get("presets") or {})
+        )
+
+    def _plan_all_gpu_models(self, preview: Mapping[str, Any]) -> dict[str, Any]:
+        """Plan the same request against every GPU model the cluster reports.
+
+        This is an availability overview only: it selects nothing, and a Job
+        still has to be planned/submitted with one concrete model.
+        """
+
+        try:
+            nodes = select_node(
+                self._planning_nodes(), self._node_choice(preview.get("node", AUTO_NODE))
+            )
+        except ValueError as exc:
+            raise MCPServiceError(str(exc)) from exc
+        totals: dict[str, dict[str, int]] = {}
+        for node in nodes:
+            if node.unschedulable or not node.gpu_product or node.gpu_total <= 0:
+                continue
+            model = canonical_gpu(node.gpu_product)
+            entry = totals.setdefault(model, {"gpu_total": 0, "gpu_free": 0})
+            entry["gpu_total"] += int(node.gpu_total)
+            if node.scheduling_info_available:
+                entry["gpu_free"] += int(node.gpu_free)
+        if not totals:
+            raise MCPServiceError("no schedulable GPU nodes were reported")
+
+        base = dict(preview)
+        models: list[dict[str, Any]] = []
+        for model in sorted(totals):
+            entry: dict[str, Any] = {"gpu": model, **totals[model]}
+            try:
+                job_request, plan, _ = self._prepare_request(
+                    {**base, "gpu": model}, force_agent=True, nodes=nodes,
+                )
+            except MCPServiceError as exc:
+                entry.update(schedulable_now=False, fits_any_node_capacity=False, error=str(exc))
+                models.append(entry)
+                continue
+            scheduling = plan.scheduling or {}
+            limits = scheduling.get("gpu_limits") or {}
+            entry.update(
+                gpus=job_request.gpu.count if job_request.gpu else None,
+                schedulable_now=bool(plan.immediately_schedulable),
+                gpu_available_now=scheduling.get("gpu_available_now"),
+                fits_any_node_capacity=scheduling.get("fits_any_node_capacity", True),
+                schedulable_nodes=scheduling.get("schedulable_nodes", []),
+                gpu_available_nodes=scheduling.get("gpu_available_nodes", []),
+                max_per_node=limits.get("max_per_node"),
+                max_free_per_node=limits.get("max_free_per_node"),
+                cpu=plan.compute.cpu_pair,
+                memory=plan.compute.memory_pair,
+                recommended_allocation=scheduling.get("recommended_allocation"),
+                next_action=scheduling.get("next_action"),
+            )
+            models.append(entry)
+        models.sort(key=lambda item: (
+            not item.get("schedulable_now"),
+            not item.get("gpu_available_now"),
+            not item.get("fits_any_node_capacity"),
+            item["gpu"],
+        ))
+        return {
+            "gpu": AUTO_GPU,
+            "resource_only": True,
+            "schedulable_now": [item["gpu"] for item in models if item.get("schedulable_now")],
+            "models": models,
+            "guidance": (
+                "gpu=auto is an availability overview and selects nothing. Choose a "
+                "model whose memory and speed suit the task, then call plan_job or "
+                "submit_job with that model as gpu."
+            ),
+        }
+
     def _prepare_request(
         self,
         request: Mapping[str, Any],
         *,
         force_agent: bool,
         generated_name_token: Optional[str] = None,
+        nodes: Optional[Sequence[Any]] = None,
     ) -> tuple[JobRequest, ResourcePlan, dict[str, Any]]:
-        job_request, plan = self._parse_request(
-            request,
-            generated_name_token=generated_name_token,
-        )
-        build_config = copy.deepcopy(self.config)
-        if force_agent:
-            self._force_config_no_retry(build_config)
-        manifest = build_job_manifest(job_request, plan, build_config)
+        # Planning and manifest validation raise plain ValueError for caller
+        # mistakes (unknown GPU model, unpinnable plan, ...).  Surface them as
+        # request errors; otherwise the tool layer reports them as a
+        # Kubernetes outage.
+        try:
+            job_request, plan = self._parse_request(
+                request,
+                generated_name_token=generated_name_token,
+                nodes=nodes,
+            )
+            build_config = copy.deepcopy(self.config)
+            if force_agent:
+                self._force_config_no_retry(build_config)
+            manifest = build_job_manifest(job_request, plan, build_config)
+        except MCPServiceError:
+            raise
+        except ValueError as exc:
+            raise MCPServiceError(str(exc)) from exc
         if force_agent:
             self._force_agent_manifest(manifest)
         return job_request, plan, manifest
@@ -504,6 +603,7 @@ class JobService:
         request: Mapping[str, Any],
         *,
         generated_name_token: Optional[str] = None,
+        nodes: Optional[Sequence[Any]] = None,
     ) -> tuple[JobRequest, ResourcePlan]:
         if not isinstance(request, Mapping):
             raise MCPServiceError("job request must be an object")
@@ -550,6 +650,11 @@ class JobService:
             name = name.strip()
 
         gpu_token = request.get("gpu")
+        if self._is_auto_gpu(gpu_token):
+            raise MCPServiceError(
+                "gpu=auto is only an availability overview for plan_job; "
+                "choose a concrete GPU model to submit"
+            )
         gpu_count = request.get("gpus", 1)
         if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count <= 0:
             raise MCPServiceError("gpus must be a positive integer")
@@ -625,6 +730,7 @@ class JobService:
         if not 0 < shared_percent_value <= 100:
             raise MCPServiceError("shared_memory_percent must be greater than 0 and at most 100")
 
+        node_name = self._node_choice(request.get("node", AUTO_NODE))
         if gpu_model is None:
             if not cpu or not memory:
                 raise MCPServiceError(
@@ -636,9 +742,14 @@ class JobService:
                 shared_memory=shared_memory,
                 shared_memory_percent=shared_percent_value,
             )
+            if node_name is not None:
+                select_node(self._planning_nodes() if nodes is None else nodes, node_name)
+                plan = dataclasses.replace(plan, node=node_name, sizing_node=node_name)
             gpu = None
         else:
-            nodes = self._planning_nodes()
+            if nodes is None:
+                nodes = self._planning_nodes()
+            nodes = select_node(nodes, node_name, gpu_model)
             gpu = GPURequest(gpu_model, gpu_count)
             plan = plan_resources(
                 nodes,
@@ -665,7 +776,6 @@ class JobService:
         env = request.get("env", {})
         if not isinstance(env, Mapping):
             raise MCPServiceError("env must be a mapping of names to scalar values")
-        pin_node = self._boolean(request.get("pin_node", False), "pin_node")
         job_request = JobRequest(
             name=name,
             namespace=self.namespace,
@@ -676,7 +786,7 @@ class JobService:
             image=image,
             working_dir=working_dir,
             env=env,
-            pin_node=pin_node,
+            node=node_name,
         )
         return job_request, plan
 
@@ -739,6 +849,15 @@ class JobService:
         )
 
     @staticmethod
+    def _node_choice(value: Any) -> Optional[str]:
+        """``auto`` lets Kubernetes place the Job; a node name pins it there."""
+
+        if not isinstance(value, str) or not value.strip():
+            raise MCPServiceError('node must be "auto" or a node name')
+        value = value.strip()
+        return None if value == AUTO_NODE else value
+
+    @staticmethod
     def _boolean(value: Any, field: str) -> bool:
         if not isinstance(value, bool):
             raise MCPServiceError(f"{field} must be boolean")
@@ -797,7 +916,7 @@ class JobService:
             "cpu": plan.compute.cpu_pair,
             "memory": plan.compute.memory_pair,
             "shared_memory": plan.compute.shared_memory,
-            "pin_node": request.pin_node,
+            "requested_node": request.node or AUTO_NODE,
             "node": plan.node,
             "sizing_node": plan.sizing_node,
             "immediately_schedulable": plan.immediately_schedulable,
@@ -1349,6 +1468,7 @@ class JobService:
         tail: int = _DEFAULT_LOG_TAIL,
         cursors: Optional[dict[str, str]] = None,
         container: Optional[str] = None,
+        before: Optional[str] = None,
     ) -> dict:
         ref = self._job_ref(job)
         archived = self._restart_history.logs(ref["uid"])
@@ -1363,6 +1483,11 @@ class JobService:
         if container is not None and (not isinstance(container, str) or not container.strip()):
             raise MCPServiceError("container must be a non-empty string or null")
         cursor_map = self._validate_cursors(cursors)
+        before_key = _log_timestamp_key(before) if before is not None else None
+        if before is not None and before_key is None:
+            raise MCPServiceError("before must be an RFC 3339 log timestamp")
+        if before is not None and cursor_map:
+            raise MCPServiceError("Use before for older logs or cursors for newer logs, separately")
         if archived is not None:
             entries = archived["logs"]
             if pods is not None:
@@ -1386,7 +1511,7 @@ class JobService:
                 stdout, next_cursor, state = _incremental_log_text(
                     entry["stdout"], pod_uid=entry["pod_uid"], container=entry["container"],
                     cursor=decoded, max_chars=_MAX_LOG_CHARS_PER_POD,
-                    max_bytes=_MAX_LOG_BYTES_PER_POD, tail=tail,
+                    max_bytes=_MAX_LOG_BYTES_PER_POD, tail=tail, before=before_key,
                 )
                 if next_cursor or raw:
                     next_cursors[key] = next_cursor or raw
@@ -1473,7 +1598,7 @@ class JobService:
             result = self._pod_logs(
                 pod_name,
                 ref["namespace"],
-                tail=tail,
+                tail=-1 if before_key is not None else tail,
                 container=container_name,
                 timestamps=True,
                 since_time=(
@@ -1489,6 +1614,7 @@ class JobService:
                 max_chars=_MAX_LOG_CHARS_PER_POD,
                 max_bytes=_MAX_LOG_BYTES_PER_POD,
                 tail=tail,
+                before=before_key,
             )
             if next_cursor is not None:
                 next_cursors[cursor_key] = next_cursor
@@ -1759,6 +1885,46 @@ class JobService:
             "uid": ref["uid"],
             "cancelled": True,
         }
+
+    def cancel_targets(self, jobs: Optional[list[dict]], pattern: Optional[str]) -> dict:
+        """Resolve and validate the whole batch before performing any deletion."""
+        if (jobs is None) == (pattern is None):
+            raise MCPServiceError("Supply either jobs or pattern")
+        if pattern is not None:
+            try:
+                matcher = regex.compile(pattern)
+            except regex.error as exc:
+                raise MCPServiceError("Invalid Job name regex") from exc
+            inventory = self.client.list_jobs(namespace=self.namespace)
+            deadline = time.monotonic() + 0.2
+            jobs = []
+            try:
+                for job in inventory.get("items", []):
+                    name = (job.get("metadata") or {}).get("name")
+                    if not name:
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    if matcher.search(name, timeout=remaining):
+                        metadata = job["metadata"]
+                        if not metadata.get("uid"):
+                            raise StaleJobReference("A matching Job has no UID. Nothing cancelled.")
+                        jobs.append(metadata)
+                        if len(jobs) > 100:
+                            break
+            except TimeoutError as exc:
+                raise MCPServiceError("Job name regex took too long. Use a simpler pattern.") from exc
+        if not jobs:
+            raise MCPServiceError("No Jobs matched. Nothing cancelled.")
+        if len(jobs) > 100:
+            raise MCPServiceError("A cancellation batch may contain at most 100 Jobs. Narrow the selection.")
+        targets = {}
+        for job in jobs:
+            ref, live = self._validated_live_job(job)
+            self._reject_coder_job(ref, live)
+            targets[ref["uid"]] = ref
+        return {"jobs": sorted(targets.values(), key=lambda ref: ref["name"])}
 
     def restart_job(
         self,
@@ -2229,11 +2395,17 @@ class JobService:
         timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
         startup_time_seconds: Optional[float] = None,
         scheduling_policy: str = "report_blocked",
+        log_keyword: Optional[str] = None,
     ) -> dict:
         if not isinstance(jobs, list):
             raise MCPServiceError("jobs must be an array of Job references")
         if scheduling_policy not in ("report_blocked", "wait_for_capacity"):
             raise MCPServiceError("scheduling_policy must be report_blocked or wait_for_capacity")
+        if log_keyword is not None and (
+            not isinstance(log_keyword, str) or not log_keyword.strip()
+            or len(log_keyword) > 256 or "\n" in log_keyword or "\r" in log_keyword
+        ):
+            raise MCPServiceError("log_keyword must be a non-empty single line of at most 256 characters")
         # Resolving name-only references performs Kubernetes reads. Keep them
         # off the event loop, then bind this wait to the resolved UIDs.
         refs = await self._run_blocking(
@@ -2294,16 +2466,76 @@ class JobService:
                 if startup_time_seconds is not None:
                     self._monitor_startup_times[ref["uid"]] = startup_time_seconds
             monitor = self._monitor
-        result = await monitor.wait(
+        start_cursor = self._event_store.latest_cursor() if cursor is None and log_keyword else cursor
+        wait = monitor.wait(
             refs,
             cursor=cursor,
             event_types=event_types,
             timeout=float(timeout),
             scheduling_policy=scheduling_policy,
         )
+        if log_keyword is None:
+            result = await wait
+        else:
+            lifecycle = asyncio.ensure_future(wait)
+            keyword = asyncio.create_task(self._wait_for_log_keyword(refs, log_keyword))
+            try:
+                done, _ = await asyncio.wait((lifecycle, keyword), return_when=asyncio.FIRST_COMPLETED)
+                if lifecycle in done:
+                    result = lifecycle.result()
+                else:
+                    result = {
+                        "events": [], "log_match": keyword.result(),
+                        "cursor": start_cursor, "timed_out": False,
+                    }
+            finally:
+                lifecycle.cancel()
+                keyword.cancel()
+                with anyio.CancelScope(shield=True):
+                    await asyncio.gather(lifecycle, keyword, return_exceptions=True)
         output = await self._enrich_failure_events(result, refs)
         output["jobs"] = refs
         return output
+
+    async def _wait_for_log_keyword(self, refs, keyword):
+        since = {}
+        while True:
+            try:
+                match = await self._run_blocking(self._scan_log_keyword, refs, keyword, since)
+            except KubernetesError:
+                match = None
+            if match is not None:
+                return match
+            await asyncio.sleep(5)
+
+    def _scan_log_keyword(self, refs, keyword, since):
+        polled_at = datetime.now(timezone.utc).isoformat()
+        for ref in refs:
+            for pod in self._job_pods(ref["name"], ref["namespace"], uid=ref["uid"]):
+                if _pod_phase(pod) != "Running":
+                    continue
+                metadata = pod.get("metadata") or {}
+                for container in (pod.get("spec") or {}).get("containers", []):
+                    name = container["name"]
+                    key = (metadata["uid"], name)
+                    start = since.get(key)
+                    result = self._pod_logs(
+                        metadata["name"], ref["namespace"], container=name,
+                        tail=200 if start is None else -1, timestamps=True, since_time=start,
+                    )
+                    stdout, _, code = _process_output(result)
+                    if code:
+                        continue
+                    latest = start or polled_at
+                    for line in stdout.splitlines():
+                        timestamp = _LOG_TIMESTAMP.match(line)
+                        if timestamp:
+                            latest = timestamp.group("timestamp")
+                        if keyword in (timestamp.group("message") if timestamp else line):
+                            return {"job": ref, "pod": metadata["name"], "container": name,
+                                    "keyword": keyword}
+                    since[key] = latest
+        return None
 
     async def _enrich_failure_events(
         self,
@@ -3193,6 +3425,7 @@ def _incremental_log_text(
     max_chars: int,
     max_bytes: int,
     tail: int,
+    before: Optional[tuple[datetime, int]] = None,
 ) -> tuple[str, Optional[str], dict[str, Any]]:
     """Filter timestamped lines after a cursor and return bounded latest text.
 
@@ -3220,6 +3453,8 @@ def _incremental_log_text(
         match = _LOG_TIMESTAMP.match(raw_line)
         timestamp = match.group("timestamp") if match else None
         timestamp_key = _log_timestamp_key(timestamp) if timestamp else None
+        if before is not None and (timestamp_key is None or timestamp_key >= before):
+            continue
         prefix = raw_line[:match.start("message")] if match else ""
         message = match.group("message") if match else raw_line
         progress = "\r" in message
@@ -3254,6 +3489,7 @@ def _incremental_log_text(
             "raw": rendered,
             "token": token,
             "progress": progress,
+            "timestamp": timestamp if timestamp_key is not None else None,
         }
         # Runtimes may timestamp each flushed progress frame separately.
         # Merge only explicit rewrites of another progress row, never normal
@@ -3330,6 +3566,7 @@ def _incremental_log_text(
         "lines_delivered": len(selected),
         "bytes_delivered": len(visible.encode("utf-8")),
         "timestamped": not unparsed,
+        "oldest_timestamp": next((record["timestamp"] for record in selected if record["timestamp"]), None),
     }
     return visible, last_token, state
 
@@ -3370,7 +3607,11 @@ def _bound_job_logs_response(
 ) -> dict[str, Any]:
     """Bound the complete serialized log response, not just each Pod."""
 
-    if _log_result_size(value) <= budget:
+    def serialized_size():
+        # Allow for clients that serialize the result with separator spaces.
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+    if serialized_size() <= budget:
         return value
     value["truncated"] = True
     value["response_truncated"] = True
@@ -3379,7 +3620,7 @@ def _bound_job_logs_response(
         entries = []
         value["logs"] = entries
 
-    while _log_result_size(value) > budget:
+    while serialized_size() > budget:
         text_fields = [
             (entry, field)
             for entry in entries

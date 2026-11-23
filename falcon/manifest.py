@@ -157,10 +157,8 @@ def build_job_manifest(
         runtime.get("node_selector", {}), "runtime.node_selector"
     )
     node_selector.update(configured_selectors)
-    if request.pin_node:
-        pinned_node = plan.node or plan.sizing_node
-        if not pinned_node:
-            raise ValueError("node pinning was requested but the resource plan has no node")
+    if request.node:
+        pinned_node = request.node
         hostname_label = (
             _optional_string(cluster.get("hostname_label"))
             or "kubernetes.io/hostname"

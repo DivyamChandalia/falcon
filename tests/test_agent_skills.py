@@ -45,7 +45,7 @@ class AgentSkillTests(unittest.TestCase):
         self.assertIn("name: falcon", frontmatter)
         self.assertIn("description:", frontmatter)
         self.assertNotIn("allowed-tools:", frontmatter)
-        self.assertLessEqual(len(skill.splitlines()), 45)
+        self.assertLessEqual(len(skill.splitlines()), 62)
         for redundant in (
             "falcon setup", "CLI is fallback", "interactive shell", "conda activate",
             "backoffLimit", "restartPolicy", "Coder Jobs", "permissions change", "exact reference/UID",

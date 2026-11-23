@@ -709,6 +709,131 @@ class DashboardInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.focused_pane, "selected")
             self.assertEqual(app.state.expanded_pane, "selected")
 
+    async def test_steady_dashboard_refresh_keeps_sampling_without_repainting(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.pause(0.5)
+            row = app._selected_row()
+            for _ in range(24):
+                app._record_history()
+            app._render_resources()
+            count = len(app.histories[row.uid])
+            jobs = app.query_one("#jobs-pane", DashboardPane)
+            metrics = app.query_one("#resources-pane", DashboardPane)
+            with patch.object(jobs, "update", wraps=jobs.update) as update_jobs, patch.object(
+                metrics, "update", wraps=metrics.update
+            ) as update_metrics, patch.object(app, "_render_selected", wraps=app._render_selected) as selected:
+                rows = [replace(item, metrics_updated_at=item.metrics_updated_at + 1) for item in app.rows]
+                app._result_queue.put_nowait((rows, app.job_events, row.uid, None, 1, None))
+                app._drain_results()
+                self.assertEqual(len(app.histories[row.uid]), count + 1)
+                update_jobs.assert_not_called()
+                update_metrics.assert_not_called()
+                selected.assert_not_called()
+
+                changed = [
+                    replace(item, status="Failed", at_risk=False) if item.uid == row.uid else item
+                    for item in rows
+                ]
+                app._result_queue.put_nowait((changed, app.job_events, row.uid, None, 2, None))
+                app._drain_results()
+                self.assertEqual(app._selected_row().status, "Failed")
+                update_jobs.assert_called_once()
+                selected.assert_called_once()
+
+    async def test_dashboard_shows_first_jobs_before_starting_metrics(self) -> None:
+        class Collector(DemoUsageCollector):
+            def __init__(self):
+                super().__init__("mixed")
+                self.available_rows = []
+                self.metric_calls = 0
+                self.inventory_source = SimpleNamespace(
+                    jobs_ready=False,
+                    subscribe=lambda callback: lambda: None,
+                )
+                self.jobs_frame_drawn = False
+                self.started_after_jobs_frame = False
+
+            def collect_inventory(self):
+                return self.available_rows
+
+            def collect(self):
+                self.metric_calls += 1
+                self.started_after_jobs_frame = self.jobs_frame_drawn
+                return self.available_rows
+
+        collector = Collector()
+        app = FalconDashboard(collector, refresh_seconds=999)
+        display = app._display
+
+        def observe_display(screen, renderable):
+            display(screen, renderable)
+            if renderable is not None and app.filtered_rows:
+                jobs_region = app.query_one("#jobs-pane").content_region
+                strips = screen._compositor.render_strips()
+                for y in jobs_region.line_range:
+                    if app.filtered_rows[0].job[:8] in strips[y].crop(*jobs_region.column_span).text:
+                        collector.jobs_frame_drawn = True
+                        break
+
+        with patch.object(app, "_display", side_effect=observe_display):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(0.2)
+                self.assertIn(
+                    "Loading Jobs from Kubernetes",
+                    "".join(strip.text for strip in app.screen._compositor.render_strips()),
+                )
+                self.assertEqual(collector.metric_calls, 0)
+
+                collector.available_rows = DemoUsageCollector("mixed").collect()
+                app._inventory_changed()
+                await pilot.pause(0.2)
+                self.assertTrue(app.rows)
+                self.assertNotIn(
+                    "Loading Jobs",
+                    "".join(strip.text for strip in app.screen._compositor.render_strips()),
+                )
+                self.assertEqual(collector.metric_calls, 1)
+                self.assertTrue(collector.started_after_jobs_frame)
+
+    async def test_dashboard_spinner_updates_visible_cells_even_without_focus(self) -> None:
+        app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
+        tick = app._tick_clock
+        with patch.object(app, "_tick_clock"):
+            async with app.run_test(size=(200, 50)) as pilot:
+                await pilot.pause(0.5)
+                row = app._selected_row()
+                row.agent_managed = True
+                row.agent_state = "connected"
+                row.status = "Running"
+                app.app_focus = False
+                app._render_all()
+                await pilot.pause()
+
+                jobs = app.query_one("#jobs-pane-content", DashboardPaneContent)
+                details = app.query_one("#selected-details-left")
+                strips = app.screen._compositor.render_strips()
+                glyph = "◴◷◶◵"[app._spinner]
+                positions = [index for index, strip in enumerate(strips) if glyph in strip.text]
+                self.assertEqual(len(positions), 3)
+                with patch.object(jobs, "_render_content") as render_jobs, patch.object(
+                    details, "_render_content"
+                ) as render_details:
+                    tick()
+                    await pilot.pause()
+                    updated = app.screen._compositor.render_strips()
+                    next_glyph = "◴◷◶◵"[app._spinner]
+                    self.assertNotEqual(glyph, next_glyph)
+                    for index, (before, after) in enumerate(zip(strips, updated)):
+                        expected = before.text.replace(glyph, next_glyph) if index in positions else before.text
+                        # The clock can advance independently on the header.
+                        if index == 0:
+                            self.assertIn(next_glyph, after.text)
+                        else:
+                            self.assertEqual(expected, after.text)
+                    render_jobs.assert_not_called()
+                    render_details.assert_not_called()
+
     async def test_expanded_selected_job_scrolls_the_entire_inspector(self) -> None:
         app = FalconDashboard(DemoUsageCollector("mixed"), refresh_seconds=999)
         async with app.run_test(size=(80, 22)) as pilot:
@@ -2536,6 +2661,32 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history_renderer.call_count, 1)
                 self.assertEqual(pie_renderer.call_count, 1)
 
+    async def test_resources_retains_new_history_when_chart_output_is_unchanged(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        with patch("falcon.resources_ui.render_gpu_history", side_effect=lambda *a, **kw: Text("Same chart")) as chart:
+            async with app.run_test(size=(200, 50)) as pilot:
+                await pilot.pause(0.5)
+                initial = app.snapshot
+                count = len(app.history)
+                render_count = chart.call_count
+                allocation = app.query_one("#gpu-allocations-pane", ResourcesPane)
+                with patch.object(allocation, "update", wraps=allocation.update) as update, patch.object(
+                    app, "_render_nodes", wraps=app._render_nodes
+                ) as render_nodes:
+                    app._results.put_nowait(replace(initial, collected_at=initial.collected_at + 1))
+                    app._drain_results()
+                    self.assertEqual(len(app.history), count + 1)
+                    self.assertEqual(chart.call_count, render_count + 1)
+                    update.assert_not_called()
+                    render_nodes.assert_not_called()
+
+                    chart.side_effect = None
+                    chart.return_value = Text("Changed chart")
+                    app._results.put_nowait(replace(initial, collected_at=initial.collected_at + 2))
+                    app._drain_results()
+                    update.assert_called_once()
+                    render_nodes.assert_not_called()
+
     def test_history_deduplicates_stale_points_prunes_and_tracks_disappearing_nodes(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"))
         snapshot = GpuTelemetrySnapshot.from_mappings(
@@ -2739,6 +2890,36 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(app._cluster_namespace_values("gpu"), app._cluster_namespace_values("vram"))
         app.nodes = [replace(node, gpu_memory_bytes_per_device=None) for node in app.nodes]
         self.assertEqual(app._cluster_namespace_values("vram"), ())
+
+    async def test_allocation_colors_shortcut_and_vram_tree_sort(self) -> None:
+        app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)
+        async with app.run_test(size=(140, 32)) as pilot:
+            await pilot.pause(0.5)
+            await pilot.press("right")
+            footer = app.query_one("#resources-footer")
+            self.assertIn("c Colors", footer.render().plain)
+            before = app._namespace_colors()
+            await pilot.press("c")
+            self.assertNotEqual(app._namespace_colors(), before)
+            await pilot.press("c")
+            self.assertEqual(app._namespace_colors(), before)
+
+            await pilot.press("v")
+            groups = app._namespace_allocation_groups()
+            expected = dict(app._cluster_namespace_values("vram"))
+            self.assertTrue(expected)
+            self.assertEqual(
+                [group.vram_bytes for group in groups],
+                sorted((group.vram_bytes for group in groups), reverse=True),
+            )
+            for group in groups:
+                self.assertEqual(group.vram_bytes / 1024**3, expected.get(group.namespace, 0))
+                sizes = app._gpu_memory_by_node()
+                values = [app._requested_vram(consumer, sizes) for consumer in group.consumers]
+                self.assertEqual(values, sorted(values, reverse=True))
+            self.assertIn("VRAM", [column.header for column in app._allocation_table(width=80).columns])
+            await pilot.press("v")
+            self.assertIn("GPU", [column.header for column in app._allocation_table(width=80).columns])
 
     async def test_v_updates_combined_gpu_pie_without_changing_focus(self) -> None:
         app = FalconResourcesApp(DemoCollector("mixed"), refresh_seconds=999)

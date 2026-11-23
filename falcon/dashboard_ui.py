@@ -11,19 +11,23 @@ import textwrap
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from statistics import mean
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 from rich import box
 from rich.align import Align
+from rich.cells import cell_len
 from rich.console import Group
+from rich.control import Control
 from rich.panel import Panel
 from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events
+from textual._compositor import ChopsUpdate
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -82,6 +86,9 @@ class InventoryChanged(Message):
 
 
 AGENT_PRESENCE_REFRESH_SECONDS = 1.0
+SPINNER_FRAMES = "◴◷◶◵"
+SPINNER_STYLE = Style(meta={"falcon_animation": "spinner"})
+CLOCK_STYLE = Style(meta={"falcon_animation": "clock"})
 
 
 class AgentPresenceChanged(Message):
@@ -476,8 +483,8 @@ def _job_status_display(row: JobUsage, spinner: int = 0) -> Tuple[str, str, str]
             return "✓", row.status, PALETTE.success
         if state == "connected":
             if row.at_risk:
-                return "◴◷◶◵"[spinner % 4], "Eviction risk", PALETTE.warning
-            return "◴◷◶◵"[spinner % 4], row.status, _status_style(row.status)[1]
+                return SPINNER_FRAMES[spinner % 4], "Eviction risk", PALETTE.warning
+            return SPINNER_FRAMES[spinner % 4], row.status, _status_style(row.status)[1]
     if row.at_risk:
         return "●", "Eviction risk", PALETTE.warning
     icon, color = _status_style(row.status)
@@ -498,7 +505,98 @@ def _event_style(event: JobEvent) -> str:
     return YELLOW if event.event_type.lower() == "warning" else GREEN
 
 
-class DashboardPaneContent(Static):
+def _status_text(value: str, color: str) -> Text:
+    text = Text(value, style=color)
+    if value and value[0] in SPINNER_FRAMES:
+        text.stylize(SPINNER_STYLE, 0, 1)
+    return text
+
+
+class AnimatedContent(Static):
+    """Patch marked cells without rebuilding the surrounding Rich content."""
+
+    def __init__(self, *args, **kwargs):
+        self._animation_lines: dict[int, tuple[Strip, list[tuple[int, Segment, str]]]] = {}
+        self._animation_size = None
+        self._animation_values: dict[str, str] = {}
+        super().__init__(*args, **kwargs)
+
+    def refresh(self, *regions, **kwargs):
+        self._animation_lines.clear()
+        return super().refresh(*regions, **kwargs)
+
+    def update(self, content="", *, layout: bool = True) -> None:
+        self._animation_values.clear()
+        super().update(content, layout=layout)
+
+    def animate_cells(self, **values: str) -> bool:
+        if not self.display or self.size != self._animation_size:
+            return False
+        regions = []
+        for y, (_, cells) in self._animation_lines.items():
+            for x, segment, key in cells:
+                value = values.get(key)
+                if (
+                    value is not None
+                    and cell_len(value) == segment.cell_length
+                    and value != self._animation_values.get(key, segment.text)
+                ):
+                    regions.append(Region(x, y, segment.cell_length, 1))
+        self._animation_values.update(values)
+        if regions:
+            # Bypass our cache invalidation: the base strips are unchanged.
+            super().refresh(*regions)
+        return bool(regions)
+
+    def render_line(self, y: int) -> Strip:
+        if self.size != self._animation_size:
+            self._animation_lines.clear()
+            self._animation_size = self.size
+        cached = self._animation_lines.get(y)
+        if cached is None:
+            line = super().render_line(y)
+            cells = []
+            x = 0
+            for segment in line:
+                key = segment.style.meta.get("falcon_animation") if segment.style else None
+                if key:
+                    cells.append((x, segment, key))
+                x += segment.cell_length
+            cached = (line, cells)
+            self._animation_lines[y] = cached
+        line, cells = cached
+        if not cells or not self._animation_values:
+            return line
+        strips = []
+        start = 0
+        for x, segment, key in cells:
+            value = self._animation_values.get(key, segment.text)
+            length = segment.cell_length
+            if cell_len(value) != length:
+                continue
+            strips.append(line.crop(start, x))
+            strips.append(Strip([Segment(value, segment.style)], length))
+            start = x + length
+        strips.append(line.crop(start))
+        return Strip.join(strips)
+
+
+class _AnimationUpdate(ChopsUpdate):
+    """Keep Textual's partial terminal writes within their dirty spans."""
+
+    def render_segments(self, console) -> str:
+        output = []
+        for y, left, right in self.spans:
+            for end, (x, strip) in zip(self.chop_ends[y], self.chops[y].items()):
+                start = max(x, left)
+                stop = min(end, right)
+                if strip is not None and start < stop:
+                    output.append(Control.move_to(start, y).segment.text)
+                    output.append(strip.crop(start - x, stop - x).render(console))
+        return "".join(output)
+
+
+class DashboardPaneContent(AnimatedContent):
     def __init__(self, content="", *args, **kwargs):
         self._natural_content = content
         self._natural_height_cache: Optional[Tuple[int, int]] = None
@@ -1167,7 +1265,7 @@ class SelectedJobInspector(Container):
     def compose(self) -> ComposeResult:
         with Horizontal(id="selected-details"):
             with Vertical(classes="selected-detail-column"):
-                yield Static(id="selected-details-left", markup=False)
+                yield AnimatedContent(id="selected-details-left", markup=False)
                 yield SelectedCommandRow(id="selected-command-row")
             with Vertical(classes="selected-detail-column"):
                 yield Static(id="selected-details-right", markup=False)
@@ -1797,6 +1895,9 @@ class FalconDashboard(App):
         self.rows: List[JobUsage] = []
         self.filtered_rows: List[JobUsage] = []
         self.job_events: List[JobEvent] = []
+        self._jobs_display_key: tuple | None = None
+        self._resource_display_key: object = None
+        self._summary_display: Optional[Text] = None
         self.event_search = ""
         self._output_search_target = None
         self._output_matches = []
@@ -1807,11 +1908,14 @@ class FalconDashboard(App):
         self._inventory_notification_lock = threading.Lock()
         self._inventory_notification_pending = False
         self._inventory_unsubscribe = None
+        self._inventory_loading = getattr(collector, "inventory_source", None) is not None
+        self._initial_inventory_details_pending = False
         self._presence_stop = threading.Event()
         self._presence_thread = None
         self._last_api_error = None
         self._stale = False
         self._spinner = 0
+        self._animation_repaint_pending = False
         self._result_queue = __import__("queue").Queue(maxsize=1)
         self._last_terminal_size: Tuple[int, int] = (-1, -1)
         self._responsive_hidden_panes: Set[str] = set()
@@ -1844,7 +1948,7 @@ class FalconDashboard(App):
             self.state.cursor_job_uid = self.filtered_rows[value].uid
 
     def compose(self) -> ComposeResult:
-        yield Static(id="falcon-header")
+        yield AnimatedContent(id="falcon-header")
         yield Static(id="summary")
         yield Static(id="controls")
         yield Input(placeholder="Search jobs…", id="search-input")
@@ -1871,7 +1975,8 @@ class FalconDashboard(App):
         if source is not None:
             self._inventory_unsubscribe = source.subscribe(self._inventory_changed)
             self._inventory_changed()
-        self._request_update()
+        else:
+            self._request_update()
         self.set_interval(self.refresh_seconds, self._request_update)
         self.set_interval(0.2, self._drain_results)
         if self.log_manager is not None:
@@ -1969,28 +2074,36 @@ class FalconDashboard(App):
             return
 
     def _tick_clock(self) -> None:
-        self._spinner = (self._spinner + 1) % 4
+        self._spinner = (self._spinner + 1) % len(SPINNER_FRAMES)
+        glyph = SPINNER_FRAMES[self._spinner]
         try:
-            self._render_header()
-            # Repaint only the Jobs table while an agent-owned workload is
-            # active. Keep the selected-job status in sync without making the
-            # log/metrics panes redraw on every frame.
-            if any(self._agent_is_connected(row) for row in self.filtered_rows):
-                self._render_jobs(layout=False)
-                selected = self._selected_row()
-                if selected is not None and self._agent_is_connected(selected):
-                    self._render_selected_status()
-        except Exception:
+            header = self.query_one("#falcon-header", AnimatedContent)
+            if header.animate_cells(spinner=glyph, clock=self._clock()):
+                self._animation_repaint_pending = True
+            if self.query_one("#jobs-pane").display:
+                jobs = self.query_one("#jobs-pane-content", AnimatedContent)
+                if jobs.animate_cells(spinner=glyph):
+                    self._animation_repaint_pending = True
+            if self.query_one("#selected-pane").display:
+                content = "#selected-details-left" if self.query_one("#selected-inspector").display else "#selected-pane-content"
+                if self.query_one(content, AnimatedContent).animate_cells(spinner=glyph):
+                    self._animation_repaint_pending = True
+        except NoMatches:
             # A timer may race with Textual tearing down the default screen.
             return
 
-    @staticmethod
-    def _agent_is_connected(row: JobUsage) -> bool:
-        """Animate nonterminal Jobs with an active wait_for_events lease."""
-        return (
-            row.agent_managed and row.agent_state == "connected"
-            and row.status.strip().lower() not in {"failed", "unknown", "succeeded", "completed"}
-        )
+    def _display(self, screen, renderable) -> None:
+        if self._animation_repaint_pending and renderable is not None:
+            self._animation_repaint_pending = False
+            if isinstance(renderable, ChopsUpdate):
+                # Textual's terminal serializer can include the widget's
+                # unchanged prefix when a region starts within a strip.
+                renderable = _AnimationUpdate(renderable.chops, renderable.spans, renderable.chop_ends)
+        super()._display(screen, renderable)
+        if self._initial_inventory_details_pending and renderable is not None:
+            # Widget refresh requests reach the screen asynchronously. Start
+            # the slower initialization only after Textual emits a frame.
+            self.call_next(self._finish_initial_inventory)
 
     def pane_focused(self, pane: str) -> None:
         self.state.focused_pane = pane
@@ -2228,7 +2341,10 @@ class FalconDashboard(App):
         self.post_message(InventoryChanged())
 
     def on_inventory_changed(self, message: InventoryChanged) -> None:
-        self.set_timer(0.1, self._flush_inventory)
+        if self._inventory_loading:
+            self._flush_inventory()
+        else:
+            self.set_timer(0.1, self._flush_inventory)
 
     def _flush_inventory(self) -> None:
         with self._inventory_notification_lock:
@@ -2238,34 +2354,68 @@ class FalconDashboard(App):
         previous_uid = self.state.cursor_job_uid
         previous_events = self.job_events
         previous_stale = self._stale
+        was_loading = self._inventory_loading
+        self._inventory_loading = not getattr(self.collector.inventory_source, "jobs_ready", True)
         rows = self.collector.collect_inventory()
         rows_changed = rows != self.rows
+        first_rows = rows_changed and bool(rows) and not self.rows and was_loading
+        if first_rows:
+            self._initial_inventory_details_pending = True
         self.rows = rows
         self.state.marked_job_uids.intersection_update(row.uid for row in self.rows)
         self._filter_rows()
+        selected = self._selected_row()
+        if not self._initial_inventory_details_pending:
+            self.job_events = (
+                self.collector.events(selected)
+                if selected and "events" not in self.state.hidden_panes else []
+            )
+        self._stale = bool(self.collector.last_error)
+        self.state.last_successful_refresh = self.collector.last_successful_refresh
+        if rows_changed:
+            self._render_summary()
+            self._render_controls()
+        if rows_changed or was_loading != self._inventory_loading:
+            self._render_jobs(layout=False)
+        if rows_changed:
+            self._render_footer()
+            if not self._initial_inventory_details_pending:
+                self._refresh_inventory_details()
+        if previous_events != self.job_events or previous_uid != self.state.cursor_job_uid:
+            self._render_events()
+        if previous_stale != self._stale:
+            self._render_header()
+        if was_loading and not self._inventory_loading:
+            self._request_update()
+
+    def _finish_initial_inventory(self) -> None:
+        if not self._initial_inventory_details_pending:
+            return
+        self._initial_inventory_details_pending = False
+        if not self.is_mounted:
+            return
+        self._refresh_inventory_details()
         selected = self._selected_row()
         self.job_events = (
             self.collector.events(selected)
             if selected and "events" not in self.state.hidden_panes else []
         )
-        self._stale = bool(self.collector.last_error)
-        self.state.last_successful_refresh = self.collector.last_successful_refresh
-        if rows_changed and self.log_manager is not None:
+        self._render_events()
+        self._request_update()
+
+    def _refresh_inventory_details(self) -> None:
+        if not self.is_mounted:
+            return
+        if self.log_manager is not None:
             self.log_manager.reconcile(self.rows)
-        if rows_changed:
-            self._render_summary()
-            self._render_controls()
-            self._render_jobs(layout=False)
-            self._render_selected()
-            self._render_resources()
-            self._render_footer()
-        if previous_events != self.job_events or previous_uid != self.state.cursor_job_uid:
-            self._render_events()
-        if previous_stale != self._stale:
-            self._render_header()
+        self._render_selected()
+        self._render_resources()
 
     def _request_update(self) -> None:
-        if self._refreshing:
+        # Give the first inventory frame priority over metrics and availability
+        # requests. The inventory watch can render and recover independently.
+        waiting_for_inventory = self._inventory_loading and not self.rows and not self._stale
+        if self._refreshing or waiting_for_inventory or self._initial_inventory_details_pending:
             return
         self._refreshing = True
         self.state.loading_states["refresh"] = True
@@ -2303,6 +2453,14 @@ class FalconDashboard(App):
             return
         self._refreshing = False
         self.state.loading_states["refresh"] = False
+        previous_rows = self.rows
+        previous_selected = self._selected_row()
+        previous_events = self.job_events
+        previous_stale = self._stale
+        previous_availability = self.state.gpu_availability
+        previous_filtered_count = len(self.filtered_rows)
+        previous_marked_count = len(self.state.marked_job_uids)
+        previous_jobs_scroll = self.state.jobs_scroll_offset
         if rows is not None:
             if getattr(self.collector, "inventory_source", None) is not None:
                 # An inventory event can arrive while the metrics worker is
@@ -2324,7 +2482,7 @@ class FalconDashboard(App):
                 selected = self._selected_row()
                 self.job_events = self.collector.events(selected) if selected else []
                 event_uid = self.state.cursor_job_uid
-            if self.log_manager is not None:
+            if self.log_manager is not None and not self._initial_inventory_details_pending:
                 self.log_manager.reconcile(self.rows)
             if error and error != self._last_api_error:
                 self.notify(f"API error: {error} · retrying…", severity="warning")
@@ -2336,7 +2494,38 @@ class FalconDashboard(App):
                 self.notify(f"API error: {error} · retrying…", severity="error")
         self._last_api_error = error
         try:
-            self._render_all()
+            if previous_stale != self._stale:
+                self._render_header()
+            rows_changed = previous_rows != self.rows
+            selected = self._selected_row()
+            if previous_selected is not None and selected is not None:
+                # Sampling timestamps are bookkeeping and do not appear in
+                # the inspector. Keep the newest row without repainting it.
+                previous_selected = replace(
+                    previous_selected, metrics_updated_at=selected.metrics_updated_at
+                )
+            selected_changed = previous_selected != selected
+            if self.query_one("#summary").display and (
+                rows_changed or previous_availability != self.state.gpu_availability
+            ):
+                self._render_summary()
+            if previous_filtered_count != len(self.filtered_rows) and self.query_one("#controls").display:
+                self._render_controls()
+            marked_changed = previous_marked_count != len(self.state.marked_job_uids)
+            if self.query_one("#jobs-pane").display and (
+                rows_changed or marked_changed or previous_jobs_scroll != self.state.jobs_scroll_offset
+            ):
+                self._render_jobs(layout=False)
+            if (previous_selected.uid if previous_selected else "") != self.state.cursor_job_uid:
+                self._set_titles()
+            if (selected_changed or marked_changed) and self.query_one("#selected-pane").display:
+                self._render_selected()
+            if marked_changed:
+                self._render_footer()
+            if self.query_one("#resources-pane").display:
+                self._render_resources()
+            if previous_events != self.job_events and self.query_one("#events-pane").display:
+                self._render_events()
         except NoMatches:
             # The collector thread may deliver its final result while the
             # Textual screen is being torn down.
@@ -2361,15 +2550,20 @@ class FalconDashboard(App):
         self._set_selected_subtitle()
 
     def _render_header(self) -> None:
-        target = self.query_one("#falcon-header", Static)
+        target = self.query_one("#falcon-header", AnimatedContent)
         clock = self._clock()
-        glyph = "◴◷◶◵"[self._spinner]
-        status = f"[bold {RED}]STALE[/]" if self._stale else f"[{CYAN}]{glyph}[/]"
         width = max(30, self.size.width - 2)
-        left = f"[bold {CYAN}]Falcon Dashboard[/]"
-        right = f"[{GRAY}]{clock}[/]  {status}"
         gap = max(1, width - len("Falcon Dashboard") - len(clock) - 4)
-        target.update(left + " " * gap + right)
+        header = Text()
+        header.append("Falcon Dashboard", f"bold {CYAN}")
+        header.append(" " * gap)
+        header.append(clock, Style.parse(GRAY) + CLOCK_STYLE)
+        header.append("  ")
+        if self._stale:
+            header.append("STALE", f"bold {RED}")
+        else:
+            header.append(SPINNER_FRAMES[self._spinner], Style.parse(CYAN) + SPINNER_STYLE)
+        target.update(header)
 
     def _render_summary(self) -> None:
         running = sum(row.status == "Running" for row in self.rows)
@@ -2411,7 +2605,9 @@ class FalconDashboard(App):
         gap = max(2, width - len(left.plain) - len(right.plain) - 4)
         left.append(" " * gap)
         left.append_text(right)
-        self.query_one("#summary", Static).update(left)
+        if left != self._summary_display:
+            self._summary_display = left
+            self.query_one("#summary", Static).update(left)
 
     def _render_controls(self) -> None:
         filters = self.state.filters
@@ -2485,15 +2681,21 @@ class FalconDashboard(App):
     def _render_jobs(self, *, layout: bool = True) -> None:
         target = self.query_one("#jobs-pane", DashboardPane)
         if not self.rows:
+            layout = layout or self._jobs_display_key is not None
+            self._jobs_display_key = None
+            message = (
+                "Loading Jobs from Kubernetes…"
+                if self._inventory_loading
+                else "No Jobs found.\nPress f to change filters or r to refresh."
+            )
             target.update(
-                Align.center(
-                    "No Jobs found.\nPress f to change filters or r to refresh.",
-                    vertical="middle",
-                ),
+                Align.center(message, vertical="middle"),
                 layout=layout,
             )
             return
         if not self.filtered_rows:
+            layout = layout or self._jobs_display_key is not None
+            self._jobs_display_key = None
             target.update(
                 Align.center(
                     f"No Jobs match “{self.state.search_query}”.\nPress Esc to clear search.",
@@ -2563,6 +2765,7 @@ class FalconDashboard(App):
         count = self._visible_job_count()
         start = self.state.jobs_scroll_offset
         jobs_focused = self.app_focus and self.state.focused_pane == "jobs"
+        displayed_rows = []
         for index, row in enumerate(self.filtered_rows[start:start + count], start=start):
             selected = row.uid == self.state.cursor_job_uid
             marked = row.uid in self.state.marked_job_uids
@@ -2573,7 +2776,7 @@ class FalconDashboard(App):
             cells: List[Text] = [Text(f"{marker}{mark}", style=CYAN if selection_active or marked else GRAY)]
             name_style = f"bold {WHITE}" if selected else WHITE
             cells.append(Text(row.job, style=name_style, no_wrap=True, overflow="ellipsis"))
-            cells.append(Text(f"{icon} {status_text}", style=status_color))
+            cells.append(_status_text(f"{icon} {status_text}", status_color))
             if show_active_pod:
                 cells.append(Text(_active_pod_state_display(row.active_pod_state), style=WHITE, no_wrap=True, overflow="ellipsis"))
             if show_node:
@@ -2586,9 +2789,26 @@ class FalconDashboard(App):
                 cells.append(Text(row.completions, style=WHITE))
             if show_age:
                 cells.append(Text(row.age, style=WHITE))
+            displayed_rows.append(
+                tuple(
+                    (SPINNER_FRAMES[0] + cell.plain[1:], cell.style)
+                    if column == 2 and icon in SPINNER_FRAMES
+                    else (cell.plain, cell.style)
+                    for column, cell in enumerate(cells)
+                )
+            )
             table.add_row(*cells)
         position = f" {min(start + 1, len(self.filtered_rows))}-{min(start + count, len(self.filtered_rows))}/{len(self.filtered_rows)} "
-        target.border_subtitle = position if len(self.filtered_rows) > count else ""
+        subtitle = position if len(self.filtered_rows) > count else ""
+        display_key = (width, expanded, subtitle, tuple(displayed_rows))
+        if display_key == self._jobs_display_key:
+            return
+        # Jobs content has auto height. An in-place repaint keeps the old
+        # bounds, which can clip all rows when replacing the loading message.
+        previous = self._jobs_display_key
+        layout = layout or previous is None or len(previous[-1]) != len(displayed_rows)
+        self._jobs_display_key = display_key
+        target.border_subtitle = subtitle
         target.update(table, layout=layout)
 
     def _wrapped_command(self, row: JobUsage) -> List[str]:
@@ -3246,7 +3466,7 @@ class FalconDashboard(App):
                 if label == "Eviction risk" and row.at_risk
                 else WHITE
             )
-            table.add_row(label, Text(value, style=value_style))
+            table.add_row(label, _status_text(value, value_style) if label == "Status" else Text(value, style=value_style))
         return table
 
     def _render_selected_status(self) -> None:
@@ -3287,6 +3507,8 @@ class FalconDashboard(App):
         self._selected_detail_cache = (row.uid, details, right_details)
 
     def _render_selected(self) -> None:
+        if self._initial_inventory_details_pending:
+            return
         row = self._selected_row()
         target = self.query_one("#selected-pane", DashboardPane)
         inspector_visible = self._selected_inspector_visible()
@@ -3412,7 +3634,9 @@ class FalconDashboard(App):
                         if label == "Eviction risk" and row.at_risk
                         else WHITE
                     )
-                    legacy_overview.add_row(label, Text(value, style=value_style))
+                    legacy_overview.add_row(
+                        label, _status_text(value, value_style) if label == "Status" else Text(value, style=value_style)
+                    )
                 target.update(
                     Group(
                         Panel(
@@ -3468,7 +3692,7 @@ class FalconDashboard(App):
         text = Text(row.job, style=f"bold {WHITE}")
         status_icon, status_label, status_color = _job_status_display(row, self._spinner)
         text.append("   ", style=GRAY)
-        text.append(f"{status_icon} {status_label}", style=status_color)
+        text.append_text(_status_text(f"{status_icon} {status_label}", status_color))
         text.append(f"   Active pod: {_active_pod_state_display(row.active_pod_state)}   {row.nodes}   {row.age}", style=GRAY)
         if command and self.size.width >= 90:
             text.append(f"   {command}", style=WHITE)
@@ -3948,12 +4172,13 @@ class FalconDashboard(App):
         target = self.query_one("#resources-pane", DashboardPane)
         row = self._selected_row()
         target.border_title = self._pane_title("resources")
-        if not row:
-            target.update(Align.center("Resource metrics unavailable for this Job.", vertical="middle"))
-            return
-        points = self._history_slice(row.uid)
+        points = self._history_slice(row.uid) if row else []
         if not points:
-            target.update(Align.center("Waiting for samples", vertical="middle"))
+            message = "Waiting for samples" if row else "Resource metrics unavailable for this Job."
+            target.border_subtitle = ""
+            if self._resource_display_key != message:
+                self._resource_display_key = message
+                target.update(Align.center(message, vertical="middle"))
             return
         last = points[-1]
         if row.status in {"Succeeded", "Failed"}:
@@ -3966,6 +4191,7 @@ class FalconDashboard(App):
         else:
             target.border_subtitle = ""
         if self.state.expanded_pane == "resources":
+            self._resource_display_key = None
             self._render_expanded_resources(target, row, points)
             return
         metrics = self._resource_metrics(row, points)
@@ -3982,6 +4208,10 @@ class FalconDashboard(App):
         table = Table(box=None, expand=True, padding=(0, 1), show_header=False)
         pane_width = target.content_size.width or target.size.width or self.size.width
         columns = 2 if pane_width < 90 else 4
+        display_key = (columns, tuple(cells))
+        if display_key == self._resource_display_key:
+            return
+        self._resource_display_key = display_key
         for _ in range(columns):
             table.add_column(ratio=1)
         if columns == 4:

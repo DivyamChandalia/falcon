@@ -152,7 +152,7 @@ def test_replacement_does_not_adopt_old_attempt_and_events_are_local(inventory, 
 @pytest.mark.parametrize("phase", ["Running", "Pending"])
 def test_agent_running_presence_follows_wait_not_ownership(inventory, monkeypatch, tmp_path, phase):
     from falcon.agent_presence import WaitPresence
-    from falcon.dashboard_ui import FalconDashboard, _job_status_display
+    from falcon.dashboard_ui import _job_status_display
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     source, _, transport = inventory
@@ -183,14 +183,12 @@ def test_agent_running_presence_follows_wait_not_ownership(inventory, monkeypatc
     assert row.agent_state == "disconnected"
     assert row.status == phase
     assert _job_status_display(row, 0)[0] == "●"
-    assert not FalconDashboard._agent_is_connected(row)
 
     reconnected = WaitPresence(None, "research", ["job-1"])
     reconnected.renew()
     try:
         row = collector.collect_inventory()[0]
         assert row.agent_state == "connected"
-        assert FalconDashboard._agent_is_connected(row)
         assert _job_status_display(row, 0)[0] == "◴"
         assert _job_status_display(row, 1)[0] == "◷"
     finally:
@@ -320,7 +318,6 @@ async def test_live_dashboard_reconnects_while_metrics_and_inventory_are_idle(
                 lease = WaitPresence(None, "research", ["job-1"])
                 lease.renew()
                 await wait_for_state("connected")
-                assert app._agent_is_connected(app.rows[0])
                 assert _job_status_display(app.rows[0], 0)[0] == "◴"
                 assert _job_status_display(app.rows[0], 1)[0] == "◷"
                 lease.close()

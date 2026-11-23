@@ -246,7 +246,11 @@ legend and flat GPU Jobs list. Each namespace parent uses the chart's stable
 colour and shows the sum of requested GPU count, memory, and CPU for its visible
 children; child rows show workload and node. It includes CPU-only and
 memory-only workloads, and sorting applies consistently to parents and children
-without combining unlike units. The view selector is hidden while one surface
+without combining unlike units. Press `v` in GPU mode to show allocated VRAM
+instead of GPU counts in the tree and sort both levels by VRAM. Values use
+requested GPU count times device memory, with a dash when no amount is known.
+Press `c` to switch the namespace palette
+across the tree, pies, and history. The view selector is hidden while one surface
 is expanded; `Esc` restores it with the combined/page layout. `System/hidden`
 is retained in charts when needed to reconcile totals. Both graphs switch
 bases together within the active pair. GPU mode is exactly namespace requested GPU count

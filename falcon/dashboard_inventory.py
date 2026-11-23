@@ -64,6 +64,13 @@ class DashboardInventory:
 
         return unsubscribe
 
+    @property
+    def jobs_ready(self) -> bool:
+        """Whether an empty Jobs view can be confirmed from both lists."""
+
+        with self._lock:
+            return "jobs.batch" in self._initialized and "pods" in self._initialized
+
     def _notify(self):
         with self._lock:
             self._revision += 1

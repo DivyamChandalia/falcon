@@ -95,6 +95,30 @@ def plan_cpu_resources(
     )
 
 
+AUTO_NODE = "auto"
+
+
+def select_node(
+    nodes: Iterable[NodeResources],
+    node: Optional[str],
+    gpu_model: Optional[str] = None,
+) -> list[NodeResources]:
+    """Restrict planning to one named node; ``auto``/``None`` keeps every node."""
+
+    candidates = list(nodes)
+    if node is None or node == AUTO_NODE:
+        return candidates
+    match = next((item for item in candidates if item.name == node), None)
+    if match is None:
+        known = ", ".join(sorted(item.name for item in candidates)) or "none"
+        raise ValueError(f"node {node} was not reported by the cluster; known nodes: {known}")
+    if match.unschedulable:
+        raise ValueError(f"node {node} is cordoned (unschedulable)")
+    if gpu_model is not None and canonical_gpu(match.gpu_product or "") != canonical_gpu(gpu_model):
+        raise ValueError(f"node {node} has {match.gpu_product or 'no'} GPUs, not {gpu_model}")
+    return [match]
+
+
 def plan_resources(
     nodes: Iterable[NodeResources],
     preset: str,

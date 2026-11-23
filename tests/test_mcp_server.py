@@ -62,6 +62,27 @@ class FakeService:
 
 
 @pytest.mark.asyncio
+async def test_cancel_job_batch_preview_and_exact_cancellation():
+    service = FakeService(DEFAULT_CONFIG)
+    targets = [REF, {"name": "train-two", "uid": "uid-2"}]
+
+    def resolve(jobs, pattern):
+        return {"jobs": targets if pattern == "^train" else jobs}
+
+    service.cancel_targets = resolve
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *args, **kwargs: service)
+    async with create_connected_server_and_client_session(server) as session:
+        preview = await session.call_tool("cancel_job", {"pattern": "^train", "dry_run": True})
+        assert preview.structuredContent == {"jobs": targets, "dry_run": True}
+        assert not service.calls
+        result = await session.call_tool("cancel_job", {"jobs": preview.structuredContent["jobs"]})
+        assert result.structuredContent == {
+            "results": [{"job": target, "cancelled": True} for target in targets],
+        }
+        assert service.calls == [("cancel", target) for target in targets]
+
+
+@pytest.mark.asyncio
 async def test_tool_retries_transient_failure_without_agent_intervention(monkeypatch):
     service = FakeService(DEFAULT_CONFIG)
     calls = []

@@ -149,7 +149,6 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
             ordinary = _job_status_display(_job(status=status))
             self.assertEqual(_job_status_display(connected, 0), ("◴", *ordinary[1:]))
             self.assertEqual(_job_status_display(connected, 1), ("◷", *ordinary[1:]))
-            self.assertTrue(FalconDashboard._agent_is_connected(connected))
         risk = _job(agent_managed=True, agent_state="connected", at_risk=True)
         ordinary_risk = _job_status_display(_job(at_risk=True))
         self.assertEqual(_job_status_display(risk, 0), ("◴", *ordinary_risk[1:]))
@@ -157,13 +156,11 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
         for status, icon in (("Failed", "✕"), ("Succeeded", "✓")):
             terminal = _job(status=status, agent_managed=True, agent_state="connected")
             self.assertEqual(_job_status_display(terminal, 1)[0], icon)
-            self.assertFalse(FalconDashboard._agent_is_connected(terminal))
         for state in ("", "disconnected", "offline"):
             disconnected = _job(agent_managed=True, agent_state=state)
             self.assertEqual(
                 _job_status_display(disconnected, 1), _job_status_display(_job(), 1)
             )
-            self.assertFalse(FalconDashboard._agent_is_connected(disconnected))
         for status in ("Pending", "Queued", "Suspended", "Succeeded", "Failed"):
             with self.subTest(status=status):
                 ordinary = _job_status_display(_job(status=status), 0)
@@ -234,7 +231,7 @@ class DashboardInspectorTests(unittest.IsolatedAsyncioTestCase):
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause(0.6)
-            self.assertTrue(app._agent_is_connected(row))
+            self.assertIn(_job_status_display(row, app._spinner)[0], "◴◷◶◵")
             self.assertTrue(
                 any(glyph in app.export_screenshot(simplify=True) for glyph in "◴◷◶◵")
             )

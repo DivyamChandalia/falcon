@@ -78,7 +78,7 @@ _FUZZY_COMPLETION = r'''_falcon_suggest() {
 LAUNCH_OPTIONS = [
     "--gpus", "--cpu", "--memory", "--name", "--environment",
     "--image", "--env", "--shm-size", "--shm-percent", "-f", "--follow",
-    "--pin-node", "--max", "--dry-run", "--output", "--namespace", "--",
+    "--node", "--max", "--dry-run", "--output", "--namespace", "--",
 ]
 
 OPTIONS: Dict[str, List[str]] = {

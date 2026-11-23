@@ -232,7 +232,7 @@ class JobRequest:
     env: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
     annotations: Mapping[str, str] = field(default_factory=dict)
-    pin_node: bool = False
+    node: Optional[str] = None
 
     def __post_init__(self) -> None:
         name = self.name.strip()

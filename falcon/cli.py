@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import difflib
 import fnmatch
 import getpass
@@ -74,7 +75,7 @@ from .launcher import (
 )
 from .models import GPURequest, JobRequest, NodeResources
 from .output import dumps, render_table
-from .planning import canonical_gpu, plan_cpu_resources, plan_resources
+from .planning import AUTO_NODE, canonical_gpu, plan_cpu_resources, plan_resources, select_node
 from .resource_service import (
     ResourceServiceClient,
     ResourceServiceCollector,
@@ -199,9 +200,9 @@ def _submission_arguments(parser: argparse.ArgumentParser) -> None:
         help="Size from 95%% of proportional node capacity",
     )
     parser.add_argument(
-        "--pin-node",
-        action="store_true",
-        help="Pin to the node used for resource planning",
+        "--node",
+        default="auto",
+        help="Node to run on, or 'auto' (default) to let Kubernetes choose",
     )
     parser.add_argument(
         "--dry-run",
@@ -750,6 +751,7 @@ def _submit_command(
         else config.get("resources", {}).get("shared_memory_percent", 15)
     )
     memory = _cli_memory(args.memory) if args.memory else None
+    node_name = None if args.node == AUTO_NODE else args.node
     if gpu is None:
         if not args.cpu or not memory:
             raise CliError("CPU-only Jobs require both --cpu and --memory")
@@ -759,9 +761,12 @@ def _submit_command(
             shared_memory=args.shm_size,
             shared_memory_percent=percent,
         )
+        if node_name is not None:
+            select_node(_planning_nodes(config, KubernetesClient(namespace)), node_name)
+            plan = dataclasses.replace(plan, node=node_name, sizing_node=node_name)
     else:
         client = KubernetesClient(namespace)
-        nodes = _planning_nodes(config, client)
+        nodes = select_node(_planning_nodes(config, client), node_name, gpu.model)
         plan = plan_resources(
             nodes,
             args.gpu,
@@ -785,7 +790,7 @@ def _submit_command(
         working_dir=str(Path.cwd()),
         env=_parse_env(args.env),
         annotations={"falcon.dev/owner": logname()},
-        pin_node=args.pin_node,
+        node=node_name,
     )
     specification = build_specification(request, plan, config)
     if args.dry_run:

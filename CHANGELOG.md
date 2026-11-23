@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.5 — 2026-11-23
+
+- Ask your agent to run a Job on a specific node, or ask which GPUs are free
+  right now across all GPU types. By default, Jobs still go to any matching
+  node.
+- Cancel several Jobs in one request, for example "cancel all my sweep-* jobs".
+- Mistakes such as an unknown GPU name now get a clear explanation instead of
+  "Kubernetes is unavailable".
+- Dashboard opens faster and feels more responsive, and stays smooth over slow
+  or laggy SSH connections because it sends far less screen data.
+- Dashboard: press `v` to see how much GPU memory each namespace has reserved
+  instead of GPU counts, and `c` to change namespace colours.
+- `--pin-node` is replaced by `--node NAME`. Update any scripts that use it.
+
+Reconnect Falcon MCP in your coding agent after upgrading.
+
 ## 0.5.4 — 2026-11-17
 
 - Coding agents can now restart running and queued Jobs directly, keeping the

@@ -208,7 +208,10 @@ class SubmissionRequest(BaseModel):
     environment: Optional[str] = None
     working_dir: Optional[str] = None
     env: Dict[str, str] = Field(default_factory=dict)
-    pin_node: bool = False
+    node: str = Field(
+        default="auto", min_length=1, max_length=253,
+        description='Keep "auto" so Kubernetes picks a matching node. Name a node only when the task requires that specific machine; Falcon then plans against it and pins the Job there.',
+    )
     maximize: bool = False
     shared_memory: Optional[str] = None
     shared_memory_percent: Optional[float] = Field(default=None, ge=0, le=100)
@@ -292,7 +295,9 @@ INSTRUCTIONS = (
     "Re-arm only after handling an event or wait expiry, not on a timer. "
     "timed_out means the wait elapsed, not that the Job failed; "
     "use the returned continuation to keep following the same Jobs. Do not "
-    "poll list_jobs, inspect_job, logs, or metrics on a timer. Failure events identify "
+    "poll list_jobs, inspect_job, logs, or metrics on a timer. Omit log_keyword "
+    "unless a known log marker requires mid-run action. Once matched, continue "
+    "lifecycle monitoring without that keyword. Failure events identify "
     "the exact pod; use job_logs to inspect that attempt. Decide whether to fix and "
     "relaunch under the user's existing permissions; Falcon does not recover jobs "
     "automatically. Pending/running state is intentionally not reported; scheduling "
@@ -403,6 +408,9 @@ def create_server(
         """Preview node availability and allocation recommendations without creating a Job.
 
         For GPU sizing, provide gpu/gpus; command, cpu and memory are optional.
+        gpu="auto" returns a per-model availability overview of every GPU model
+        on the cluster instead of one plan; it selects nothing, and submit_job
+        requires a concrete model.
         The scheduling breakdown gives per-node free/total CPU, RAM and GPUs,
         exact shortfalls, jointly feasible alternatives and recommendations.
         When no matching GPU is free, maximum/recommended allocations use node
@@ -449,6 +457,7 @@ def create_server(
         ),
         cursors: Optional[Dict[str, str]] = None,
         container: Optional[str] = None,
+        before: Optional[str] = Field(default=None, max_length=64),
     ) -> dict[str, Any]:
         """Read separate bounded pod-attempt logs; default to the current/latest pod.
 
@@ -457,12 +466,16 @@ def create_server(
         tail=40 and limit=1, not limit=40.
         Select exact pod names from failure events, or failed_only for failed
         attempts. Per-pod/container cursors retrieve only new retained text.
+        For older output, select the same Pod and container and pass the returned
+        oldest_timestamp as before. This exclusive timestamp skips lines sharing
+        the boundary timestamp. Read one Pod at a time for longer pages.
         For a restarted Job's old UID, read its locally archived logs and summary.
         Other deleted or rotated Pod output may no longer be available.
         """
         return await invoke(
             "job_logs", job.model_dump(exclude_none=True), pods=pods, failed_only=failed_only,
             limit=limit, tail=tail, cursors=cursors, container=container,
+            **({"before": before} if before is not None else {}),
         )
 
     @server.tool(annotations=read, structured_output=True)
@@ -497,6 +510,10 @@ def create_server(
                 "(schedule and follow). Other errors remain actionable."
             ),
         ),
+        log_keyword: Optional[str] = Field(
+            default=None, min_length=1, max_length=256,
+            description="Optional case-sensitive log text for a one-time alert when work is required mid-run. Omit for normal lifecycle monitoring.",
+        ),
     ) -> dict[str, Any]:
         """Wait for meaningful changes, not periodic running updates.
 
@@ -529,6 +546,9 @@ def create_server(
         ``timed_out`` only means the wait ended and does not imply
         a Job or monitor failure. Use the returned continuation to wait again
         with the same Jobs, cursor, and observation settings.
+        Set log_keyword only for a known marker that requires action before
+        the Job finishes. A match returns log_match. Continue with the returned
+        cursor and omit log_keyword once that action is no longer needed.
         """
         current = await get_service()
         result = await current.wait_for_events(
@@ -536,6 +556,7 @@ def create_server(
             event_types=event_types, timeout=DEFAULT_WAIT_TIMEOUT_SECONDS,
             startup_time_seconds=startup_time_seconds,
             scheduling_policy=scheduling_policy,
+            **({"log_keyword": log_keyword} if log_keyword is not None else {}),
         )
         if result.get("timed_out") and not result.get("disconnected"):
             arguments = {
@@ -547,6 +568,8 @@ def create_server(
                 arguments["event_types"] = event_types
             if startup_time_seconds is not None:
                 arguments["startup_time_seconds"] = startup_time_seconds
+            if log_keyword is not None:
+                arguments["log_keyword"] = log_keyword
             result = {
                 **result,
                 "continuation": {
@@ -558,9 +581,50 @@ def create_server(
         return _agent_response(result)
 
     @server.tool(annotations=destructive, structured_output=True)
-    async def cancel_job(job: JobReference) -> dict[str, Any]:
-        """Cancel the latest run by name, or a specific run when uid is supplied."""
-        return await invoke("cancel_job", job.model_dump(exclude_none=True))
+    async def cancel_job(
+        job: Optional[JobReference] = None,
+        jobs: Optional[List[JobReference]] = Field(default=None, min_length=1, max_length=100),
+        pattern: Optional[str] = Field(default=None, min_length=1, max_length=256),
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel Jobs in the configured namespace. Supply exactly one selector.
+
+        job targets one run; jobs is an explicit batch. pattern searches Job
+        names with a regex, so use anchors for exact prefixes/suffixes.
+        Use dry_run to preview exact names and UIDs before cancelling.
+        """
+        if sum(value is not None for value in (job, jobs, pattern)) != 1:
+            raise MCPServiceError("Supply exactly one of job, jobs, or pattern")
+        if job is not None and not dry_run:
+            return await invoke("cancel_job", job.model_dump(exclude_none=True))
+        refs = [job] if job is not None else jobs
+        selection = await invoke(
+            "cancel_targets",
+            [ref.model_dump(exclude_none=True) for ref in refs] if refs is not None else None,
+            pattern,
+        )
+        targets = selection["jobs"]
+        if dry_run:
+            return {"jobs": targets, "dry_run": True}
+        results = []
+        for target in targets:
+            try:
+                await invoke("cancel_job", target)
+            except MCPServiceError as exc:
+                results.append({"job": target, "cancelled": False, "error": str(exc)[:256]})
+            except KubernetesError as exc:
+                if not exc.not_found:
+                    results.append({
+                        "job": target, "cancelled": False,
+                        "error": _UNAVAILABLE_MESSAGE, "outcome_unknown": True,
+                    })
+                    # A cluster outage could otherwise cost a full retry
+                    # budget for every remaining target.
+                    return {"results": results, "unattempted": targets[len(results):]}
+                results.append({"job": target, "cancelled": False, "error": "Job no longer exists."})
+            else:
+                results.append({"job": target, "cancelled": True})
+        return {"results": results}
 
     @server.tool(annotations=write, structured_output=True)
     async def create_service(
