@@ -70,6 +70,25 @@ def _vector(value: Mapping[str, Any]) -> ResourceVector:
     )
 
 
+def _consumers(items: Any) -> tuple[WorkloadConsumer, ...]:
+    return tuple(
+        WorkloadConsumer(
+            node_name=str(item.get("node_name", "")),
+            namespace=str(item.get("namespace", "")),
+            pod_name=str(item.get("pod_name", "")),
+            workload_kind=str(item.get("workload_kind", "")),
+            workload_name=str(item.get("workload_name", "")),
+            status=str(item.get("status", "")),
+            requested=_vector(item.get("requested", {})),
+            owner_identity=item.get("owner_identity"),
+            is_falcon_job=bool(item.get("is_falcon_job", False)),
+            created_at=item.get("created_at"),
+        )
+        for item in items
+        if isinstance(item, Mapping)
+    )
+
+
 def snapshot_from_dict(value: Mapping[str, Any]) -> ClusterSnapshot:
     """Validate and deserialize a schema-v1 snapshot payload."""
 
@@ -79,22 +98,7 @@ def snapshot_from_dict(value: Mapping[str, Any]) -> ClusterSnapshot:
     for raw in value.get("nodes", ()):
         if not isinstance(raw, Mapping) or not isinstance(raw.get("name"), str):
             raise ValueError("snapshot node is malformed")
-        consumers = tuple(
-            WorkloadConsumer(
-                node_name=str(item.get("node_name", "")),
-                namespace=str(item.get("namespace", "")),
-                pod_name=str(item.get("pod_name", "")),
-                workload_kind=str(item.get("workload_kind", "")),
-                workload_name=str(item.get("workload_name", "")),
-                status=str(item.get("status", "")),
-                requested=_vector(item.get("requested", {})),
-                owner_identity=item.get("owner_identity"),
-                is_falcon_job=bool(item.get("is_falcon_job", False)),
-                created_at=item.get("created_at"),
-            )
-            for item in raw.get("consumers", ())
-            if isinstance(item, Mapping)
-        )
+        consumers = _consumers(raw.get("consumers", ()))
         nodes.append(
             NodeSnapshot(
                 name=raw["name"],
@@ -151,6 +155,12 @@ def snapshot_from_dict(value: Mapping[str, Any]) -> ClusterSnapshot:
         nodes=tuple(nodes), jobs=tuple(jobs),
         collected_at=float(value.get("collected_at", 0.0)),
         stale=bool(value.get("stale", False)), error=value.get("error"),
+        # Older services omit the queue; keep that distinct from "empty".
+        queue=(
+            _consumers(value["queue"])
+            if isinstance(value.get("queue"), (list, tuple))
+            else None
+        ),
     )
 
 

@@ -56,6 +56,11 @@ one service, and `/healthz` exposes the revision, subscriber count, history
 size, freshness, and upstream-request count. With several clients connected,
 the upstream count must still increase only once per five-second interval.
 
+Snapshots also carry `queue`: unbound pending Pods in creation order, each with
+its awaited GPU model. The field is additive within schema v1, so older clients
+ignore it. Clients talking to a service that predates it show the Resources
+pending queue as unavailable until the service is redeployed.
+
 Upgraded clients safely stop their own positively identified legacy history
 process. Administrators should audit collectors owned by users who have not
 yet upgraded (for example, processes whose command line contains

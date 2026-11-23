@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.6 — 2026-11-23
+
+- Resources: press `p` to see the pending queue. The Namespace/Workload table
+  switches to Jobs waiting for each GPU type (H100, A6000, 2080Ti, …) in
+  estimated order, so you can see where your Job is in line. Your Jobs are
+  marked `▸`. Press `p` again to go back. Pies and history are unchanged.
+- Resources: each press of `c` now gives namespaces a new random set of
+  colours.
+
+The pending queue needs the updated resource service on node1. Until it is
+redeployed, the queue view shows "Queue unavailable".
+
 ## 0.5.5 — 2026-11-23
 
 - Ask your agent to run a Job on a specific node, or ask which GPUs are free

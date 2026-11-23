@@ -2898,11 +2898,16 @@ class ResourceInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("right")
             footer = app.query_one("#resources-footer")
             self.assertIn("c Colors", footer.render().plain)
-            before = app._namespace_colors()
-            await pilot.press("c")
-            self.assertNotEqual(app._namespace_colors(), before)
-            await pilot.press("c")
-            self.assertEqual(app._namespace_colors(), before)
+            seen = [app._namespace_colors()]
+            for _ in range(5):
+                await pilot.press("c")
+                current = app._namespace_colors()
+                # Every press draws a new random assignment.
+                self.assertNotEqual(current, seen[-1])
+                self.assertEqual(set(current), set(seen[0]))
+                # It stays stable until the next press.
+                self.assertEqual(app._namespace_colors(), current)
+                seen.append(current)
 
             await pilot.press("v")
             groups = app._namespace_allocation_groups()

@@ -1837,6 +1837,7 @@ def _resources_command(
             history_loader=loader,
             history_hours=history_hours,
             history_warning=history_warning,
+            own_namespace=str(config.get("cluster", {}).get("namespace", "") or ""),
         )
         # Textual restores the alternate screen, but tmux versions in the
         # wild do not all restore the shell's saved cursor column reliably.

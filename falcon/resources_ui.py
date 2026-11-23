@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import queue
+import random
 import threading
 import time
 from collections import defaultdict
@@ -520,7 +521,8 @@ class ResourcesViewState:
     allocation_scroll: int = 0
     allocation_filters: AllocationFilters = field(default_factory=AllocationFilters)
     namespace_basis: str = "gpu"
-    alternate_namespace_colors: bool = False
+    # ``c`` draws a new random namespace palette; None keeps the default one.
+    namespace_color_seed: Optional[int] = None
     # ``m`` cycles the primary allocation metric. ``namespace_basis`` is only
     # the GPU sub-mode selected by ``v``; keep ``memory_basis`` for callers
     # that inspect the older state shape and to preserve the last CPU/memory
@@ -528,6 +530,9 @@ class ResourcesViewState:
     allocation_mode: str = "gpu"
     memory_basis: str = "memory"
     history_log_scale: bool = False
+    # ``p`` swaps the Namespace/Workload table for the pending queue grouped by
+    # GPU model. Allocation History stays on the namespace breakdown.
+    queue_view: bool = False
     selected_cluster_pie: str = "gpu"
     expanded_panels: dict[str, str] = field(
         default_factory=lambda: {
@@ -780,6 +785,7 @@ class FalconResourcesApp(App[None]):
         Binding("c", "toggle_namespace_colors", "Namespace colors", show=False),
         Binding("m", "toggle_allocation_basis", "GPU/Memory/CPU", show=False),
         Binding("l", "toggle_history_scale", "History log scale", show=False),
+        Binding("p", "toggle_queue_view", "Pending queue", show=False),
         Binding("r", "refresh_data", "Refresh"),
     ]
 
@@ -802,9 +808,11 @@ class FalconResourcesApp(App[None]):
         telemetry_collector=None,
         telemetry_refresh_seconds: float = 5.0,
         color_mode: Optional[str] = None,
+        own_namespace: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.color_mode = configure_color(self.console, color_mode)
+        self.own_namespace = own_namespace or ""
         self.collector = collector
         self.refresh_seconds = refresh_seconds
         self.node_filter = (node_filter or "").lower()
@@ -1418,6 +1426,7 @@ class FalconResourcesApp(App[None]):
             ]
         previous_names = self._layout_node_names
         nodes_changed = nodes != self.nodes
+        queue_changed = snapshot.queue != self.snapshot.queue
         self.snapshot = snapshot
         previous_selected_key = None
         previous_anchor_key = None
@@ -1437,7 +1446,7 @@ class FalconResourcesApp(App[None]):
                 else None
             )
         self.nodes = nodes
-        if nodes_changed:
+        if nodes_changed or queue_changed:
             self._nodes_revision += 1
         # The collector refreshes the configured local metrics endpoint in the
         # background. Derive both selectable allocation bases from every fresh
@@ -2433,7 +2442,55 @@ class FalconResourcesApp(App[None]):
             if consumer.requested.gpu_count > 0
         )
 
+    def _queue_consumers(self) -> tuple[WorkloadConsumer, ...]:
+        """Pending queue in estimated order, honouring the GPU filter."""
+
+        consumers = self.snapshot.queue or ()
+        if self.gpu_filter:
+            consumers = tuple(
+                consumer
+                for consumer in consumers
+                if self.gpu_filter in self._queue_model(consumer).lower()
+            )
+        return tuple(consumers)
+
+    @staticmethod
+    def _queue_model(consumer: WorkloadConsumer) -> str:
+        return consumer.requested.gpu_model or "CPU"
+
+    @staticmethod
+    def _queue_model_key(model: str) -> tuple:
+        return (model == "CPU", gpu_model_order_key(model))
+
+    def _queue_groups(self) -> tuple[NamespaceAllocationGroup, ...]:
+        """Group the queue by GPU model, keeping queue order within each."""
+
+        grouped: dict[str, list[WorkloadConsumer]] = {}
+        for consumer in self._queue_consumers():
+            if self.state.allocation_filters.matches(consumer):
+                grouped.setdefault(self._queue_model(consumer), []).append(consumer)
+        groups = [
+            NamespaceAllocationGroup(
+                namespace=model,
+                gpu_count=sum(item.requested.gpu_count for item in consumers),
+                memory_bytes=sum(item.requested.memory_bytes for item in consumers),
+                cpu_cores=sum(item.requested.cpu_cores for item in consumers),
+                consumers=tuple(consumers),
+            )
+            for model, consumers in grouped.items()
+        ]
+        return tuple(sorted(groups, key=lambda group: self._queue_model_key(group.namespace)))
+
+    def _queue_colors(self) -> dict[str, str]:
+        models = sorted(
+            {self._queue_model(consumer) for consumer in self.snapshot.queue or ()},
+            key=self._queue_model_key,
+        )
+        return allocation_colors((model, 1.0) for model in models)
+
     def _namespace_allocation_groups(self) -> tuple[NamespaceAllocationGroup, ...]:
+        if self.state.queue_view:
+            return self._queue_groups()
         grouped: defaultdict[str, list[WorkloadConsumer]] = defaultdict(list)
         for consumer in self._allocation_consumers():
             if not self.state.allocation_filters.matches(consumer):
@@ -2628,9 +2685,11 @@ class FalconResourcesApp(App[None]):
             width = pane.content_size.width
         width = max(1, int(width))
         rows = self._allocation_rows()
-        colors = self._namespace_colors()
-        vram_mode = self._allocation_basis() == "vram"
+        queue_view = self.state.queue_view
+        colors = self._queue_colors() if queue_view else self._namespace_colors()
+        vram_mode = self._allocation_basis() == "vram" and not queue_view
         sizes = self._gpu_memory_by_node() if vram_mode else {}
+        availability = self.snapshot.gpu_availability if queue_view else {}
         # Reserve the resource fields and hierarchy marker before showing
         # an optional Node column; Age must not clip GPU requests or the tree.
         show_node = width >= 58
@@ -2643,7 +2702,7 @@ class FalconResourcesApp(App[None]):
             header_style=f"bold {CYAN_2}",
         )
         table.add_column(
-            "NAMESPACE / WORKLOAD",
+            "GPU / QUEUED JOB" if queue_view else "NAMESPACE / WORKLOAD",
             ratio=1,
             min_width=3,
             no_wrap=True,
@@ -2651,8 +2710,8 @@ class FalconResourcesApp(App[None]):
         )
         if show_node:
             table.add_column(
-                "NODE",
-                width=10,
+                "NAMESPACE" if queue_view else "NODE",
+                width=14 if queue_view else 10,
                 no_wrap=True,
                 overflow="ellipsis",
             )
@@ -2666,6 +2725,18 @@ class FalconResourcesApp(App[None]):
             if consumer is None:
                 label = Text("■ ", style=colors.get(group.namespace, MUTED))
                 label.append(f"▾ {group.namespace}", style=f"bold {WHITE}")
+                if queue_view:
+                    waiting = len(group.consumers)
+                    label.append(
+                        f" · {waiting} waiting" if width >= 70 else f" ·{waiting}q",
+                        style=YELLOW,
+                    )
+                    item = availability.get(group.namespace)
+                    if item is not None and width >= 90:
+                        label.append(
+                            f" · {item.request_headroom}/{item.allocatable} free",
+                            style=GRAY,
+                        )
                 row = [label]
                 if show_node:
                     row.append(Text(""))
@@ -2688,11 +2759,24 @@ class FalconResourcesApp(App[None]):
             # Keep the hierarchy marker at the left edge so it remains
             # visible when the narrow table prioritizes resource columns.
             label = Text("└─ ", style=GRAY)
-            label.append(child_name, style=WHITE)
+            own = queue_view and consumer.namespace == self.own_namespace
+            if queue_view:
+                position = group.consumers.index(consumer) + 1
+                label.append(f"#{position} ", style=CYAN)
+                if own:
+                    label.append("▸", style=f"bold {YELLOW}")
+            label.append(child_name, style=f"bold {YELLOW}" if own else WHITE)
             row = [label]
             if show_node:
-                row.append(Text(consumer.node_name, style=GRAY))
-            if vram_mode:
+                row.append(
+                    Text(
+                        consumer.namespace if queue_view else consumer.node_name,
+                        style=GRAY,
+                    )
+                )
+            if queue_view:
+                gpu_request = str(consumer.requested.gpu_count) if consumer.requested.gpu_count else "-"
+            elif vram_mode:
                 vram_bytes = self._requested_vram(consumer, sizes)
                 gpu_request = _short_memory(vram_bytes) if vram_bytes else "-"
             else:
@@ -2712,7 +2796,15 @@ class FalconResourcesApp(App[None]):
         if not rows:
             # A status message must use the entire pane, not the narrow name
             # column left after reserving resource and Age fields.
-            table.caption = Text("No workloads match filters" if self.state.allocation_filters != AllocationFilters() else "No active resource allocations", style=MUTED)
+            if self.state.allocation_filters != AllocationFilters():
+                empty = "No workloads match filters"
+            elif queue_view and self.snapshot.queue is None:
+                empty = "Queue unavailable: the resource service needs an update"
+            elif queue_view:
+                empty = "No pending Jobs"
+            else:
+                empty = "No active resource allocations"
+            table.caption = Text(empty, style=MUTED)
         return table
 
     @staticmethod
@@ -2757,16 +2849,27 @@ class FalconResourcesApp(App[None]):
             (name for name in names if not is_system_namespace(name)),
             key=natural_name_key,
         )
-        if self.state.alternate_namespace_colors:
-            colors = {
-                name: ALTERNATE_NAMESPACE_COLORS[index % len(ALTERNATE_NAMESPACE_COLORS)]
-                for index, name in enumerate(visible)
-            }
-        else:
+        if self.state.namespace_color_seed is None:
             colors = allocation_colors((name, 1.0) for name in visible)
+        else:
+            colors = self._shuffled_colors(visible, self.state.namespace_color_seed)
         if any(is_system_namespace(name) for name in names):
             colors["System/hidden"] = MUTED
         return colors
+
+    @staticmethod
+    def _shuffled_colors(names: Sequence[str], seed: int) -> dict[str, str]:
+        """Assign a seeded random, distinct-first palette to ``names``."""
+
+        palette = list(dict.fromkeys((*PALETTE.pie, *ALTERNATE_NAMESPACE_COLORS)))
+        rng = random.Random(seed)
+        rng.shuffle(palette)
+        order = list(names)
+        rng.shuffle(order)
+        return {
+            name: palette[index % len(palette)]
+            for index, name in enumerate(order)
+        }
 
     def _allocation_colors(
         self, categories: Sequence[tuple[str, float]]
@@ -2785,6 +2888,10 @@ class FalconResourcesApp(App[None]):
         basis = self._allocation_basis()
         categories = self._namespace_categories()
         colors = self._allocation_colors(categories)
+        queue_view = self.state.queue_view
+        table_title = (
+            " PENDING QUEUE BY GPU " if queue_view else " NAMESPACE / WORKLOAD ALLOCATION "
+        )
         geometry = self._allocation_geometry_for(
             categories=categories,
             expanded=expanded,
@@ -2838,11 +2945,13 @@ class FalconResourcesApp(App[None]):
             "allocation-tree-v1",
             expanded,
             basis,
+            queue_view,
+            self.own_namespace,
             self.state.selected_panels.get("gpu-allocations", ""),
             self.state.allocation_scroll,
             self.app_focus,
             self.color_mode,
-            self.state.alternate_namespace_colors,
+            self.state.namespace_color_seed,
             geometry.signature,
             _valid_consumer_sort(self.state.consumer_sort),
             self.state.allocation_filters,
@@ -2886,11 +2995,15 @@ class FalconResourcesApp(App[None]):
                 Panel(
                     self._allocation_table(width=inner_width(geometry.allocation)),
                     title=Text(
-                        " NAMESPACE / WORKLOAD ALLOCATION ",
+                        table_title,
                         style=f"bold {PALETTE.accent}",
                     ),
                     subtitle=Text(
-                        f" sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]} · s cycle " + ("· filtered · f edit " if self.state.allocation_filters != AllocationFilters() else ""),
+                        (
+                            " estimated order · p namespaces "
+                            if queue_view
+                            else f" sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]} · s cycle "
+                        ) + ("· filtered · f edit " if self.state.allocation_filters != AllocationFilters() else ""),
                         style=GRAY,
                     ),
                     box=box.SQUARE,
@@ -2964,10 +3077,12 @@ class FalconResourcesApp(App[None]):
             _valid_consumer_sort(self.state.consumer_sort)
         ]
         sort_hint = " sort VRAM " if basis == "vram" else f" sort {sort_label} · s cycle "
+        if queue_view:
+            sort_hint = " estimated order · p namespaces "
         allocation = Panel(
             self._allocation_table(width=inner_width(geometry.allocation)),
             title=Text(
-                " NAMESPACE / WORKLOAD ALLOCATION ",
+                table_title,
                 style=f"bold {PALETTE.accent}",
             ),
             subtitle=Text(sort_hint + ("· filtered · f edit " if self.state.allocation_filters != AllocationFilters() else ""), style=GRAY),
@@ -3666,6 +3781,7 @@ class FalconResourcesApp(App[None]):
         )
 
     def _render_footer(self) -> None:
+        queue_control = "p Namespaces" if self.state.queue_view else "p Queue"
         if (
             self.size.width < MINIMUM_WIDTH
             or self.size.height < RESOURCE_MINIMUM_HEIGHT
@@ -3677,7 +3793,7 @@ class FalconResourcesApp(App[None]):
             scale_label = self._history_scale_label()
             gpu_control = f"v {basis_label}   " if self.state.allocation_mode == "gpu" else ""
             value = (
-                "↑/↓ Scroll active pane   Enter Expand   Tab Next pane   "
+                f"↑/↓ Scroll active pane   Enter Expand   Tab Next pane   {queue_control}   "
                 f"s Sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]}   "
                 f"{gpu_control}m {mode_label}   l {scale_label}   r Refresh   q Quit"
             )
@@ -3689,13 +3805,13 @@ class FalconResourcesApp(App[None]):
             gpu_control = f"v {basis_label}  " if self.state.allocation_mode == "gpu" else ""
             prefix = "Esc restore panels   " if expanded_panel else ""
             value = prefix + (
-                "←/→ Views  ↑/↓ Scroll Allocation  Enter Expand  Tab  "
+                f"←/→ Views  ↑/↓ Scroll Allocation  Enter Expand  Tab  {queue_control}  "
                 f"s Sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]}  "
                 f"{gpu_control}m {mode_label}  l {scale_label}  r Refresh  q Quit"
                 if self.size.width < 100
                 else (
                     "←/→ Views   ↑/↓ Scroll Allocation   Enter Expand   "
-                    "Tab Next pane   "
+                    f"Tab Next pane   {queue_control}   "
                     f"s Sort {CONSUMER_SORT_LABELS[_valid_consumer_sort(self.state.consumer_sort)]}   "
                     f"{gpu_control}m {mode_label}   l {scale_label}   r Refresh   q Quit"
                 )
@@ -4116,7 +4232,13 @@ class FalconResourcesApp(App[None]):
         self._render_all()
 
     def action_toggle_namespace_colors(self) -> None:
-        self.state.alternate_namespace_colors = not self.state.alternate_namespace_colors
+        """Randomly reassign namespace colours; every press looks different."""
+
+        before = self._namespace_colors()
+        for _ in range(20):
+            self.state.namespace_color_seed = random.getrandbits(32)
+            if self._namespace_colors() != before or len(before) < 2:
+                break
         self._render_all()
 
     def action_toggle_allocation_basis(self) -> None:
@@ -4135,6 +4257,18 @@ class FalconResourcesApp(App[None]):
         # Keep the current Nodes side/focus when this shortcut is used from
         # an expanded inspector or the active Nodes side of the combined view.
         self._select_allocation_metric(next_mode, activate=False)
+        self._render_all()
+
+    def action_toggle_queue_view(self) -> None:
+        """Swap the Namespace/Workload table for the pending queue by GPU model."""
+
+        self.state.queue_view = not self.state.queue_view
+        self.state.allocation_scroll = 0
+        self._allocation_render_key = None
+        self._pie_cache_key = None
+        if not self._allocation_is_visible() and self.state.view != "gpu-allocations":
+            self._switch_view("gpu-allocations")
+            return
         self._render_all()
 
     def action_toggle_history_scale(self) -> None:

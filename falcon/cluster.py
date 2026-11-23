@@ -360,6 +360,10 @@ class ClusterSnapshot:
     collected_at: float = 0.0
     stale: bool = False
     error: Optional[str] = None
+    # Unbound pending Pods in estimated scheduling order (oldest first). Their
+    # ``requested.gpu_model`` is the GPU model they wait for, or None for
+    # CPU-only Pods. None means the source does not publish a queue.
+    queue: Optional[Tuple[WorkloadConsumer, ...]] = None
 
     @classmethod
     def empty(

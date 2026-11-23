@@ -157,6 +157,9 @@ namespace aggregate rows are blank.
 - `v`: while the GPU mode is active, switch between requested GPU count and
   allocated VRAM. It does not leave or enter GPU mode.
 - `l`: toggle Allocation History between linear and logarithmic y-axis scale
+- `p`: swap Namespace/Workload Allocation for the pending queue grouped by
+  GPU model; press again to return. The namespace pies and Allocation History
+  are unchanged.
 - Click an Allocations sub-pane to select it; `Enter` expands the selection
   and `Esc` restores it
 - `r`: refresh; `q`: quit
@@ -186,6 +189,14 @@ on the next launch. It defaults to GPU and is shared by Selected Node workloads
 and Namespace/Workload Allocation, including their expanded views, so changing
 it in either pane updates the other. The selected resource is primary; ties are
 resolved by GPU, memory, CPU, then natural namespace/workload name priority.
+
+The pending queue lists Pods the scheduler has not yet placed, one group per
+awaited GPU model (from the Pod's `gpu-type` label) plus `CPU` for CPU-only
+Pods. Within a group, Pods are numbered oldest first and Pods in your
+configured namespace are marked `▸`. The order is an estimate: KAI also
+applies queue fair-share, and a smaller request that fits can start before a
+larger one ahead of it. Older resource services do not publish the queue, and the view then
+reports it as unavailable.
 
 Allocations is scheduler-facing allocation accounting from the same local
 resource snapshot as the other Resources views; it does not query or infer GPU
@@ -249,8 +260,9 @@ memory-only workloads, and sorting applies consistently to parents and children
 without combining unlike units. Press `v` in GPU mode to show allocated VRAM
 instead of GPU counts in the tree and sort both levels by VRAM. Values use
 requested GPU count times device memory, with a dash when no amount is known.
-Press `c` to switch the namespace palette
-across the tree, pies, and history. The view selector is hidden while one surface
+Press `c` to randomly reassign namespace colours
+across the tree, pies, and history; each press gives a new assignment, which
+stays fixed until the next press. Each launch starts with the default palette. The view selector is hidden while one surface
 is expanded; `Esc` restores it with the combined/page layout. `System/hidden`
 is retained in charts when needed to reconcile totals. Both graphs switch
 bases together within the active pair. GPU mode is exactly namespace requested GPU count

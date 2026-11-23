@@ -21,6 +21,7 @@ from .cluster import (
     ResourceVector,
     WorkloadConsumer,
     gpu_memory_bytes_from_labels,
+    is_system_namespace,
     natural_name_key,
 )
 from .models import NodeResources, ResourcePlan
@@ -48,6 +49,7 @@ _RESOURCE_METRIC_NAMES = frozenset(
         "kube_pod_status_phase",
         "kube_pod_container_resource_requests",
         "kube_pod_info",
+        "kube_pod_labels",
         "kube_pod_owner",
         "kube_replicaset_owner",
         "kube_job_owner",
@@ -405,6 +407,17 @@ def cluster_snapshot_from_metrics(
         if labels.get("node"):
             pod_info.setdefault(key, {})["node"] = labels["node"]
 
+    def resolve_owner(
+        key: Tuple[str, str], info: Dict[str, str]
+    ) -> Tuple[str, str]:
+        owner_kind = info.get("owner_kind", "") or "Pod"
+        owner_name = info.get("owner_name", "") or key[1]
+        if owner_kind == "ReplicaSet":
+            return replica_owners.get((key[0], owner_name), (owner_kind, owner_name))
+        if owner_kind == "Job":
+            return job_owners.get((key[0], owner_name), (owner_kind, owner_name))
+        return owner_kind, owner_name
+
     consumers_by_node: DefaultDict[str, List[WorkloadConsumer]] = defaultdict(list)
     pod_vectors: Dict[Tuple[str, str], ResourceVector] = {}
     for key, request in pod_requests.items():
@@ -427,18 +440,7 @@ def cluster_snapshot_from_metrics(
         if vector.is_empty:
             continue
         pod_vectors[key] = vector
-        owner_kind = info.get("owner_kind", "") or "Pod"
-        owner_name = info.get("owner_name", "") or key[1]
-        if owner_kind == "ReplicaSet":
-            owner_kind, owner_name = replica_owners.get(
-                (key[0], owner_name),
-                (owner_kind, owner_name),
-            )
-        elif owner_kind == "Job":
-            owner_kind, owner_name = job_owners.get(
-                (key[0], owner_name),
-                (owner_kind, owner_name),
-            )
+        owner_kind, owner_name = resolve_owner(key, info)
         consumers_by_node[node_name].append(
             WorkloadConsumer(
                 node_name=node_name,
@@ -573,11 +575,98 @@ def cluster_snapshot_from_metrics(
             )
         )
 
+    queue = _pending_queue(
+        metrics,
+        pod_phases=pod_phases,
+        pod_info=pod_info,
+        pod_requests=pod_requests,
+        pod_created=pod_created,
+        node_labels=node_labels,
+        resource_nodes=resource_nodes,
+        resolve_owner=resolve_owner,
+    )
+
     return ClusterSnapshot(
         nodes=tuple(snapshots),
         jobs=tuple(jobs),
         collected_at=collected_at,
+        queue=queue,
     )
+
+
+def _pending_queue(
+    metrics,
+    *,
+    pod_phases: Dict[Tuple[str, str], str],
+    pod_info: Dict[Tuple[str, str], Dict[str, str]],
+    pod_requests,
+    pod_created: Dict[Tuple[str, str], Optional[str]],
+    node_labels,
+    resource_nodes: Dict[str, NodeResources],
+    resolve_owner: Callable[[Tuple[str, str], Dict[str, str]], Tuple[str, str]],
+) -> Tuple[WorkloadConsumer, ...]:
+    """Return unbound pending Pods, oldest first, keyed by awaited GPU model.
+
+    The scheduler's real order also depends on queues and fair share that
+    ordinary users cannot read, so creation order is an estimate. Falcon pins
+    the GPU model through the ``gpu-type`` label, which kube-state-metrics
+    exports on Pods and Nodes alike.
+    """
+
+    models_by_type: Dict[str, str] = {}
+    for name, labels in node_labels.items():
+        node = resource_nodes.get(name)
+        gpu_type = labels.get("gpu-type", "").lower()
+        if gpu_type and node is not None and node.gpu_product:
+            models_by_type.setdefault(gpu_type, _display_gpu_model(node.gpu_product))
+    pod_gpu_types: Dict[Tuple[str, str], str] = {}
+    for labels, value in metrics.get("kube_pod_labels", []):
+        if value == 1 and labels.get("label_gpu_type"):
+            pod_gpu_types[(labels.get("namespace", ""), labels.get("pod", ""))] = (
+                labels["label_gpu_type"].replace("_", "-").lower()
+            )
+    created_seconds: Dict[Tuple[str, str], float] = {}
+    for labels, value in metrics.get("kube_pod_created", []):
+        created_seconds[(labels.get("namespace", ""), labels.get("pod", ""))] = value
+
+    queued: List[Tuple[float, str, str, WorkloadConsumer]] = []
+    for key, phase in pod_phases.items():
+        info = pod_info.get(key, {})
+        if phase != "Pending" or info.get("node") or not key[1]:
+            continue
+        if is_system_namespace(key[0]):
+            continue
+        request = pod_requests.get(key, {"cpu": 0.0, "memory": 0.0, "gpu": 0.0})
+        gpu_count = int(request["gpu"])
+        model: Optional[str] = None
+        if gpu_count > 0:
+            gpu_type = pod_gpu_types.get(key, "")
+            model = models_by_type.get(gpu_type) or (gpu_type.upper() or "Any GPU")
+        owner_kind, owner_name = resolve_owner(key, info)
+        queued.append(
+            (
+                created_seconds.get(key, math.inf),
+                key[0],
+                key[1],
+                WorkloadConsumer(
+                    node_name="",
+                    namespace=key[0],
+                    pod_name=key[1],
+                    workload_kind=owner_kind,
+                    workload_name=owner_name,
+                    status="Pending",
+                    requested=ResourceVector(
+                        cpu_cores=request["cpu"],
+                        memory_bytes=int(round(request["memory"])),
+                        gpu_count=gpu_count,
+                        gpu_model=model,
+                    ),
+                    created_at=pod_created.get(key),
+                ),
+            )
+        )
+    queued.sort(key=lambda item: item[:3])
+    return tuple(item[3] for item in queued)
 
 
 def fetch_cluster_snapshot(
