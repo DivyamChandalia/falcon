@@ -9,14 +9,14 @@ are upgraded in place when opened by a new client.
 
 ## Installation on node1
 
-The following block is directly copy-pastable. It clones the published `sse`
+The following block is directly copy-pastable. It clones the published `main`
 branch, installs that checkout into an isolated system virtual environment,
 copies its unit files, and creates the locked-down service identity:
 
 ```console
-git clone --branch sse --single-branch \
-  https://github.com/DivyamChandalia/falcon.git falcon-sse
-cd falcon-sse
+git clone --branch main --single-branch \
+  https://github.com/DivyamChandalia/falcon.git falcon-resource-service
+cd falcon-resource-service
 sudo python3 -m venv /opt/falcon-resource-service
 sudo /opt/falcon-resource-service/bin/python -m pip install --upgrade \
   .
@@ -60,6 +60,23 @@ Snapshots also carry `queue`: unbound pending Pods in creation order, each with
 its awaited GPU model. The field is additive within schema v1, so older clients
 ignore it. Clients talking to a service that predates it show the Resources
 pending queue as unavailable until the service is redeployed.
+
+## Upgrading
+
+From the checkout made during installation, pull `main`, reinstall, and
+restart only the service. The socket unit keeps listening, so clients
+reconnect on their own:
+
+```console
+cd falcon-resource-service
+git pull --ff-only
+sudo /opt/falcon-resource-service/bin/python -m pip install --upgrade .
+sudo systemctl restart falcon-resource-service.service
+curl --fail http://node1.yoda.hyperverge.org:30081/healthz
+```
+
+If unit files changed in the release, copy them again and run
+`sudo systemctl daemon-reload` before restarting.
 
 Upgraded clients safely stop their own positively identified legacy history
 process. Administrators should audit collectors owned by users who have not
