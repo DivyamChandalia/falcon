@@ -40,6 +40,17 @@ _UNAVAILABLE_MESSAGE = (
 )
 
 
+def _rejected_message(exc: KubernetesError) -> str:
+    """Kubernetes answered but refused; pass its error on to the agent."""
+    detail = (str(exc).strip() or exc.stderr.strip() or "no detail returned")
+    if len(detail) > 4000:
+        detail = detail[:3997] + "..."
+    return (
+        "Kubernetes rejected the request; it is reachable, so do not retry unchanged. "
+        f"Fix the request and resubmit. Kubernetes error:\n{detail}"
+    )
+
+
 def _safe_tool_errors(function):
     """Keep infrastructure diagnostics out of model-facing tool results."""
     @wraps(function)
@@ -54,7 +65,9 @@ def _safe_tool_errors(function):
                     "The requested Kubernetes resource was not found. Refresh its reference."
                 ) from None
             logging.getLogger(__name__).error("Tool %s failed (%s)", function.__name__, type(exc).__name__)
-            raise ToolError(_UNAVAILABLE_MESSAGE) from None
+            if exc.unavailable:
+                raise ToolError(_UNAVAILABLE_MESSAGE) from None
+            raise ToolError(_rejected_message(exc)) from None
         except Exception as exc:
             logging.getLogger(__name__).error("Tool %s failed (%s)", function.__name__, type(exc).__name__)
             raise ToolError(_UNAVAILABLE_MESSAGE) from None

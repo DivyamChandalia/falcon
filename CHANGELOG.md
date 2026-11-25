@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.7 — 2026-11-25
+
+- Jobs whose command or environment contains values like `2e-3` or `1e5` now
+  submit correctly. Before, Kubernetes read them as numbers and refused the
+  Job.
+- When Kubernetes refuses a request, your agent now sees Kubernetes' actual
+  error and can fix the request, instead of being told "Kubernetes is
+  unavailable".
+
+Reconnect Falcon MCP in your coding agent after upgrading.
+
 ## 0.5.6 — 2026-11-23
 
 - Resources: press `p` to see the pending queue. The Namespace/Workload table

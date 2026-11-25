@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from urllib.parse import quote
 
-import yaml
-
 from .models import SubmittedJob
 
 DEFAULT_TIMEOUT = 15.0
@@ -401,7 +399,9 @@ class KubernetesClient:
         return {"nodes": nodes, "pods": pods, "jobs": jobs}
 
     def create_job(self, manifest: Mapping[str, Any]) -> SubmittedJob:
-        payload = yaml.safe_dump(dict(manifest), sort_keys=False)
+        # JSON, not YAML: PyYAML (YAML 1.1) leaves strings such as "2e-3"
+        # unquoted, and Kubernetes' YAML 1.2 parser then reads them as numbers.
+        payload = json.dumps(dict(manifest))
         created = self._json(
             self._run(
                 ["create", "--filename", "-", "--output", "json"],
@@ -425,7 +425,7 @@ class KubernetesClient:
     def create_service(self, manifest: Mapping[str, Any]) -> Dict[str, Any]:
         return self._json(self._run(
             ["create", "--filename", "-", "--output", "json"],
-            input_text=yaml.safe_dump(dict(manifest), sort_keys=False),
+            input_text=json.dumps(dict(manifest)),
         ))
 
     def delete_service_uid(self, name: str, uid: str, *, namespace: Optional[str] = None) -> ProcessResult:

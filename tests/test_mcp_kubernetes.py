@@ -190,3 +190,28 @@ def test_orphan_recovery_removes_only_orphan_and_requires_deletion():
 def test_uid_delete_rejects_missing_identity(name, uid):
     with pytest.raises(ValueError, match="name and UID"):
         KubernetesClient().delete_job_uid(name, uid)
+
+
+def test_create_job_sends_json_so_numeric_looking_args_stay_strings():
+    # PyYAML leaves "2e-3" unquoted; Kubernetes' YAML parser reads it as a
+    # number and rejects the Job ("cannot unmarshal number ... of type string").
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(
+            argv, 0, '{"metadata": {"name": "train", "uid": "u1"}}', ""
+        )
+
+    client = KubernetesClient("mine", runner=run)
+    command = ["train.py", "--lr", "2e-3", "--steps", "30000", "--mult", "0.5", "--flag", "yes"]
+    manifest = {"apiVersion": "batch/v1", "kind": "Job", "spec": {"template": {"spec": {
+        "containers": [{"name": "main", "command": command, "env": [{"name": "X", "value": "1e5"}]}],
+    }}}}
+    client.create_job(manifest)
+    client.create_service(manifest)
+    for kwargs in calls:
+        sent = json.loads(kwargs["input"])
+        container = sent["spec"]["template"]["spec"]["containers"][0]
+        assert container["command"] == command
+        assert container["env"][0]["value"] == "1e5"

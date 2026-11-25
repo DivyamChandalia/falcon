@@ -150,6 +150,31 @@ async def test_internal_errors_are_brief_and_connection_remains_usable(method):
 
 
 @pytest.mark.asyncio
+async def test_kubernetes_rejection_is_not_reported_as_an_outage():
+    service = FakeService(DEFAULT_CONFIG)
+
+    def reject(*args, **kwargs):
+        raise KubernetesError(
+            'Error from server (BadRequest): error when creating "STDIN": Job in version "v1" '
+            "cannot be handled as a Job: json: cannot unmarshal number into Go struct field "
+            "Container.spec.template.spec.containers.command of type string\nsecond line"
+        )
+
+    service.submit_job = reject
+    server = create_server(DEFAULT_CONFIG, service_factory=lambda *a, **k: service)
+    async with create_connected_server_and_client_session(server) as session:
+        result = await session.call_tool(
+            "submit_job", {"request": {"command": ["true"]}, "idempotency_key": "rejected"}
+        )
+        assert result.isError
+        text = result.content[0].text
+        assert "unavailable" not in text
+        assert "Kubernetes rejected the request" in text
+        assert "cannot unmarshal number" in text
+        assert "second line" in text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["restart_job", "cancel_job"])
 async def test_retried_mutation_keeps_original_resolved_uid(method):
     service = FakeService(DEFAULT_CONFIG)
